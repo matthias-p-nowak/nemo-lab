@@ -1,0 +1,93 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "compile js",
+      "type": "shell",
+      "command": "esbuild",
+      "args": [
+        "--bundle",
+        "frontend/src/app.ts",
+        "--outdir=${workspaceFolder}/dist/js",
+        "--sourcemap",
+        "--watch"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "isBackground": true,
+      "problemMatcher": [
+        {
+          "owner": "esbuild",
+          "pattern": [{ "regexp": "^(ERROR) in (.+):(\\d+):(\\d+): (.+)$", "severity": 1, "file": 2, "line": 3, "column": 4, "message": 5 }],
+          "background": {
+            "activeOnStart": true,
+            "beginsPattern": "^\\[watch\\] build started",
+            "endsPattern": "^\\[watch\\] build finished"
+          }
+        }
+      ]
+    },
+    {
+      "label": "watch-scss",
+      "type": "shell",
+      "command": "sass",
+      "args": [
+        "-w",
+        "frontend/src/main.scss:dist/css/main.css"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "isBackground": true,
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    },
+    {
+      "label": "start-nemo-server",
+      "type": "shell",
+      "command": "go",
+      "args": [
+        "run",
+        "./cmd/server"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/backend"
+      },
+      "isBackground": true,
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    },
+    {
+      "label": "copy-resources",
+      "type": "shell",
+      "command": "cp",
+      "args": [
+        "-r",
+        "frontend/resources/.",
+        "dist/"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "start-all",
+      "dependsOn": [
+        "copy-resources",
+        "compile js",
+        "watch-scss"
+      ],
+      "dependsOrder": "parallel",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": []
+    }
+  ]
+}

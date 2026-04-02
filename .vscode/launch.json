@@ -1,0 +1,30 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Go: Launch server",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/backend/cmd/server",
+      "cwd": "${workspaceFolder}",
+      "env": {},
+      "args": ["-config", "${workspaceFolder}/nemo.toml"]
+    },
+    {
+      "name": "Firefox: Launch localhost",
+      "type": "firefox",
+      "request": "launch",
+      "url": "http://127.0.0.1:7255",
+      "webRoot": "${workspaceFolder}",
+      "profile": "devel"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Go + Firefox",
+      "configurations": ["Go: Launch server", "Firefox: Launch localhost"],
+      "stopAll": true
+    }
+  ]
+}
