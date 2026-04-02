@@ -1,0 +1,7 @@
+dist/
+tmp/
+previous_work/
+*.db
+__debug_bin*
+wt/
+images/
