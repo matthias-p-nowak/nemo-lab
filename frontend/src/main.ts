@@ -580,13 +580,17 @@ class WebGLTileViewer {
 
     const tileUrl = this.tileUrl(0, 0, 0);
     try {
+      const fetchStart = performance.now();
       const image = await loadImage(tileUrl);
       if (requestId !== this.generation) {
         return;
       }
+      const fetchMs = performance.now() - fetchStart;
+      const uploadStart = performance.now();
       this.level0Tile = this.uploadTileTexture(0, 0, image);
+      const uploadMs = performance.now() - uploadStart;
       const dims = getLevelDimensions(this.manifest, 0);
-      this.logTilePlaced(0, this.level0Tile, dims.width, dims.height);
+      this.logTilePlaced(0, this.level0Tile, dims.width, dims.height, fetchMs, uploadMs);
       this.draw();
     } catch (error) {
       console.error("tile viewer: level0 tile load failed", error);
@@ -624,6 +628,7 @@ class WebGLTileViewer {
         }
 
         const url = this.tileUrl(level, tx, ty);
+        const fetchStart = performance.now();
         void loadImage(url)
           .then((image) => {
             if (
@@ -633,9 +638,12 @@ class WebGLTileViewer {
             ) {
               return;
             }
+            const fetchMs = performance.now() - fetchStart;
+            const uploadStart = performance.now();
             const tile = this.uploadTileTexture(tx, ty, image);
+            const uploadMs = performance.now() - uploadStart;
             this.fitTiles.set(key, tile);
-            this.logTilePlaced(level, tile, dims.width, dims.height);
+            this.logTilePlaced(level, tile, dims.width, dims.height, fetchMs, uploadMs);
             this.draw();
           })
           .catch((error) => {
@@ -878,7 +886,9 @@ class WebGLTileViewer {
     level: number,
     tile: Pick<LoadedTile, "tx" | "ty" | "width" | "height">,
     levelWidth: number,
-    levelHeight: number
+    levelHeight: number,
+    fetchMs: number,
+    uploadMs: number
   ): void {
     this.computeTransform();
     const placement = this.getTilePlacementRect(tile, levelWidth, levelHeight);
@@ -890,6 +900,8 @@ class WebGLTileViewer {
       y: placement.y,
       width: placement.width,
       height: placement.height,
+      fetchMs,
+      uploadMs,
     });
   }
 
