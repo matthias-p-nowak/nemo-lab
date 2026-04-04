@@ -1,9 +1,45 @@
+/** Tunable viewer constants. */
+const config = {
+  /** Maximum pointer travel (CSS px) between down and up to count as a click/annotation. */
+  clickMaxDragPx: 10,
+};
+
 /** WebSocket endpoint for backend events. */
 const ws = new WebSocket(`ws://${location.host}/ws`);
 
 ws.addEventListener("open", () => console.log("ws: connected"));
 ws.addEventListener("close", () => console.log("ws: disconnected"));
 ws.addEventListener("error", (e) => console.error("ws: error", e));
+
+/** Sends a log entry to the backend over the shared WebSocket. */
+function logEvent(type: string, data: Record<string, unknown> = {}): void {
+  if (ws.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  ws.send(JSON.stringify({ type: "log", entry: { type, ts: new Date().toISOString(), ...data } }));
+}
+
+/** Last-seen state per item key; used by traceState to suppress duplicate log entries. */
+const _traceStateCache = new Map<string, string>();
+
+/**
+ * Logs {type:"trace_state", item, state} only when the state value differs
+ * from the previously recorded value for that item.
+ */
+function traceState(item: string, state: string): void {
+  if (_traceStateCache.get(item) === state) {
+    return;
+  }
+  _traceStateCache.set(item, state);
+  logEvent("trace_state", { item, state });
+}
+
+document.addEventListener("focusin", (e) =>
+  logEvent("focus", { action: "in", target: (e.target as Element | null)?.tagName ?? "unknown" })
+);
+document.addEventListener("focusout", (e) =>
+  logEvent("focus", { action: "out", target: (e.target as Element | null)?.tagName ?? "unknown" })
+);
 
 /** Supported image names for prototype navigation. */
 const imageNames: string[] = ["r00000000f0.png", "00001140.png"];
@@ -74,6 +110,18 @@ interface ViewTransform {
   height: number;
 }
 
+/** Canvas-space tile placement rectangle in CSS pixels. */
+interface TilePlacementRect {
+  /** Left edge in canvas CSS pixels. */
+  x: number;
+  /** Top edge in canvas CSS pixels. */
+  y: number;
+  /** Drawn width in canvas CSS pixels. */
+  width: number;
+  /** Drawn height in canvas CSS pixels. */
+  height: number;
+}
+
 /** Main app container. */
 const appRoot = document.querySelector<HTMLDivElement>("#app");
 if (!appRoot) {
@@ -99,6 +147,7 @@ function goPreviousImage(): void {
   appState.currentImageIndex =
     (appState.currentImageIndex - 1 + imageNames.length) % imageNames.length;
   appState.annotations = [];
+  logEvent("image_change", { image: getCurrentImageName() });
   render();
 }
 
@@ -106,6 +155,7 @@ function goPreviousImage(): void {
 function goNextImage(): void {
   appState.currentImageIndex = (appState.currentImageIndex + 1) % imageNames.length;
   appState.annotations = [];
+  logEvent("image_change", { image: getCurrentImageName() });
   render();
 }
 
@@ -256,6 +306,8 @@ class WebGLTileViewer {
   private fitLevel = 0;
   /** Last level for which tiles are being loaded. */
   private loadingLevel = -1;
+  /** Monotonic id for fit-level tile load batches; rejects stale async callbacks. */
+  private loadingGeneration = 0;
 
   /** Current async request generation token. */
   private generation = 0;
@@ -297,6 +349,24 @@ class WebGLTileViewer {
 
   /** Current animation multiplier between natural and fit scale. */
   private animationScale = 1;
+  /** Current zoom in CSS pixels per source pixel. */
+  private zoom = 1;
+  /** Current left offset of image in canvas CSS pixels. */
+  private offsetX = 0;
+  /** Current top offset of image in canvas CSS pixels. */
+  private offsetY = 0;
+  /** True while primary-pointer drag pan is active. */
+  private isDragging = false;
+  /** Previous pointer X used for drag delta integration. */
+  private dragLastX = 0;
+  /** Previous pointer Y used for drag delta integration. */
+  private dragLastY = 0;
+  /** Pointer X at drag start, used to detect the first move event. */
+  private dragStartX = 0;
+  /** Pointer Y at drag start, used to detect the first move event. */
+  private dragStartY = 0;
+  /** Accumulated pointer travel in CSS px since last pointerdown. */
+  private dragTotalDistance = 0;
 
   constructor(
     canvas: HTMLCanvasElement,
@@ -401,6 +471,11 @@ class WebGLTileViewer {
       this.windowResizeHandler = null;
     }
     this.canvas.removeEventListener("click", this.handleCanvasClick);
+    this.canvas.removeEventListener("wheel", this.handleWheel);
+    this.canvas.removeEventListener("pointerdown", this.handlePointerDown);
+    this.canvas.removeEventListener("pointermove", this.handlePointerMove);
+    this.canvas.removeEventListener("pointerup", this.handlePointerUp);
+    this.canvas.removeEventListener("pointercancel", this.handlePointerUp);
 
     this.clearTextures();
     gl.deleteBuffer(this.positionBuffer);
@@ -416,6 +491,7 @@ class WebGLTileViewer {
     this.level0Tile = null;
     this.fitTiles.clear();
     this.loadingLevel = -1;
+    this.loadingGeneration = 0;
     this.animationScale = 1;
 
     this.clearTextures();
@@ -441,6 +517,12 @@ class WebGLTileViewer {
     }
 
     this.manifest = manifest;
+    const fitScale = this.fitScaleForDimensions(manifest.width, manifest.height);
+    this.zoom = fitScale;
+    this.offsetX = (this.canvas.clientWidth - fitScale * manifest.width) / 2;
+    this.offsetY = (this.canvas.clientHeight - fitScale * manifest.height) / 2;
+    this.fitLevel = this.pickFitLevel();
+    this.updateCanvasZoomLevelClass();
 
     await this.loadLevel0(requestId);
     this.startFitAnimation();
@@ -503,6 +585,8 @@ class WebGLTileViewer {
         return;
       }
       this.level0Tile = this.uploadTileTexture(0, 0, image);
+      const dims = getLevelDimensions(this.manifest, 0);
+      this.logTilePlaced(0, this.level0Tile, dims.width, dims.height);
       this.draw();
     } catch (error) {
       console.error("tile viewer: level0 tile load failed", error);
@@ -522,6 +606,7 @@ class WebGLTileViewer {
       this.clearFitTiles();
       this.loadingLevel = level;
     }
+    const loadingGen = ++this.loadingGeneration;
 
     const dims = getLevelDimensions(this.manifest, level);
     const cols = Math.ceil(dims.width / this.manifest.tile_size);
@@ -537,10 +622,16 @@ class WebGLTileViewer {
         const url = this.tileUrl(level, tx, ty);
         void loadImage(url)
           .then((image) => {
-            if (requestId !== this.generation || this.fitLevel !== level) {
+            if (
+              requestId !== this.generation ||
+              this.fitLevel !== level ||
+              this.loadingGeneration !== loadingGen
+            ) {
               return;
             }
-            this.fitTiles.set(key, this.uploadTileTexture(tx, ty, image));
+            const tile = this.uploadTileTexture(tx, ty, image);
+            this.fitTiles.set(key, tile);
+            this.logTilePlaced(level, tile, dims.width, dims.height);
             this.draw();
           })
           .catch((error) => {
@@ -561,7 +652,7 @@ class WebGLTileViewer {
       this.animationId = null;
     }
 
-    const durationMs = 500;
+    const durationMs = 200;
     const start = performance.now();
 
     const step = (now: number): void => {
@@ -587,8 +678,8 @@ class WebGLTileViewer {
     }
 
     const dpr = window.devicePixelRatio || 1;
-    const targetW = Math.max(1, this.canvas.clientWidth * dpr);
-    const targetH = Math.max(1, this.canvas.clientHeight * dpr);
+    const targetW = this.zoom * this.manifest.width * dpr;
+    const targetH = this.zoom * this.manifest.height * dpr;
 
     for (let level = 0; level < this.manifest.levels; level += 1) {
       const dims = getLevelDimensions(this.manifest, level);
@@ -606,22 +697,24 @@ class WebGLTileViewer {
       return;
     }
 
-    const animating = this.animationId !== null;
-    const level = animating ? 0 : this.fitLevel > 0 ? this.fitLevel : 0;
-    const dims = getLevelDimensions(this.manifest, level);
-    const scale = animating
-      ? this.animationScale
-      : this.fitScaleForDimensions(dims.width, dims.height);
-
-    const drawW = dims.width * scale;
-    const drawH = dims.height * scale;
-
-    this.transform = {
-      x: (this.canvas.clientWidth - drawW) / 2,
-      y: (this.canvas.clientHeight - drawH) / 2,
-      width: drawW,
-      height: drawH,
-    };
+    if (this.animationId !== null) {
+      const dims = getLevelDimensions(this.manifest, 0);
+      const drawW = dims.width * this.animationScale;
+      const drawH = dims.height * this.animationScale;
+      this.transform = {
+        x: (this.canvas.clientWidth - drawW) / 2,
+        y: (this.canvas.clientHeight - drawH) / 2,
+        width: drawW,
+        height: drawH,
+      };
+    } else {
+      this.transform = {
+        x: this.offsetX,
+        y: this.offsetY,
+        width: this.zoom * this.manifest.width,
+        height: this.zoom * this.manifest.height,
+      };
+    }
   }
 
   /** Returns fit scale for a specific level. */
@@ -638,14 +731,73 @@ class WebGLTileViewer {
     return Math.min(this.canvas.clientWidth / width, this.canvas.clientHeight / height);
   }
 
+  /** Constrains zoom and pan offsets so image remains near viewport bounds. */
+  private clampPanZoom(): void {
+    if (!this.manifest) {
+      return;
+    }
+    const cw = this.canvas.clientWidth;
+    const ch = this.canvas.clientHeight;
+    const pad = 20;
+
+    const minZoom = Math.max(
+      Math.min(
+        (cw - 2 * pad) / this.manifest.width,
+        (ch - 2 * pad) / this.manifest.height
+      ),
+      1e-6
+    );
+    this.zoom = Math.max(minZoom, Math.min(2, this.zoom));
+
+    const imgW = this.zoom * this.manifest.width;
+    const imgH = this.zoom * this.manifest.height;
+
+    const xA = -pad;
+    const xB = cw + pad - imgW;
+    const xMin = Math.min(xA, xB);
+    const xMax = Math.max(xA, xB);
+    this.offsetX = Math.max(xMin, Math.min(xMax, this.offsetX));
+
+    const yA = -pad;
+    const yB = ch + pad - imgH;
+    const yMin = Math.min(yA, yB);
+    const yMax = Math.max(yA, yB);
+    this.offsetY = Math.max(yMin, Math.min(yMax, this.offsetY));
+    traceState("pan_zoom", `${this.zoom},${this.offsetX},${this.offsetY}`);
+  }
+
+  /** Reloads fit-level tiles if zoom-driven target level changed. */
+  private maybeChangeFitLevel(): void {
+    if (!this.manifest) {
+      return;
+    }
+    const newLevel = this.pickFitLevel();
+    if (newLevel !== this.fitLevel) {
+      this.fitLevel = newLevel;
+      this.loadingLevel = -1;
+      this.loadFitLevelTiles(this.generation);
+    }
+    this.updateCanvasZoomLevelClass();
+  }
+
+  /** Updates canvas border-color state class based on whether fit level is maxed. */
+  private updateCanvasZoomLevelClass(): void {
+    if (!this.manifest) {
+      return;
+    }
+    const atMax = this.fitLevel === this.manifest.levels - 1;
+    this.canvas.classList.toggle("image-view__canvas--zoom-at-max", atMax);
+    this.canvas.classList.toggle("image-view__canvas--zoom-below-max", !atMax);
+  }
+
   /** Draws one tile texture into the current transform space. */
   private drawTile(tile: LoadedTile, levelWidth: number, levelHeight: number): void {
     const gl = this.gl;
-    const tileSize = this.manifest?.tile_size ?? 256;
-    const x0 = this.transform.x + ((tile.tx * tileSize) / levelWidth) * this.transform.width;
-    const y0 = this.transform.y + ((tile.ty * tileSize) / levelHeight) * this.transform.height;
-    const x1 = x0 + (tile.width / levelWidth) * this.transform.width;
-    const y1 = y0 + (tile.height / levelHeight) * this.transform.height;
+    const placement = this.getTilePlacementRect(tile, levelWidth, levelHeight);
+    const x0 = placement.x;
+    const y0 = placement.y;
+    const x1 = placement.x + placement.width;
+    const y1 = placement.y + placement.height;
 
     const ndc = this.rectToNdc(x0, y0, x1, y1);
 
@@ -669,6 +821,40 @@ class WebGLTileViewer {
     gl.uniform1i(this.tileSamplerUniform, 0);
 
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+
+  /** Returns CSS-pixel placement for one tile in the current view transform. */
+  private getTilePlacementRect(
+    tile: Pick<LoadedTile, "tx" | "ty" | "width" | "height">,
+    levelWidth: number,
+    levelHeight: number
+  ): TilePlacementRect {
+    const tileSize = this.manifest?.tile_size ?? 256;
+    const x = this.transform.x + ((tile.tx * tileSize) / levelWidth) * this.transform.width;
+    const y = this.transform.y + ((tile.ty * tileSize) / levelHeight) * this.transform.height;
+    const width = (tile.width / levelWidth) * this.transform.width;
+    const height = (tile.height / levelHeight) * this.transform.height;
+    return { x, y, width, height };
+  }
+
+  /** Logs tile upload+placement coordinates for jump/flicker diagnostics. */
+  private logTilePlaced(
+    level: number,
+    tile: Pick<LoadedTile, "tx" | "ty" | "width" | "height">,
+    levelWidth: number,
+    levelHeight: number
+  ): void {
+    this.computeTransform();
+    const placement = this.getTilePlacementRect(tile, levelWidth, levelHeight);
+    logEvent("tile_placed", {
+      level,
+      tx: tile.tx,
+      ty: tile.ty,
+      x: placement.x,
+      y: placement.y,
+      width: placement.width,
+      height: placement.height,
+    });
   }
 
   /** Draws normalized annotation points over image content. */
@@ -801,6 +987,9 @@ class WebGLTileViewer {
 
   /** Handles canvas click by mapping into normalized image coordinates. */
   private readonly handleCanvasClick = (event: MouseEvent): void => {
+    if (this.dragTotalDistance > config.clickMaxDragPx) {
+      return;
+    }
     const bounds = this.canvas.getBoundingClientRect();
     const px = event.clientX - bounds.left;
     const py = event.clientY - bounds.top;
@@ -819,40 +1008,111 @@ class WebGLTileViewer {
     this.onAddAnnotation(x, y);
   };
 
+  /** Handles wheel-based pan/zoom gestures centered at cursor. */
+  private readonly handleWheel = (event: WheelEvent): void => {
+    if (!this.manifest || this.animationId !== null) {
+      return;
+    }
+    event.preventDefault();
+    const bounds = this.canvas.getBoundingClientRect();
+    const mx = event.clientX - bounds.left;
+    const my = event.clientY - bounds.top;
+
+    if (event.ctrlKey) {
+      const factor = event.deltaY < 0 ? 1.1 : 0.9;
+      const previousZoom = this.zoom;
+      const nextZoom = Math.max(1e-6, Math.min(2, previousZoom * factor));
+      const appliedFactor = nextZoom / previousZoom;
+      this.offsetX = mx - (mx - this.offsetX) * appliedFactor;
+      this.offsetY = my - (my - this.offsetY) * appliedFactor;
+      this.zoom = nextZoom;
+    } else if (event.shiftKey) {
+      this.offsetX -= event.deltaY;
+    } else {
+      this.offsetY -= event.deltaY;
+    }
+
+    this.clampPanZoom();
+    logEvent("wheel", {
+      deltaX: event.deltaX,
+      deltaY: event.deltaY,
+      ctrlKey: event.ctrlKey,
+      shiftKey: event.shiftKey,
+    });
+    this.draw();
+    this.maybeChangeFitLevel();
+  };
+
+  /** Starts drag-pan tracking on primary-pointer down. */
+  private readonly handlePointerDown = (event: PointerEvent): void => {
+    if (event.button !== 0 || this.animationId !== null) {
+      return;
+    }
+    logEvent("pointer", { action: "down", button: event.button, x: event.clientX, y: event.clientY });
+    this.isDragging = true;
+    this.dragLastX = event.clientX;
+    this.dragLastY = event.clientY;
+    this.dragStartX = event.clientX;
+    this.dragStartY = event.clientY;
+    this.dragTotalDistance = 0;
+    this.canvas.setPointerCapture(event.pointerId);
+  };
+
+  /** Integrates pointer movement into pan offset while dragging. */
+  private readonly handlePointerMove = (event: PointerEvent): void => {
+    if (!this.isDragging || !this.manifest) {
+      return;
+    }
+    if (this.dragLastX === event.clientX && this.dragLastY === event.clientY) {
+      return;
+    }
+    if (this.dragLastX === this.dragStartX && this.dragLastY === this.dragStartY) {
+      logEvent("pointer", { action: "move_first", x: event.clientX, y: event.clientY });
+    }
+    const dx = event.clientX - this.dragLastX;
+    const dy = event.clientY - this.dragLastY;
+    this.dragTotalDistance += Math.sqrt(dx * dx + dy * dy);
+    this.offsetX += dx;
+    this.offsetY += dy;
+    this.dragLastX = event.clientX;
+    this.dragLastY = event.clientY;
+    this.clampPanZoom();
+    this.draw();
+  };
+
+  /** Ends drag-pan and refreshes level selection if needed. */
+  private readonly handlePointerUp = (event: PointerEvent): void => {
+    logEvent("pointer", { action: "up", button: event.button, x: event.clientX, y: event.clientY });
+    if (!this.isDragging) {
+      return;
+    }
+    this.isDragging = false;
+    this.maybeChangeFitLevel();
+  };
+
   /** Sets up listeners for click and resize-driven level refit. */
   private setupCanvasListeners(): void {
     this.canvas.addEventListener("click", this.handleCanvasClick);
+    this.canvas.addEventListener("wheel", this.handleWheel, { passive: false });
+    this.canvas.addEventListener("pointerdown", this.handlePointerDown);
+    this.canvas.addEventListener("pointermove", this.handlePointerMove);
+    this.canvas.addEventListener("pointerup", this.handlePointerUp);
+    this.canvas.addEventListener("pointercancel", this.handlePointerUp);
 
     if (typeof ResizeObserver !== "undefined") {
       this.resizeObserver = new ResizeObserver(() => {
         this.resize();
+        this.clampPanZoom();
         this.draw();
-
-        if (!this.manifest) {
-          return;
-        }
-
-        const newFitLevel = this.pickFitLevel();
-        if (newFitLevel !== this.fitLevel) {
-          this.fitLevel = newFitLevel;
-          this.loadingLevel = -1;
-          this.loadFitLevelTiles(this.generation);
-        }
+        this.maybeChangeFitLevel();
       });
       this.resizeObserver.observe(this.canvas);
     } else {
       this.windowResizeHandler = () => {
         this.resize();
+        this.clampPanZoom();
         this.draw();
-        if (!this.manifest) {
-          return;
-        }
-        const newFitLevel = this.pickFitLevel();
-        if (newFitLevel !== this.fitLevel) {
-          this.fitLevel = newFitLevel;
-          this.loadingLevel = -1;
-          this.loadFitLevelTiles(this.generation);
-        }
+        this.maybeChangeFitLevel();
       };
       window.addEventListener("resize", this.windowResizeHandler);
     }

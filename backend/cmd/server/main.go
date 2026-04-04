@@ -28,7 +28,7 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/ws", ws.NewHandler(sqlDB))
+	mux.Handle("/ws", ws.NewHandler(sqlDB, cfg.LogsDir))
 	mux.Handle("/images/", http.StripPrefix("/images/", http.FileServer(http.Dir("images"))))
 	mux.Handle("/", http.FileServer(http.Dir(cfg.StaticDir)))
 

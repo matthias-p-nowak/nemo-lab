@@ -6,6 +6,7 @@ const (
 	defaultListenAddr = ":7255"
 	defaultStaticDir  = "dist"
 	defaultDBPath     = "nemo.db"
+	defaultLogsDir    = "logs"
 )
 
 // Config contains runtime configuration loaded from TOML.
@@ -13,6 +14,7 @@ type Config struct {
 	ListenAddr string   `toml:"listen_addr"`
 	StaticDir  string   `toml:"static_dir"`
 	DBPath     string   `toml:"db_path"`
+	LogsDir    string   `toml:"logs_dir"`
 	Admins     []string `toml:"admins"`
 }
 
@@ -22,6 +24,7 @@ func Load(path string) (*Config, error) {
 		ListenAddr: defaultListenAddr,
 		StaticDir:  defaultStaticDir,
 		DBPath:     defaultDBPath,
+		LogsDir:    defaultLogsDir,
 		Admins:     []string{},
 	}
 
@@ -37,6 +40,9 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.DBPath == "" {
 		cfg.DBPath = defaultDBPath
+	}
+	if cfg.LogsDir == "" {
+		cfg.LogsDir = defaultLogsDir
 	}
 	if cfg.Admins == nil {
 		cfg.Admins = []string{}

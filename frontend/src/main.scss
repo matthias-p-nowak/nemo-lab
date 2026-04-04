@@ -152,11 +152,25 @@ button.ghost {
 .image-view__canvas {
   width: 100%;
   height: 100%;
+  margin: 5px;
   display: block;
   border: 1px solid var(--line);
   border-radius: 6px;
-  cursor: crosshair;
+  touch-action: none;
+  cursor: grab;
   background: #11161b;
+
+  &:active {
+    cursor: grabbing;
+  }
+}
+
+.image-view__canvas--zoom-below-max {
+  border-color: #4caf50;
+}
+
+.image-view__canvas--zoom-at-max {
+  border-color: #795548;
 }
 
 .annotation-overlay {

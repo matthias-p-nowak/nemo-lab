@@ -2,12 +2,13 @@ package ws
 
 import (
 	"database/sql"
-	"io"
 	"log"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/matthias-p-nowak/nemo-lab/auth"
+	"github.com/matthias-p-nowak/nemo-lab/logger"
 	"golang.org/x/net/websocket"
 )
 
@@ -17,7 +18,7 @@ var (
 )
 
 // NewHandler builds the /ws handler and validates session cookies before upgrade.
-func NewHandler(db *sql.DB) http.HandlerFunc {
+func NewHandler(db *sql.DB, logsDir string) http.HandlerFunc {
 	_ = db
 
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -29,6 +30,19 @@ func NewHandler(db *sql.DB) http.HandlerFunc {
 
 		websocket.Handler(func(conn *websocket.Conn) {
 			defer conn.Close()
+
+			lgr, loggerErr := logger.New(logsDir, time.Now())
+			if loggerErr != nil {
+				log.Printf("ws logger init failed: %v", loggerErr)
+				lgr = nil
+			}
+			if lgr != nil {
+				_ = lgr.Append(map[string]any{
+					"type":         "connect",
+					"ts":           time.Now().Format(time.RFC3339),
+					"token_prefix": tokenPrefix(cookie.Value),
+				})
+			}
 
 			connectionsMu.Lock()
 			connections[cookie.Value]++
@@ -46,9 +60,36 @@ func NewHandler(db *sql.DB) http.HandlerFunc {
 				remaining := connections[cookie.Value]
 				connectionsMu.Unlock()
 				log.Printf("ws disconnect token=%s active=%d", cookie.Value, remaining)
+
+				if lgr != nil {
+					_ = lgr.Append(map[string]any{
+						"type": "disconnect",
+						"ts":   time.Now().Format(time.RFC3339),
+					})
+					_ = lgr.Close()
+				}
 			}()
 
-			_, _ = io.Copy(io.Discard, conn)
+			for {
+				var msg struct {
+					Type  string         `json:"type"`
+					Entry map[string]any `json:"entry"`
+				}
+				if err := websocket.JSON.Receive(conn, &msg); err != nil {
+					break
+				}
+				if msg.Type == "log" && lgr != nil {
+					_ = lgr.Append(msg.Entry)
+				}
+			}
 		}).ServeHTTP(w, r)
 	}
+}
+
+// tokenPrefix returns the first up-to-8 characters for safe log correlation.
+func tokenPrefix(token string) string {
+	if len(token) <= 8 {
+		return token
+	}
+	return token[:8]
 }
