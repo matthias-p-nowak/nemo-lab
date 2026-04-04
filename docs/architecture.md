@@ -55,6 +55,8 @@
 - `clampPanZoom()` constrains zoom and offsets with a 20px overscroll pad and max zoom `2`, using ordered min/max bounds so pan remains available even when the zoomed image is larger than the canvas.
 - Tile level selection (`pickFitLevel`) is based on current zoomed image target (`zoom * manifest dimension * dpr`), and `maybeChangeFitLevel()` reloads tiles when level changes.
 - Fit-level tile streaming uses a monotonic load-batch generation token so stale async tile callbacks are ignored, including revisits to the same level after intermediate zoom changes.
+- Fit-level tile requests are viewport-culled: only tiles whose level-space rectangle intersects the current viewport are fetched.
+- After wheel zoom/pan and drag-pan movement, fit-level loading is re-evaluated so newly revealed visible tiles are requested even when the selected level does not change.
 - Resize handling clamps pan/zoom, redraws, and re-evaluates fit level.
 - Canvas interaction styling is in `frontend/src/main.scss` with `touch-action: none` and grab/grabbing cursors.
 - Viewer input handlers emit telemetry with module-level `logEvent(...)` over the shared WebSocket.

@@ -611,9 +611,13 @@ class WebGLTileViewer {
     const dims = getLevelDimensions(this.manifest, level);
     const cols = Math.ceil(dims.width / this.manifest.tile_size);
     const rows = Math.ceil(dims.height / this.manifest.tile_size);
+    const tileSize = this.manifest.tile_size;
 
     for (let ty = 0; ty < rows; ty += 1) {
       for (let tx = 0; tx < cols; tx += 1) {
+        if (!this.tileIntersectsViewport(tx, ty, tileSize, dims.width, dims.height)) {
+          continue;
+        }
         const key = `${tx}_${ty}`;
         if (this.fitTiles.has(key)) {
           continue;
@@ -639,6 +643,38 @@ class WebGLTileViewer {
           });
       }
     }
+  }
+
+  /** True when a fit-level tile intersects the current canvas viewport. */
+  private tileIntersectsViewport(
+    tx: number,
+    ty: number,
+    tileSize: number,
+    levelWidth: number,
+    levelHeight: number
+  ): boolean {
+    if (!this.manifest) {
+      return false;
+    }
+
+    const vpImageX0 = (0 - this.offsetX) / this.zoom;
+    const vpImageY0 = (0 - this.offsetY) / this.zoom;
+    const vpImageX1 = (this.canvas.clientWidth - this.offsetX) / this.zoom;
+    const vpImageY1 = (this.canvas.clientHeight - this.offsetY) / this.zoom;
+
+    const scaleX = levelWidth / this.manifest.width;
+    const scaleY = levelHeight / this.manifest.height;
+    const vpX0 = vpImageX0 * scaleX;
+    const vpY0 = vpImageY0 * scaleY;
+    const vpX1 = vpImageX1 * scaleX;
+    const vpY1 = vpImageY1 * scaleY;
+
+    const tileX0 = tx * tileSize;
+    const tileY0 = ty * tileSize;
+    const tileX1 = Math.min((tx + 1) * tileSize, levelWidth);
+    const tileY1 = Math.min((ty + 1) * tileSize, levelHeight);
+
+    return tileX0 < vpX1 && tileX1 > vpX0 && tileY0 < vpY1 && tileY1 > vpY0;
   }
 
   /** Runs the 0.5 second level-0 grow animation to fit scale. */
@@ -1040,7 +1076,11 @@ class WebGLTileViewer {
       shiftKey: event.shiftKey,
     });
     this.draw();
+    const previousLevel = this.fitLevel;
     this.maybeChangeFitLevel();
+    if (this.fitLevel === previousLevel) {
+      this.loadFitLevelTiles(this.generation);
+    }
   };
 
   /** Starts drag-pan tracking on primary-pointer down. */
@@ -1078,6 +1118,11 @@ class WebGLTileViewer {
     this.dragLastY = event.clientY;
     this.clampPanZoom();
     this.draw();
+    const previousLevel = this.fitLevel;
+    this.maybeChangeFitLevel();
+    if (this.fitLevel === previousLevel) {
+      this.loadFitLevelTiles(this.generation);
+    }
   };
 
   /** Ends drag-pan and refreshes level selection if needed. */

@@ -151,6 +151,10 @@ The canvas border color reflects the current zoom state relative to the image's 
 
 The yellow debug `box-shadow` on `.image-view__canvas` is removed.
 
+### Viewport-Culled Tile Loading
+
+Only tiles whose image-space rectangle intersects the current viewport are fetched. Tiles that scroll or zoom out of view while loading are discarded via the existing `loadingGeneration` guard. On pan or zoom, `loadFitLevelTiles` is re-evaluated and any newly visible tiles are requested.
+
 ### Tile Placement Logging
 
 - When a tile texture is uploaded and placed, log a `tile_placed` event with: level, tile coordinates (`tx`, `ty`), and canvas position (`x`, `y`, `width`, `height` in CSS pixels)
