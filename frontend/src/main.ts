@@ -19,20 +19,6 @@ function logEvent(type: string, data: Record<string, unknown> = {}): void {
   ws.send(JSON.stringify({ type: "log", entry: { type, ts: new Date().toISOString(), ...data } }));
 }
 
-/** Last-seen state per item key; used by traceState to suppress duplicate log entries. */
-const _traceStateCache = new Map<string, string>();
-
-/**
- * Logs {type:"trace_state", item, state} only when the state value differs
- * from the previously recorded value for that item.
- */
-function traceState(item: string, state: string): void {
-  if (_traceStateCache.get(item) === state) {
-    return;
-  }
-  _traceStateCache.set(item, state);
-  logEvent("trace_state", { item, state });
-}
 
 document.addEventListener("focusin", (e) =>
   logEvent("focus", { action: "in", target: (e.target as Element | null)?.tagName ?? "unknown" })
@@ -361,11 +347,7 @@ class WebGLTileViewer {
   private dragLastX = 0;
   /** Previous pointer Y used for drag delta integration. */
   private dragLastY = 0;
-  /** Pointer X at drag start, used to detect the first move event. */
-  private dragStartX = 0;
-  /** Pointer Y at drag start, used to detect the first move event. */
-  private dragStartY = 0;
-  /** Accumulated pointer travel in CSS px since last pointerdown. */
+/** Accumulated pointer travel in CSS px since last pointerdown. */
   private dragTotalDistance = 0;
 
   constructor(
@@ -580,17 +562,11 @@ class WebGLTileViewer {
 
     const tileUrl = this.tileUrl(0, 0, 0);
     try {
-      const fetchStart = performance.now();
       const image = await loadImage(tileUrl);
       if (requestId !== this.generation) {
         return;
       }
-      const fetchMs = performance.now() - fetchStart;
-      const uploadStart = performance.now();
       this.level0Tile = this.uploadTileTexture(0, 0, image);
-      const uploadMs = performance.now() - uploadStart;
-      const dims = getLevelDimensions(this.manifest, 0);
-      this.logTilePlaced(0, this.level0Tile, dims.width, dims.height, fetchMs, uploadMs);
       this.draw();
     } catch (error) {
       console.error("tile viewer: level0 tile load failed", error);
@@ -628,7 +604,6 @@ class WebGLTileViewer {
         }
 
         const url = this.tileUrl(level, tx, ty);
-        const fetchStart = performance.now();
         void loadImage(url)
           .then((image) => {
             if (
@@ -638,12 +613,8 @@ class WebGLTileViewer {
             ) {
               return;
             }
-            const fetchMs = performance.now() - fetchStart;
-            const uploadStart = performance.now();
             const tile = this.uploadTileTexture(tx, ty, image);
-            const uploadMs = performance.now() - uploadStart;
             this.fitTiles.set(key, tile);
-            this.logTilePlaced(level, tile, dims.width, dims.height, fetchMs, uploadMs);
             this.draw();
           })
           .catch((error) => {
@@ -807,7 +778,6 @@ class WebGLTileViewer {
     const yMin = Math.min(yA, yB);
     const yMax = Math.max(yA, yB);
     this.offsetY = Math.max(yMin, Math.min(yMax, this.offsetY));
-    traceState("pan_zoom", `${this.zoom},${this.offsetX},${this.offsetY}`);
   }
 
   /** Reloads fit-level tiles if zoom-driven target level changed. */
@@ -881,31 +851,7 @@ class WebGLTileViewer {
     return { x, y, width, height };
   }
 
-  /** Logs tile upload+placement coordinates for jump/flicker diagnostics. */
-  private logTilePlaced(
-    level: number,
-    tile: Pick<LoadedTile, "tx" | "ty" | "width" | "height">,
-    levelWidth: number,
-    levelHeight: number,
-    fetchMs: number,
-    uploadMs: number
-  ): void {
-    this.computeTransform();
-    const placement = this.getTilePlacementRect(tile, levelWidth, levelHeight);
-    logEvent("tile_placed", {
-      level,
-      tx: tile.tx,
-      ty: tile.ty,
-      x: placement.x,
-      y: placement.y,
-      width: placement.width,
-      height: placement.height,
-      fetchMs,
-      uploadMs,
-    });
-  }
-
-  /** Draws normalized annotation points over image content. */
+/** Draws normalized annotation points over image content. */
   private drawAnnotations(): void {
     const annotations = this.getAnnotations();
     if (annotations.length === 0) {
@@ -1081,12 +1027,6 @@ class WebGLTileViewer {
     }
 
     this.clampPanZoom();
-    logEvent("wheel", {
-      deltaX: event.deltaX,
-      deltaY: event.deltaY,
-      ctrlKey: event.ctrlKey,
-      shiftKey: event.shiftKey,
-    });
     this.draw();
     const previousLevel = this.fitLevel;
     this.maybeChangeFitLevel();
@@ -1100,12 +1040,9 @@ class WebGLTileViewer {
     if (event.button !== 0 || this.animationId !== null) {
       return;
     }
-    logEvent("pointer", { action: "down", button: event.button, x: event.clientX, y: event.clientY });
     this.isDragging = true;
     this.dragLastX = event.clientX;
     this.dragLastY = event.clientY;
-    this.dragStartX = event.clientX;
-    this.dragStartY = event.clientY;
     this.dragTotalDistance = 0;
     this.canvas.setPointerCapture(event.pointerId);
   };
@@ -1117,9 +1054,6 @@ class WebGLTileViewer {
     }
     if (this.dragLastX === event.clientX && this.dragLastY === event.clientY) {
       return;
-    }
-    if (this.dragLastX === this.dragStartX && this.dragLastY === this.dragStartY) {
-      logEvent("pointer", { action: "move_first", x: event.clientX, y: event.clientY });
     }
     const dx = event.clientX - this.dragLastX;
     const dy = event.clientY - this.dragLastY;
@@ -1138,8 +1072,7 @@ class WebGLTileViewer {
   };
 
   /** Ends drag-pan and refreshes level selection if needed. */
-  private readonly handlePointerUp = (event: PointerEvent): void => {
-    logEvent("pointer", { action: "up", button: event.button, x: event.clientX, y: event.clientY });
+  private readonly handlePointerUp = (_event: PointerEvent): void => {
     if (!this.isDragging) {
       return;
     }

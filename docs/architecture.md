@@ -60,7 +60,7 @@
 - Resize handling clamps pan/zoom, redraws, and re-evaluates fit level.
 - Canvas interaction styling is in `frontend/src/main.scss` with `touch-action: none` and grab/grabbing cursors.
 - Viewer input handlers emit telemetry with module-level `logEvent(...)` over the shared WebSocket.
-- Logged frontend events include `wheel`, `pointer` (`down`/`up`/`move_first`), `pan_zoom` (via `traceState`, deduplicated), `image_change`, document `focus` (`focusin`/`focusout`), and `tile_placed` (level, `tx`, `ty`, CSS-pixel placement `x`, `y`, `width`, `height`, plus `fetchMs` and `uploadMs` timings for tile fetch and WebGL upload).
+- Logged frontend events: `image_change` and document `focus` (`focusin`/`focusout`).
 - Canvas click adds an annotation only if total pointer travel since `pointerdown` is ≤ `config.clickMaxDragPx` (default 10 CSS px); longer drags are treated as pan gestures and suppressed.
 - The canvas border color indicates zoom resolution: green when `fitLevel < manifest.levels - 1` (below max tile resolution), brown when at the finest level. Updated via a CSS class toggled on the canvas element after each zoom change. The yellow debug box-shadow is removed.
 - The entrance animation duration is 200 ms.
