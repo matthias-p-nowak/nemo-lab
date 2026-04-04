@@ -86,3 +86,41 @@ CREATE TABLE users (
 - Requires valid session cookie; returns 401 otherwise
 - One connection per browser tab; server tracks open connections keyed by session token
 - Serves as bidirectional communication channel and tab identifier
+
+## Frontend
+
+### Layout
+
+- Left collapsible sidebar: previous / next image buttons
+- Center image view: single WebGL canvas fills the area
+- Right collapsible sidebar: collapsible panels — optics, masks, labels, annotations, comment/annotation, comment/picture
+
+### Image Viewer
+
+- Single WebGL canvas fills the center image-view area
+- On window resize: refit image to canvas, redraw
+- No zoom/pan/rotate in this prototype
+- Tile metadata loaded from `manifest.json` (`width`, `height`, `tile_size`, `levels`, `tiles` URL pattern)
+- Tile level selection at fit-to-screen: pick the level whose resolution first exceeds the canvas size in CSS pixels × `devicePixelRatio`
+
+### Coordinate Systems
+
+- **Image space**: normalized 0..1 in both axes, origin top-left
+- **Canvas space**: CSS pixels, resized to fill the image-view area
+- Click position is mapped from canvas space → image space using the current fit transform
+
+### Load Sequence
+
+1. Fetch `manifest.json`
+2. Fetch level-0 tile (`tiles/0/0_0.png`) — small, arrives fast
+3. Upload level-0 tile as a WebGL texture; render at natural size centered in canvas
+4. Over **0.5 s** animate it growing to fit-to-screen
+5. In parallel, fetch all tiles for the appropriate fit-to-screen level
+6. As each tile arrives, upload as WebGL texture and blit at correct position — replacing the corresponding region of the level-0 texture
+7. On resize: recompute fit level, re-fetch tiles for new level if it changed, redraw
+
+### Annotations
+
+- Drawn in the same WebGL render pass on top of image tiles — no overlay div
+- Click on canvas → convert to image coordinates → add annotation point → redraw
+- Removing a dot: update annotation list, redraw — no image reload
