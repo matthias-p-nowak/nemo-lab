@@ -7,7 +7,7 @@
       "command": "esbuild",
       "args": [
         "--bundle",
-        "frontend/src/app.ts",
+        "frontend/src/main.ts",
         "--outdir=${workspaceFolder}/dist/js",
         "--sourcemap",
         "--watch"
