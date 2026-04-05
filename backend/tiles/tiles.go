@@ -7,10 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"image/color"
 	stddraw "image/draw"
 	_ "image/jpeg"
 	"image/png"
 	"io/fs"
+	"log"
 	"math"
 	"net/http"
 	"os"
@@ -153,7 +155,7 @@ func ensureService() *Service {
 // It returns the cached manifest path on success.
 func EnsureGeneratedByPath(absPath string) (string, error) {
 	svc := ensureService()
-	return svc.ensureGeneratedByPath(absPath, nil)
+	return svc.ensureGeneratedByPath(absPath, nil, nil)
 }
 
 // GenerateByPathWithProgress generates tiles for absPath, calling onLevel(level, totalLevels)
@@ -161,7 +163,18 @@ func EnsureGeneratedByPath(absPath string) (string, error) {
 // If tiles are already cached, onLevel is not called and the manifest path is returned immediately.
 func GenerateByPathWithProgress(absPath string, onLevel func(level, totalLevels int)) (string, error) {
 	svc := ensureService()
-	return svc.ensureGeneratedByPath(absPath, onLevel)
+	return svc.ensureGeneratedByPath(absPath, onLevel, nil)
+}
+
+// GenerateByPathWithProgressAndEvents is like GenerateByPathWithProgress, but also emits
+// structured generation events through onEvent. Event maps always include a "type" field.
+func GenerateByPathWithProgressAndEvents(
+	absPath string,
+	onLevel func(level, totalLevels int),
+	onEvent func(map[string]any),
+) (string, error) {
+	svc := ensureService()
+	return svc.ensureGeneratedByPath(absPath, onLevel, onEvent)
 }
 
 // ManifestPathForHash returns the expected cached manifest path for a hash.
@@ -170,13 +183,31 @@ func ManifestPathForHash(hash string) string {
 	return svc.manifestPath(hash)
 }
 
-func (s *Service) ensureGeneratedByPath(absPath string, onLevel func(level, totalLevels int)) (string, error) {
+func (s *Service) ensureGeneratedByPath(
+	absPath string,
+	onLevel func(level, totalLevels int),
+	onEvent func(map[string]any),
+) (string, error) {
+	emit := func(kind string, fields map[string]any) {
+		if onEvent == nil {
+			return
+		}
+		entry := map[string]any{"type": kind}
+		for k, v := range fields {
+			entry[k] = v
+		}
+		onEvent(entry)
+	}
+
 	if strings.TrimSpace(absPath) == "" {
 		return "", errors.New("invalid image path")
 	}
 	hash := HashForPath(absPath)
 	manifestPath := s.manifestPath(hash)
 	if _, err := os.Stat(s.completePath(hash)); err == nil {
+		emit("tile_generation_cache_hit", map[string]any{
+			"hash": hash,
+		})
 		return manifestPath, nil
 	}
 
@@ -185,8 +216,18 @@ func (s *Service) ensureGeneratedByPath(absPath string, onLevel func(level, tota
 	defer lock.Unlock()
 
 	if _, err := os.Stat(s.completePath(hash)); err == nil {
+		emit("tile_generation_cache_hit", map[string]any{
+			"hash": hash,
+		})
 		return manifestPath, nil
 	}
+
+	t0 := time.Now()
+	log.Printf("tiles start hash=%.16s path=%s", hash, absPath)
+	emit("tile_generation_start", map[string]any{
+		"hash": hash,
+		"path": absPath,
+	})
 
 	src, err := decodeImage(absPath)
 	if err != nil {
@@ -195,13 +236,21 @@ func (s *Service) ensureGeneratedByPath(absPath string, onLevel func(level, tota
 	b := src.Bounds()
 	width, height := b.Dx(), b.Dy()
 	totalLevels := computeLevels(width, height)
+	log.Printf("tiles decoded hash=%.16s size=%dx%d levels=%d elapsed=%s", hash, width, height, totalLevels, time.Since(t0).Round(time.Millisecond))
+	emit("tile_generation_decoded", map[string]any{
+		"hash":         hash,
+		"width":        width,
+		"height":       height,
+		"total_levels": totalLevels,
+		"elapsed_ms":   time.Since(t0).Milliseconds(),
+	})
 
 	// Write full manifest up front — all fields are known before any tiles are written.
 	if err := s.writeManifest(hash, width, height, totalLevels); err != nil {
 		return "", err
 	}
 
-	_, _, _, err = s.generateTiles(hash, src, onLevel)
+	_, _, _, err = s.generateTiles(hash, src, onLevel, onEvent, t0)
 	if err != nil {
 		return "", err
 	}
@@ -210,10 +259,32 @@ func (s *Service) ensureGeneratedByPath(absPath string, onLevel func(level, tota
 	if err := os.WriteFile(s.completePath(hash), nil, 0o644); err != nil {
 		return "", err
 	}
+	log.Printf("tiles complete hash=%.16s total=%s", hash, time.Since(t0).Round(time.Millisecond))
+	emit("tile_generation_complete", map[string]any{
+		"hash":       hash,
+		"elapsed_ms": time.Since(t0).Milliseconds(),
+	})
 	return manifestPath, nil
 }
 
-func (s *Service) generateTiles(hash string, src image.Image, onLevel func(level, totalLevels int)) (int, int, int, error) {
+func (s *Service) generateTiles(
+	hash string,
+	src image.Image,
+	onLevel func(level, totalLevels int),
+	onEvent func(map[string]any),
+	t0 time.Time,
+) (int, int, int, error) {
+	emit := func(kind string, fields map[string]any) {
+		if onEvent == nil {
+			return
+		}
+		entry := map[string]any{"type": kind}
+		for k, v := range fields {
+			entry[k] = v
+		}
+		onEvent(entry)
+	}
+
 	b := src.Bounds()
 	width := b.Dx()
 	height := b.Dy()
@@ -244,6 +315,11 @@ func (s *Service) generateTiles(hash string, src image.Image, onLevel func(level
 			prev = scaled
 		}
 	}
+	log.Printf("tiles mipmap done hash=%.16s elapsed=%s", hash, time.Since(t0).Round(time.Millisecond))
+	emit("tile_generation_mipmap_done", map[string]any{
+		"hash":       hash,
+		"elapsed_ms": time.Since(t0).Milliseconds(),
+	})
 
 	for _, w := range chain {
 		level, scaled, lw, lh := w.level, w.img, w.lw, w.lh
@@ -266,6 +342,15 @@ func (s *Service) generateTiles(hash string, src image.Image, onLevel func(level
 				}
 			}
 		}
+		log.Printf("tiles level done hash=%.16s level=%d/%d size=%dx%d elapsed=%s", hash, level, levels-1, lw, lh, time.Since(t0).Round(time.Millisecond))
+		emit("tile_generation_level_done", map[string]any{
+			"hash":         hash,
+			"level":        level,
+			"total_levels": levels,
+			"width":        lw,
+			"height":       lh,
+			"elapsed_ms":   time.Since(t0).Milliseconds(),
+		})
 		if onLevel != nil {
 			onLevel(level, levels)
 		}
@@ -457,14 +542,72 @@ func writePNG(path string, src image.Image) error {
 	return pngEncoder.Encode(f, src)
 }
 
+// resizeImage downscales src to the target width×height.
+// When the target is exactly half the source dimensions (the mipmap case) it
+// uses a fast 2×2 box filter operating directly on the RGBA pixel buffer.
+// Any other ratio falls back to CatmullRom.
 func resizeImage(src image.Image, width, height int) image.Image {
 	dst := image.NewRGBA(image.Rect(0, 0, width, height))
-	if src.Bounds().Dx() == width && src.Bounds().Dy() == height {
-		stddraw.Draw(dst, dst.Bounds(), src, src.Bounds().Min, stddraw.Src)
+	sb := src.Bounds()
+	if sb.Dx() == width && sb.Dy() == height {
+		stddraw.Draw(dst, dst.Bounds(), src, sb.Min, stddraw.Src)
 		return dst
 	}
-	xdraw.CatmullRom.Scale(dst, dst.Bounds(), src, src.Bounds(), stddraw.Src, nil)
+	if sb.Dx() == width*2 && sb.Dy() == height*2 {
+		boxFilter2x(dst, src)
+		return dst
+	}
+	xdraw.CatmullRom.Scale(dst, dst.Bounds(), src, sb, stddraw.Src, nil)
 	return dst
+}
+
+// boxFilter2x downscales src into dst using a 2×2 box filter.
+// src must be exactly twice the width and height of dst.
+// Works on the raw RGBA pixel buffer of src for maximum throughput.
+func boxFilter2x(dst *image.RGBA, src image.Image) {
+	sw := src.Bounds().Dx()
+	sh := src.Bounds().Dy()
+	dw := sw / 2
+	dh := sh / 2
+
+	// Fast path: source is already *image.RGBA — operate on the raw pix buffer.
+	if rgba, ok := src.(*image.RGBA); ok {
+		sp := rgba.Stride
+		dp := dst.Stride
+		for y := 0; y < dh; y++ {
+			srcRow0 := y * 2 * sp
+			srcRow1 := srcRow0 + sp
+			dstRow := y * dp
+			for x := 0; x < dw; x++ {
+				s0 := srcRow0 + x*2*4
+				s1 := srcRow0 + (x*2+1)*4
+				s2 := srcRow1 + x*2*4
+				s3 := srcRow1 + (x*2+1)*4
+				d := dstRow + x*4
+				dst.Pix[d+0] = uint8((uint32(rgba.Pix[s0+0]) + uint32(rgba.Pix[s1+0]) + uint32(rgba.Pix[s2+0]) + uint32(rgba.Pix[s3+0])) >> 2)
+				dst.Pix[d+1] = uint8((uint32(rgba.Pix[s0+1]) + uint32(rgba.Pix[s1+1]) + uint32(rgba.Pix[s2+1]) + uint32(rgba.Pix[s3+1])) >> 2)
+				dst.Pix[d+2] = uint8((uint32(rgba.Pix[s0+2]) + uint32(rgba.Pix[s1+2]) + uint32(rgba.Pix[s2+2]) + uint32(rgba.Pix[s3+2])) >> 2)
+				dst.Pix[d+3] = uint8((uint32(rgba.Pix[s0+3]) + uint32(rgba.Pix[s1+3]) + uint32(rgba.Pix[s2+3]) + uint32(rgba.Pix[s3+3])) >> 2)
+			}
+		}
+		return
+	}
+
+	// Slow path: source implements image.Image but is not *image.RGBA.
+	for y := 0; y < dh; y++ {
+		for x := 0; x < dw; x++ {
+			r0, g0, b0, a0 := src.At(x*2, y*2).RGBA()
+			r1, g1, b1, a1 := src.At(x*2+1, y*2).RGBA()
+			r2, g2, b2, a2 := src.At(x*2, y*2+1).RGBA()
+			r3, g3, b3, a3 := src.At(x*2+1, y*2+1).RGBA()
+			dst.SetRGBA(x, y, color.RGBA{
+				R: uint8(((r0 + r1 + r2 + r3) >> 2) >> 8),
+				G: uint8(((g0 + g1 + g2 + g3) >> 2) >> 8),
+				B: uint8(((b0 + b1 + b2 + b3) >> 2) >> 8),
+				A: uint8(((a0 + a1 + a2 + a3) >> 2) >> 8),
+			})
+		}
+	}
 }
 
 func computeLevels(width, height int) int {

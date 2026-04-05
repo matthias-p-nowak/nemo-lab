@@ -169,22 +169,29 @@ func handlePrefetch(token string, conn *websocket.Conn, lgr *logger.Logger, hash
 
 	firstHash := hashes[0]
 	if absPath, ok := hashToPath[firstHash]; ok {
-		_, err := tiles.GenerateByPathWithProgress(absPath, func(level, totalLevels int) {
-			log.Printf("ws image_ready token=%s hash=%.16s level=%d/%d", tokenPrefix(token), firstHash, level, totalLevels-1)
-			logAppend(lgr, map[string]any{
-				"type":         "image_ready",
-				"ts":           time.Now().Format(time.RFC3339),
-				"hash":         firstHash,
-				"level":        level,
-				"total_levels": totalLevels,
-			})
-			_ = websocket.JSON.Send(conn, map[string]any{
-				"type":         "image_ready",
-				"hash":         firstHash,
-				"level":        level,
-				"total_levels": totalLevels,
-			})
-		})
+		_, err := tiles.GenerateByPathWithProgressAndEvents(
+			absPath,
+			func(level, totalLevels int) {
+				log.Printf("ws image_ready token=%s hash=%.16s level=%d/%d", tokenPrefix(token), firstHash, level, totalLevels-1)
+				logAppend(lgr, map[string]any{
+					"type":         "image_ready",
+					"ts":           time.Now().Format(time.RFC3339),
+					"hash":         firstHash,
+					"level":        level,
+					"total_levels": totalLevels,
+				})
+				_ = websocket.JSON.Send(conn, map[string]any{
+					"type":         "image_ready",
+					"hash":         firstHash,
+					"level":        level,
+					"total_levels": totalLevels,
+				})
+			},
+			func(entry map[string]any) {
+				entry["ts"] = time.Now().Format(time.RFC3339)
+				logAppend(lgr, entry)
+			},
+		)
 		if err != nil {
 			log.Printf("ws prefetch tile generation failed token=%s hash=%.16s err=%v", tokenPrefix(token), firstHash, err)
 			logAppend(lgr, map[string]any{
