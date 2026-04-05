@@ -35,7 +35,10 @@ nemo-lab/
 | `static_dir`  | string   | `dist`    | Path to compiled frontend assets         |
 | `db_path`     | string   | `nemo.db` | Path to the SQLite database file         |
 | `logs_dir`    | string   | `logs`    | Path for per-session JSONL log files     |
-| `admins`      | []string | `[]`      | Usernames with admin privileges          |
+| `admins`               | []string | `[]`                  | Usernames with admin privileges                          |
+| `cache_dir`            | string   | `/tmp/nemo-lab/cache` | Root directory for the on-demand tile cache              |
+| `cache_limit_mb`       | int      | `512`                 | Maximum cache size in megabytes; oldest tiles evicted    |
+| `cache_evict_interval` | string   | `5m`                  | How often the eviction check runs (Go duration string)   |
 
 Example `nemo.toml`:
 ```toml
@@ -44,7 +47,58 @@ static_dir  = "dist"
 db_path     = "nemo.db"
 logs_dir    = "logs"
 admins      = ["ma"]
+cache_dir            = "/tmp/nemo-lab/cache"
+cache_limit_mb       = 512
+cache_evict_interval = "5m"
 ```
+
+### Image Handling
+
+When a `set_active_task` WS message is received the backend:
+1. Looks up `task.images` folder path from the DB by `task_id`.
+2. Recursively scans the folder for image files (`.png`, `.jpg`, `.jpeg`, `.tif`, `.tiff`), sorted by full path.
+3. Computes SHA-256 of each file's canonical path as its cache key (hash).
+4. Pushes an `image_list` message to the client:
+   ```json
+   { "type": "image_list", "images": [{ "filename": "rel/path.png", "hash": "<sha256>" }, ...] }
+   ```
+5. Stores a session-local `hash → absolute path` map for use by tiling jobs.
+
+The frontend on receiving `image_list`:
+- Resets current index to 0, stores the list.
+- Immediately sends a `prefetch` message for the current image and the next 8 hashes.
+- On navigation advances, sends `prefetch` for the new current image and next 8.
+
+### Tile Cache
+
+- Tiles are generated exclusively via WS `prefetch` messages — **not** on HTTP request.
+- Cache key: SHA-256 of the image's canonical file path.
+- Cache layout: `cache_dir/<hash>/manifest.json` and `cache_dir/<hash>/tiles/<level>/<x>_<y>.png`.
+- **Tile size: 256 px** (matches `images/tile.py`).
+- **Zoom levels**: coarsest level (0) fits the image in a single tile; finest level is full resolution. Formula: `ceil(log2(max(width, height) / tile_size)) + 1`.
+- **Level convention**: level 0 = coarsest (1 tile), level N-1 = full resolution — same as `tile.py`.
+- Tile generation uses scaled dimensions per level `round(width * scale)` / `round(height * scale)` and writes edge tiles cropped to content bounds (no 256px padding on edges).
+- Cache eviction: background goroutine runs every `cache_evict_interval`; walks cache, sorts files by last-access time, removes oldest until total size ≤ `cache_limit_mb`.
+- HTTP endpoints serve only from cache (no generation): return 404 if not yet tiled.
+  - `GET /images/<hash>/manifest.json`
+  - `GET /images/<hash>/tiles/{z}/{x}_{y}.png`
+
+### WS Protocol: prefetch and image_ready
+
+**Frontend → backend** `prefetch`:
+```json
+{ "type": "prefetch", "hashes": ["<hash0>", "<hash1>", ...] }
+```
+Backend processes in order:
+1. Resolves each hash to a file path via the session's hash→path map.
+2. Applies double-checked locking: check manifest exists → acquire per-hash write lock → re-check → generate if absent → release.
+3. When the **first hash** is ready, pushes `image_ready` to the client:
+   ```json
+   { "type": "image_ready", "hash": "<hash0>" }
+   ```
+4. Remaining hashes are tiled in background; no `image_ready` is sent for them.
+
+**Backend → frontend** `image_ready`: frontend loads `/images/<hash>/manifest.json` and displays the image.
 
 ### Logging
 

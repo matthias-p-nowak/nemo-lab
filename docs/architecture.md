@@ -2,18 +2,35 @@
 
 ## Backend runtime wiring
 
-- `backend/cmd/server/main.go` loads config from `nemo.toml`, opens SQLite, syncs `users.is_admin` from config admins, registers routes, wraps all routes with auth middleware, and starts the HTTP server.
+- `backend/cmd/server/main.go` loads config from `nemo.toml`, opens SQLite, syncs `users.is_admin` from config admins, configures tile cache service, registers routes, wraps all routes with auth middleware, and starts the HTTP server.
 - Routes:
   - `/api/me` handled by `backend/cmd/server/main.go` and returns `username` + `is_admin` for the authenticated user.
   - `/api/tasks` handled by task handlers in `backend/cmd/server/main.go` backed by `backend/tasks`.
   - `/ws` handled by `backend/ws`.
+  - `/images/` handled by `backend/tiles` for tile-manifest and tile-PNG requests, with static fallback to `images/` for other paths.
   - `/` served by static file server rooted at configured `static_dir`.
 
 ## Config
 
 - Implemented in `backend/config/config.go` using TOML (`BurntSushi/toml`).
-- Fields: `listen_addr`, `static_dir`, `db_path`, `logs_dir`, `admins`.
-- Defaults if missing: `:7255`, `dist`, `nemo.db`, `logs`, `[]`.
+- Fields: `listen_addr`, `static_dir`, `db_path`, `logs_dir`, `admins`, `cache_dir`, `cache_limit_mb`, `cache_evict_interval`.
+- Defaults if missing: `:7255`, `dist`, `nemo.db`, `logs`, `[]`, `/tmp/nemo-lab/cache`, `512`, `5m`.
+
+## Tiles cache
+
+- Implemented in `backend/tiles/tiles.go`.
+- `tiles.Configure(cacheDir, cacheLimitMB, cacheEvictInterval)` initializes a package-global service and starts background eviction.
+- `tiles.NewHandler()` handles:
+  - `GET /images/{hash}/manifest.json`
+  - `GET /images/{hash}/tiles/{z}/{x}_{y}.png`
+  - fallback static serving from `images/` for other `/images/*` paths.
+- `tiles.HashForPath(absPath)` computes SHA-256 hash keys from canonical absolute image paths.
+- `tiles.EnsureGeneratedByPath(absPath)` performs double-checked per-hash generation into cache and returns manifest path.
+- HTTP tile handler is cache-only and does not trigger generation.
+- Cache namespace is per path hash (`SHA-256(absPath)`): `{cache_dir}/{hash}/manifest.json` and `{cache_dir}/{hash}/tiles/{z}/{x}_{y}.png`.
+- Tile generation follows the `images/tile.py` level formula and level conventions; edge tiles are persisted at cropped dimensions.
+- Concurrent generation for the same hash is serialized by in-flight mutexes.
+- Eviction removes oldest files by modification time until total cache size is at or below `cache_limit_mb`.
 
 ## Database
 
@@ -46,7 +63,18 @@
 - Per connection, backend creates one JSONL session log file via `backend/logger/logger.go` in configured `logs_dir`.
 - Session log filenames use `dd-HH-mm-ss.jsonl`; logger enforces max 20 files by deleting oldest lexicographic file before create.
 - Backend appends connect/disconnect entries (`type`, `ts`, and `token_prefix` on connect).
-- Backend reads JSON WS messages and appends entries only for `{ "type": "log", "entry": { ... } }`.
+- Session state stores `activeTaskID` and a hash-to-path map for scanned task images.
+- `set_active_task` handling:
+  - looks up `tasks.images` path for task id
+  - recursively scans image files
+  - canonicalizes absolute paths and computes `tiles.HashForPath`
+  - stores session hash→path map
+  - pushes `{ "type": "image_list", "images": [{ "filename", "hash" }, ...] }`.
+- `prefetch` handling:
+  - resolves hashes against the session map
+  - synchronously tiles `hashes[0]` via `tiles.EnsureGeneratedByPath`, then pushes `{ "type": "image_ready", "hash": ... }`
+  - tiles remaining hashes asynchronously without additional ready events.
+- Logging messages continue to be appended from `{ "type": "log", "entry": { ... } }` payloads; `set_active_task` can arrive either top-level or as a logged event entry.
 
 ## Tasks API
 
@@ -91,6 +119,9 @@
 ## Frontend image viewer
 
 - Implemented in `frontend/src/main.ts` (`WebGLTileViewer`).
+- Task image source is WS-driven: frontend receives `image_list`, stores `{filename, hash}` entries, and requests tiling via `prefetch`.
+- Previous/next navigation updates the current index and sends a new `prefetch` window; image display waits for backend `image_ready`.
+- On `image_ready`, frontend loads viewer manifests/tiles using hash-based URLs (`/images/{hash}/manifest.json` + manifest tile template).
 - Viewer state now tracks `zoom`, `offsetX`, and `offsetY` for interactive navigation.
 - Initial image load sets pan/zoom to centered fit (`fitScaleForDimensions(manifest.width, manifest.height)`), then starts the existing level-0 entrance animation.
 - Wheel and pointer behavior:

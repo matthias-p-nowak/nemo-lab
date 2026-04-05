@@ -30,12 +30,11 @@ document.addEventListener("focusout", (e) =>
   logEvent("focus", { action: "out", target: (e.target as Element | null)?.tagName ?? "unknown" })
 );
 
-/** Supported image names for prototype navigation. */
-const imageNames: string[] = ["r00000000f0.png", "00001140.png"];
-
 /** Mutable prototype application state. */
 const appState = {
   currentImageIndex: 0,
+  imageList: [] as { filename: string; hash: string }[],
+  currentImageHash: null as string | null,
   leftCollapsed: false,
   rightCollapsed: false,
   panelCollapsed: {
@@ -261,33 +260,100 @@ if (!appRoot) {
 /** Shared WebGL viewer instance bound to current canvas. */
 let viewer: WebGLTileViewer | null = null;
 
-/** Returns the active image file name. */
-function getCurrentImageName(): string {
-  return imageNames[appState.currentImageIndex];
+/** Returns the active image list entry or null when no task image is loaded. */
+function getCurrentImageEntry(): { filename: string; hash: string } | null {
+  if (appState.currentImageIndex < 0 || appState.currentImageIndex >= appState.imageList.length) {
+    return null;
+  }
+  return appState.imageList[appState.currentImageIndex] ?? null;
 }
 
-/** Converts a file name to its tiled folder name. */
-function toImageStem(imageName: string): string {
-  const lastDot = imageName.lastIndexOf(".");
-  return lastDot > 0 ? imageName.slice(0, lastDot) : imageName;
+/** Returns the active image display label for sidebar metadata. */
+function getCurrentImageLabel(): string {
+  return getCurrentImageEntry()?.filename ?? "(none)";
+}
+
+/** Sends prefetch request for current and next nearby images. */
+function sendPrefetch(images: { hash: string }[], fromIndex: number): void {
+  const hashes = images.slice(fromIndex, fromIndex + 9).map((img) => img.hash);
+  if (hashes.length === 0 || ws.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  ws.send(JSON.stringify({ type: "prefetch", hashes }));
 }
 
 /** Moves to previous image and resets annotation list. */
 function goPreviousImage(): void {
+  if (appState.imageList.length === 0) {
+    return;
+  }
   appState.currentImageIndex =
-    (appState.currentImageIndex - 1 + imageNames.length) % imageNames.length;
+    (appState.currentImageIndex - 1 + appState.imageList.length) % appState.imageList.length;
   appState.annotations = [];
-  logEvent("image_change", { image: getCurrentImageName() });
+  const current = getCurrentImageEntry();
+  if (current) {
+    logEvent("image_change", { filename: current.filename, hash: current.hash });
+  }
+  sendPrefetch(appState.imageList, appState.currentImageIndex);
   render();
 }
 
 /** Moves to next image and resets annotation list. */
 function goNextImage(): void {
-  appState.currentImageIndex = (appState.currentImageIndex + 1) % imageNames.length;
+  if (appState.imageList.length === 0) {
+    return;
+  }
+  appState.currentImageIndex = (appState.currentImageIndex + 1) % appState.imageList.length;
   appState.annotations = [];
-  logEvent("image_change", { image: getCurrentImageName() });
+  const current = getCurrentImageEntry();
+  if (current) {
+    logEvent("image_change", { filename: current.filename, hash: current.hash });
+  }
+  sendPrefetch(appState.imageList, appState.currentImageIndex);
   render();
 }
+
+ws.addEventListener("message", (event) => {
+  let msg: unknown;
+  try {
+    msg = JSON.parse(event.data as string);
+  } catch {
+    return;
+  }
+  if (typeof msg !== "object" || msg === null || !("type" in msg)) {
+    return;
+  }
+  const m = msg as Record<string, unknown>;
+
+  if (m["type"] === "image_list") {
+    const images = Array.isArray(m["images"])
+      ? (m["images"] as Array<Record<string, unknown>>)
+        .filter((item) => typeof item["filename"] === "string" && typeof item["hash"] === "string")
+        .map((item) => ({ filename: String(item["filename"]), hash: String(item["hash"]) }))
+      : [];
+    appState.imageList = images;
+    appState.currentImageIndex = 0;
+    appState.currentImageHash = null;
+    appState.annotations = [];
+    render();
+    if (images.length > 0) {
+      sendPrefetch(images, 0);
+    }
+    return;
+  }
+
+  if (m["type"] === "image_ready") {
+    const hash = m["hash"];
+    if (typeof hash !== "string" || hash.length === 0) {
+      return;
+    }
+    appState.currentImageHash = hash;
+    appState.annotations = [];
+    if (viewer) {
+      void viewer.setImage(hash);
+    }
+  }
+});
 
 /** Toggles left sidebar visibility state. */
 function toggleLeftSidebar(): void {
@@ -1390,7 +1456,9 @@ function mountViewer(): void {
 
   const { gamma, multiply, add } = appState.optics;
   viewer.setOptics(gamma, multiply, add);
-  void viewer.setImage(toImageStem(getCurrentImageName()));
+  if (appState.currentImageHash) {
+    void viewer.setImage(appState.currentImageHash);
+  }
 }
 
 // ── Menu bar ─────────────────────────────────────────────────────────────────
@@ -2459,9 +2527,10 @@ function bindTasksDialogHandlers(): void {
 
       logEvent("set_active_task", { task_id: id });
 
-      if (task.images && viewer) {
-        void viewer.setImage(task.images);
-      }
+      appState.imageList = [];
+      appState.currentImageIndex = 0;
+      appState.currentImageHash = null;
+      appState.annotations = [];
 
       appState.tasksDialogOpen = false;
       render();
@@ -2559,7 +2628,7 @@ function render(): void {
         <div class="sidebar__content">
           <button type="button" data-action="previous">previous</button>
           <button type="button" data-action="next">next</button>
-          <div class="meta">Image: ${getCurrentImageName()}</div>
+          <div class="meta">Image: ${getCurrentImageLabel()}</div>
         </div>
       </aside>
 

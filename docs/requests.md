@@ -27,3 +27,5 @@
 - **Error banner lifecycle**: Tasks dialog inline error banners are cleared automatically after a subsequent successful load or save operation. (2026-04-05)
 
 - **Task path directory browser**: In admin mode, browse buttons on task `images` and `annotations` open a directory-browser modal backed by `GET /api/dirs?path=...`; selecting a path applies it to the field and persists via the existing blur/save flow. (2026-04-05)
+
+- **On-demand image list + prefetch tiling**: Backend derives task image lists from `task.images`, computes image hash as SHA-256 of canonical absolute file path, pushes `image_list` over WS, and handles `prefetch`/`image_ready` flow. `/images/{hash}/manifest.json` and `/images/{hash}/tiles/{z}/{x}_{y}.png` are cache-only HTTP reads; tile generation happens via WS prefetch processing. (2026-04-05)

@@ -16,6 +16,7 @@ import (
 	"github.com/matthias-p-nowak/nemo-lab/config"
 	"github.com/matthias-p-nowak/nemo-lab/db"
 	"github.com/matthias-p-nowak/nemo-lab/tasks"
+	"github.com/matthias-p-nowak/nemo-lab/tiles"
 	"github.com/matthias-p-nowak/nemo-lab/ws"
 )
 
@@ -34,6 +35,7 @@ func main() {
 	if err := syncAdmins(sqlDB, cfg.Admins); err != nil {
 		log.Fatalf("sync admins: %v", err)
 	}
+	tiles.Configure(cfg.CacheDir, cfg.CacheLimitMB, cfg.CacheEvictInterval)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/me", makeMeHandler(sqlDB))
@@ -44,7 +46,7 @@ func main() {
 	mux.HandleFunc("PUT /api/tasks/{id}/labels", makeTaskLabelsHandler(sqlDB))
 	mux.HandleFunc("GET /api/dirs", makeDirsHandler())
 	mux.Handle("/ws", ws.NewHandler(sqlDB, cfg.LogsDir))
-	mux.Handle("/images/", http.StripPrefix("/images/", http.FileServer(http.Dir("images"))))
+	mux.Handle("/images/", tiles.NewHandler())
 	mux.Handle("/", http.FileServer(http.Dir(cfg.StaticDir)))
 
 	handler := auth.Middleware(sqlDB, mux)
