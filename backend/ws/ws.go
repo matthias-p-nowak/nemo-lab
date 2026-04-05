@@ -12,9 +12,14 @@ import (
 	"golang.org/x/net/websocket"
 )
 
+type connState struct {
+	count        int
+	activeTaskID string
+}
+
 var (
 	connectionsMu sync.Mutex
-	connections   = map[string]int{}
+	connections   = map[string]*connState{}
 )
 
 // NewHandler builds the /ws handler and validates session cookies before upgrade.
@@ -45,19 +50,25 @@ func NewHandler(db *sql.DB, logsDir string) http.HandlerFunc {
 			}
 
 			connectionsMu.Lock()
-			connections[cookie.Value]++
-			active := connections[cookie.Value]
+			if connections[cookie.Value] == nil {
+				connections[cookie.Value] = &connState{}
+			}
+			connections[cookie.Value].count++
+			active := connections[cookie.Value].count
 			connectionsMu.Unlock()
 			log.Printf("ws connect token=%s active=%d", cookie.Value, active)
 
 			defer func() {
 				connectionsMu.Lock()
-				if connections[cookie.Value] > 1 {
-					connections[cookie.Value]--
+				if s := connections[cookie.Value]; s != nil && s.count > 1 {
+					s.count--
 				} else {
 					delete(connections, cookie.Value)
 				}
-				remaining := connections[cookie.Value]
+				remaining := 0
+				if s := connections[cookie.Value]; s != nil {
+					remaining = s.count
+				}
 				connectionsMu.Unlock()
 				log.Printf("ws disconnect token=%s active=%d", cookie.Value, remaining)
 
@@ -78,8 +89,21 @@ func NewHandler(db *sql.DB, logsDir string) http.HandlerFunc {
 				if err := websocket.JSON.Receive(conn, &msg); err != nil {
 					break
 				}
-				if msg.Type == "log" && lgr != nil {
-					_ = lgr.Append(msg.Entry)
+				switch msg.Type {
+				case "log":
+					if lgr != nil {
+						_ = lgr.Append(msg.Entry)
+					}
+				case "set_active_task":
+					taskID, _ := msg.Entry["task_id"].(string)
+					connectionsMu.Lock()
+					if s := connections[cookie.Value]; s != nil {
+						s.activeTaskID = taskID
+					}
+					connectionsMu.Unlock()
+					if lgr != nil {
+						_ = lgr.Append(msg.Entry)
+					}
 				}
 			}
 		}).ServeHTTP(w, r)

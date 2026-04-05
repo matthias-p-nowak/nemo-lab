@@ -7,7 +7,10 @@ const config = {
 /** WebSocket endpoint for backend events. */
 const ws = new WebSocket(`ws://${location.host}/ws`);
 
-ws.addEventListener("open", () => console.log("ws: connected"));
+ws.addEventListener("open", () => {
+  console.log("ws: connected");
+  openTasksDialog();
+});
 ws.addEventListener("close", () => console.log("ws: disconnected"));
 ws.addEventListener("error", (e) => console.error("ws: error", e));
 
@@ -2151,6 +2154,10 @@ function renderTaskCardBody(task: Task): string {
           <select class="task-status-select" data-action="set-status" data-task-id="${task.id}">
             ${statusOptions}
           </select>
+          <button type="button" class="task-continue-btn"
+                  data-action="continue-task" data-task-id="${task.id}">
+            continue work
+          </button>
         </div>
       </div>
       <div class="task-field-row">
@@ -2431,6 +2438,33 @@ function bindTasksDialogHandlers(): void {
         input.value = path;
         input.dispatchEvent(new Event("blur"));
       });
+    });
+  });
+
+  // Continue work
+  root.querySelectorAll<HTMLButtonElement>('[data-action="continue-task"]').forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-task-id")!;
+      const task = appState.tasks.find((t) => t.id === id);
+      if (!task) return;
+
+      if (task.status !== "doing") {
+        task.status = "doing";
+        void runTaskSave(
+          () => persistTaskScalars(task),
+          "Failed to save task status.",
+          "tasks: continue-work status save failed"
+        );
+      }
+
+      logEvent("set_active_task", { task_id: id });
+
+      if (task.images && viewer) {
+        void viewer.setImage(task.images);
+      }
+
+      appState.tasksDialogOpen = false;
+      render();
     });
   });
 
