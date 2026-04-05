@@ -153,7 +153,15 @@ func ensureService() *Service {
 // It returns the cached manifest path on success.
 func EnsureGeneratedByPath(absPath string) (string, error) {
 	svc := ensureService()
-	return svc.ensureGeneratedByPath(absPath)
+	return svc.ensureGeneratedByPath(absPath, nil)
+}
+
+// GenerateByPathWithProgress generates tiles for absPath, calling onLevel(level, totalLevels)
+// after each zoom level is written to disk. Level 0 is coarsest; level totalLevels-1 is full res.
+// If tiles are already cached, onLevel is not called and the manifest path is returned immediately.
+func GenerateByPathWithProgress(absPath string, onLevel func(level, totalLevels int)) (string, error) {
+	svc := ensureService()
+	return svc.ensureGeneratedByPath(absPath, onLevel)
 }
 
 // ManifestPathForHash returns the expected cached manifest path for a hash.
@@ -162,13 +170,13 @@ func ManifestPathForHash(hash string) string {
 	return svc.manifestPath(hash)
 }
 
-func (s *Service) ensureGeneratedByPath(absPath string) (string, error) {
+func (s *Service) ensureGeneratedByPath(absPath string, onLevel func(level, totalLevels int)) (string, error) {
 	if strings.TrimSpace(absPath) == "" {
 		return "", errors.New("invalid image path")
 	}
 	hash := HashForPath(absPath)
 	manifestPath := s.manifestPath(hash)
-	if _, err := os.Stat(manifestPath); err == nil {
+	if _, err := os.Stat(s.completePath(hash)); err == nil {
 		return manifestPath, nil
 	}
 
@@ -176,7 +184,7 @@ func (s *Service) ensureGeneratedByPath(absPath string) (string, error) {
 	lock.Lock()
 	defer lock.Unlock()
 
-	if _, err := os.Stat(manifestPath); err == nil {
+	if _, err := os.Stat(s.completePath(hash)); err == nil {
 		return manifestPath, nil
 	}
 
@@ -184,17 +192,28 @@ func (s *Service) ensureGeneratedByPath(absPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	width, height, levels, err := s.generateTiles(hash, src)
+	b := src.Bounds()
+	width, height := b.Dx(), b.Dy()
+	totalLevels := computeLevels(width, height)
+
+	// Write full manifest up front — all fields are known before any tiles are written.
+	if err := s.writeManifest(hash, width, height, totalLevels); err != nil {
+		return "", err
+	}
+
+	_, _, _, err = s.generateTiles(hash, src, onLevel)
 	if err != nil {
 		return "", err
 	}
-	if err := s.writeManifest(hash, width, height, levels); err != nil {
+
+	// Write sentinel only after all tiles succeed; absence triggers regeneration on retry.
+	if err := os.WriteFile(s.completePath(hash), nil, 0o644); err != nil {
 		return "", err
 	}
 	return manifestPath, nil
 }
 
-func (s *Service) generateTiles(hash string, src image.Image) (int, int, int, error) {
+func (s *Service) generateTiles(hash string, src image.Image, onLevel func(level, totalLevels int)) (int, int, int, error) {
 	b := src.Bounds()
 	width := b.Dx()
 	height := b.Dy()
@@ -203,12 +222,31 @@ func (s *Service) generateTiles(hash string, src image.Image) (int, int, int, er
 	}
 	levels := computeLevels(width, height)
 
-	for level := 0; level < levels; level++ {
-		scale := math.Pow(2, float64(level-(levels-1)))
+	// Build mipmap chain by iterating from full-res (level N-1) down to coarsest
+	// (level 0), downscaling each step from the previous level. This is faster
+	// than downscaling every level independently from the original source.
+	type levelWork struct {
+		level  int
+		img    image.Image
+		lw, lh int
+	}
+	chain := make([]levelWork, levels)
+	var prev image.Image = src
+	for i := levels - 1; i >= 0; i-- {
+		scale := math.Pow(2, float64(i-(levels-1)))
 		lw := maxInt(1, int(math.Round(float64(width)*scale)))
 		lh := maxInt(1, int(math.Round(float64(height)*scale)))
+		if lw == width && lh == height {
+			chain[i] = levelWork{i, prev, lw, lh}
+		} else {
+			scaled := resizeImage(prev, lw, lh)
+			chain[i] = levelWork{i, scaled, lw, lh}
+			prev = scaled
+		}
+	}
 
-		scaled := resizeImage(src, lw, lh)
+	for _, w := range chain {
+		level, scaled, lw, lh := w.level, w.img, w.lw, w.lh
 		cols := ceilDiv(lw, tileSize)
 		rows := ceilDiv(lh, tileSize)
 		for row := 0; row < rows; row++ {
@@ -227,6 +265,9 @@ func (s *Service) generateTiles(hash string, src image.Image) (int, int, int, er
 					return 0, 0, 0, err
 				}
 			}
+		}
+		if onLevel != nil {
+			onLevel(level, levels)
 		}
 	}
 
@@ -321,6 +362,10 @@ func (s *Service) manifestPath(hash string) string {
 	return filepath.Join(s.hashRoot(hash), "manifest.json")
 }
 
+func (s *Service) completePath(hash string) string {
+	return filepath.Join(s.hashRoot(hash), "tiles.complete")
+}
+
 func (s *Service) tilePath(hash string, level, x, y int) string {
 	return filepath.Join(
 		s.hashRoot(hash),
@@ -399,13 +444,17 @@ func decodeImage(path string) (image.Image, error) {
 	return img, err
 }
 
+// pngEncoder uses BestSpeed compression — tiles are cache-local so encode
+// speed matters more than file size.
+var pngEncoder = png.Encoder{CompressionLevel: png.BestSpeed}
+
 func writePNG(path string, src image.Image) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	return png.Encode(f, src)
+	return pngEncoder.Encode(f, src)
 }
 
 func resizeImage(src image.Image, width, height int) image.Image {

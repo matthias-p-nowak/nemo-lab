@@ -104,17 +104,17 @@ func NewHandler(db *sql.DB, logsDir string) http.HandlerFunc {
 					}
 					if eventType, _ := entry["type"].(string); eventType == "set_active_task" {
 						taskID, _ := entry["task_id"].(string)
-						handleSetActiveTask(db, cookie.Value, conn, taskID)
+						handleSetActiveTask(db, cookie.Value, conn, lgr, taskID)
 					}
 				case "set_active_task":
 					taskID, _ := entry["task_id"].(string)
 					if lgr != nil {
 						_ = lgr.Append(entry)
 					}
-					handleSetActiveTask(db, cookie.Value, conn, taskID)
+					handleSetActiveTask(db, cookie.Value, conn, lgr, taskID)
 				case "prefetch":
 					hashes := prefetchHashes(msg, entry)
-					handlePrefetch(cookie.Value, conn, hashes)
+					handlePrefetch(cookie.Value, conn, lgr, hashes)
 				default:
 					if msgType == "" {
 						continue
@@ -125,7 +125,7 @@ func NewHandler(db *sql.DB, logsDir string) http.HandlerFunc {
 	}
 }
 
-func handleSetActiveTask(db *sql.DB, token string, conn *websocket.Conn, taskID string) {
+func handleSetActiveTask(db *sql.DB, token string, conn *websocket.Conn, lgr *logger.Logger, taskID string) {
 	connectionsMu.Lock()
 	if s := connections[token]; s != nil {
 		s.activeTaskID = taskID
@@ -147,23 +147,61 @@ func handleSetActiveTask(db *sql.DB, token string, conn *websocket.Conn, taskID 
 		return
 	}
 	storeHashMap(token, hashToPath)
+	logAppend(lgr, map[string]any{
+		"type":        "image_list",
+		"ts":          time.Now().Format(time.RFC3339),
+		"image_count": len(items),
+	})
 	_ = websocket.JSON.Send(conn, map[string]any{"type": "image_list", "images": items})
 }
 
-func handlePrefetch(token string, conn *websocket.Conn, hashes []string) {
+func handlePrefetch(token string, conn *websocket.Conn, lgr *logger.Logger, hashes []string) {
 	if len(hashes) == 0 {
 		return
 	}
+	log.Printf("ws prefetch token=%s hashes=%d", tokenPrefix(token), len(hashes))
+	logAppend(lgr, map[string]any{
+		"type":   "prefetch",
+		"ts":     time.Now().Format(time.RFC3339),
+		"hashes": len(hashes),
+	})
 	hashToPath := loadHashMap(token)
 
 	firstHash := hashes[0]
 	if absPath, ok := hashToPath[firstHash]; ok {
-		if _, err := tiles.EnsureGeneratedByPath(absPath); err == nil {
+		_, err := tiles.GenerateByPathWithProgress(absPath, func(level, totalLevels int) {
+			log.Printf("ws image_ready token=%s hash=%.16s level=%d/%d", tokenPrefix(token), firstHash, level, totalLevels-1)
+			logAppend(lgr, map[string]any{
+				"type":         "image_ready",
+				"ts":           time.Now().Format(time.RFC3339),
+				"hash":         firstHash,
+				"level":        level,
+				"total_levels": totalLevels,
+			})
 			_ = websocket.JSON.Send(conn, map[string]any{
-				"type": "image_ready",
-				"hash": firstHash,
+				"type":         "image_ready",
+				"hash":         firstHash,
+				"level":        level,
+				"total_levels": totalLevels,
+			})
+		})
+		if err != nil {
+			log.Printf("ws prefetch tile generation failed token=%s hash=%.16s err=%v", tokenPrefix(token), firstHash, err)
+			logAppend(lgr, map[string]any{
+				"type":  "prefetch_error",
+				"ts":    time.Now().Format(time.RFC3339),
+				"hash":  firstHash,
+				"error": err.Error(),
 			})
 		}
+	} else {
+		log.Printf("ws prefetch first hash not in session map token=%s hash=%.16s", tokenPrefix(token), firstHash)
+		logAppend(lgr, map[string]any{
+			"type":  "prefetch_error",
+			"ts":    time.Now().Format(time.RFC3339),
+			"hash":  firstHash,
+			"error": "hash not in session map",
+		})
 	}
 
 	for _, hash := range hashes[1:] {
@@ -342,6 +380,13 @@ func copyHashMap(src map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+// logAppend appends an entry to lgr if non-nil; silently no-ops otherwise.
+func logAppend(lgr *logger.Logger, entry map[string]any) {
+	if lgr != nil {
+		_ = lgr.Append(entry)
+	}
 }
 
 // tokenPrefix returns the first up-to-8 characters for safe log correlation.

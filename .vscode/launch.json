@@ -24,7 +24,7 @@
     {
       "name": "Go + Firefox",
       "configurations": ["Go: Launch server", "Firefox: Launch localhost"],
-      "preLaunchTask": "copy-resources",
+      "preLaunchTask": "start-all",
       "stopAll": true
     }
   ]

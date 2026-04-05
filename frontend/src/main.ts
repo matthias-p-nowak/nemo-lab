@@ -347,10 +347,24 @@ ws.addEventListener("message", (event) => {
     if (typeof hash !== "string" || hash.length === 0) {
       return;
     }
+    const level = typeof m["level"] === "number" ? m["level"] : 0;
+    const totalLevels = typeof m["total_levels"] === "number" ? m["total_levels"] : 0;
+    console.log(`ws image_ready hash=${hash.slice(0, 16)} level=${level}/${totalLevels}`);
+    logEvent("image_ready", { hash, level, total_levels: totalLevels });
+    const isNewImage = appState.currentImageHash !== hash;
+    // Only reset annotations when the image changes.
+    if (isNewImage) {
+      appState.annotations = [];
+    }
     appState.currentImageHash = hash;
-    appState.annotations = [];
     if (viewer) {
-      void viewer.setImage(hash);
+      if (isNewImage) {
+        // New image: full load with zoom reset and animation.
+        void viewer.setImage(hash, level);
+      } else {
+        // Same image, higher-resolution level available: reload tiles in place.
+        viewer.refreshTiles(level);
+      }
     }
   }
 });
@@ -566,6 +580,8 @@ class WebGLTileViewer {
   private transform: ViewTransform = { x: 0, y: 0, width: 0, height: 0 };
   /** Selected fit-level index. */
   private fitLevel = 0;
+  /** Highest backend-ready level seen for the current image, if provided. */
+  private maxReadyLevel = -1;
   /** Last level for which tiles are being loaded. */
   private loadingLevel = -1;
   /** Monotonic id for fit-level tile load batches; rejects stale async callbacks. */
@@ -632,6 +648,8 @@ class WebGLTileViewer {
   private offsetY = 0;
   /** True while primary-pointer drag pan is active. */
   private isDragging = false;
+  /** Debounce timer for zoom log events (fires 500 ms after last wheel tick). */
+  private zoomLogTimer: ReturnType<typeof setTimeout> | null = null;
   /** Previous pointer X used for drag delta integration. */
   private dragLastX = 0;
   /** Previous pointer Y used for drag delta integration. */
@@ -778,11 +796,12 @@ class WebGLTileViewer {
   }
 
   /** Loads a new tiled image by stem name. */
-  async setImage(imageStem: string): Promise<void> {
+  async setImage(imageStem: string, readyLevel: number | null = null): Promise<void> {
     this.imageStem = imageStem;
     this.manifest = null;
     this.level0Tile = null;
     this.fitTiles.clear();
+    this.maxReadyLevel = typeof readyLevel === "number" ? readyLevel : -1;
     this.loadingLevel = -1;
     this.loadingGeneration = 0;
     this.animationScale = 1;
@@ -820,6 +839,26 @@ class WebGLTileViewer {
     await this.loadLevel0(requestId);
     this.startFitAnimation();
     this.loadFitLevelTiles(requestId);
+  }
+
+  /**
+   * Reloads tiles for the current image without resetting zoom, position, or animation.
+   * Called when a higher-resolution level becomes available for the already-displayed image.
+   */
+  refreshTiles(readyLevel: number | null = null): void {
+    if (!this.manifest) {
+      return;
+    }
+    if (typeof readyLevel === "number") {
+      this.maxReadyLevel = Math.max(this.maxReadyLevel, readyLevel);
+    }
+    // If a higher-resolution level is now the best fit, force re-evaluation by
+    // resetting loadingLevel so loadFitLevelTiles clears cached tiles and re-fetches.
+    const best = this.pickFitLevel();
+    if (best > this.fitLevel) {
+      this.loadingLevel = -1;
+    }
+    this.loadFitLevelTiles(this.generation);
   }
 
   /** Redraws all currently available content. */
@@ -877,7 +916,7 @@ class WebGLTileViewer {
       if (requestId !== this.generation) {
         return;
       }
-      this.level0Tile = this.uploadTileTexture(0, 0, image);
+      this.level0Tile = this.uploadTileTexture(0, 0, 0, image);
       this.draw();
     } catch (error) {
       console.error("tile viewer: level0 tile load failed", error);
@@ -890,7 +929,8 @@ class WebGLTileViewer {
       return;
     }
 
-    const level = this.pickFitLevel();
+    const bestLevel = this.pickFitLevel();
+    const level = this.maxReadyLevel >= 0 ? Math.min(bestLevel, this.maxReadyLevel) : bestLevel;
     this.fitLevel = level;
 
     if (this.loadingLevel !== level) {
@@ -924,7 +964,7 @@ class WebGLTileViewer {
             ) {
               return;
             }
-            const tile = this.uploadTileTexture(tx, ty, image);
+            const tile = this.uploadTileTexture(tx, ty, level, image);
             this.fitTiles.set(key, tile);
             this.draw();
           })
@@ -1199,12 +1239,17 @@ class WebGLTileViewer {
   }
 
   /** Uploads one image tile as a WebGL texture. */
-  private uploadTileTexture(tx: number, ty: number, image: HTMLImageElement): LoadedTile {
+  private uploadTileTexture(tx: number, ty: number, level: number, image: HTMLImageElement): LoadedTile {
     const gl = this.gl;
     const texture = gl.createTexture();
     if (!texture) {
       throw new Error("Failed to create texture");
     }
+
+    console.log(
+      `tile upload hash=${this.imageStem.slice(0, 16)} level=${level} tile=${tx},${ty} size=${image.naturalWidth}x${image.naturalHeight}`
+    );
+    logEvent("tile_upload", { hash: this.imageStem, level, tx, ty, width: image.naturalWidth, height: image.naturalHeight });
 
     gl.bindTexture(gl.TEXTURE_2D, texture);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
@@ -1347,6 +1392,15 @@ class WebGLTileViewer {
     if (this.fitLevel === previousLevel) {
       this.loadFitLevelTiles(this.generation);
     }
+
+    // Debounced zoom log — fires once 500 ms after the last wheel tick.
+    if (this.zoomLogTimer !== null) {
+      clearTimeout(this.zoomLogTimer);
+    }
+    this.zoomLogTimer = setTimeout(() => {
+      this.zoomLogTimer = null;
+      logEvent("zoom", { hash: this.imageStem, zoom: this.zoom, fit_level: this.fitLevel });
+    }, 500);
   };
 
   /** Starts drag-pan tracking on primary-pointer down. */
@@ -1392,6 +1446,7 @@ class WebGLTileViewer {
     }
     this.isDragging = false;
     this.maybeChangeFitLevel();
+    logEvent("pan", { hash: this.imageStem, offset_x: this.offsetX, offset_y: this.offsetY, zoom: this.zoom });
   };
 
   /** Sets up listeners for click and resize-driven level refit. */

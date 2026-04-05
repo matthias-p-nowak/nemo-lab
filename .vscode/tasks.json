@@ -9,42 +9,24 @@
         "--bundle",
         "frontend/src/main.ts",
         "--outdir=${workspaceFolder}/dist/js",
-        "--sourcemap",
-        "--watch"
+        "--sourcemap"
       ],
       "options": {
         "cwd": "${workspaceFolder}"
       },
-      "isBackground": true,
-      "problemMatcher": [
-        {
-          "owner": "esbuild",
-          "pattern": [{ "regexp": "^(ERROR) in (.+):(\\d+):(\\d+): (.+)$", "severity": 1, "file": 2, "line": 3, "column": 4, "message": 5 }],
-          "background": {
-            "activeOnStart": true,
-            "beginsPattern": "^\\[watch\\] build started",
-            "endsPattern": "^\\[watch\\] build finished"
-          }
-        }
-      ]
+      "problemMatcher": []
     },
     {
       "label": "watch-scss",
       "type": "shell",
       "command": "sass",
       "args": [
-        "-w",
         "frontend/src/main.scss:dist/css/main.css"
       ],
       "options": {
         "cwd": "${workspaceFolder}"
       },
-      "isBackground": true,
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated"
-      }
+      "problemMatcher": []
     },
     {
       "label": "start-nemo-server",
@@ -57,7 +39,6 @@
       "options": {
         "cwd": "${workspaceFolder}/backend"
       },
-      "isBackground": true,
       "problemMatcher": [],
       "presentation": {
         "reveal": "always",
@@ -82,10 +63,10 @@
       "label": "start-all",
       "dependsOn": [
         "copy-resources",
-        "compile js",
-        "watch-scss"
+        "watch-scss",
+        "compile js"
       ],
-      "dependsOrder": "parallel",
+      "dependsOrder": "sequence",
       "group": { "kind": "build", "isDefault": true },
       "problemMatcher": []
     }
