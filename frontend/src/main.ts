@@ -4,6 +4,28 @@ const config = {
   clickMaxDragPx: 10,
 };
 
+/** Applies a theme by setting data-theme on <html> and persisting to localStorage. */
+function applyTheme(theme: string): void {
+  document.documentElement.setAttribute("data-theme", theme);
+  localStorage.setItem("nemo_theme", theme);
+}
+
+// Initialise theme: localStorage preference takes priority, then server default.
+(async () => {
+  const stored = localStorage.getItem("nemo_theme");
+  if (stored === "light" || stored === "dark") {
+    applyTheme(stored);
+  } else {
+    try {
+      const res = await fetch("/api/config");
+      const data = (await res.json()) as { theme?: string };
+      applyTheme(data.theme === "light" ? "light" : "dark");
+    } catch {
+      applyTheme("dark");
+    }
+  }
+})();
+
 /** WebSocket endpoint for backend events. */
 const ws = new WebSocket(`ws://${location.host}/ws`);
 
@@ -1827,10 +1849,12 @@ function renderMenuBar(): string {
             <span class="menu-bar__check">✓</span><span>Right sidebar</span>
           </button>
           <hr class="menu-bar__separator">
-          <button type="button" class="menu-bar__dropdown-btn" aria-checked="false" data-action="set-theme" data-theme="light">
+          <button type="button" class="menu-bar__dropdown-btn" data-action="set-theme" data-theme="light"
+                  aria-checked="${document.documentElement.getAttribute('data-theme') === 'light'}">
             <span class="menu-bar__check">✓</span><span>Light theme</span>
           </button>
-          <button type="button" class="menu-bar__dropdown-btn" aria-checked="true" data-action="set-theme" data-theme="dark">
+          <button type="button" class="menu-bar__dropdown-btn" data-action="set-theme" data-theme="dark"
+                  aria-checked="${document.documentElement.getAttribute('data-theme') === 'dark'}">
             <span class="menu-bar__check">✓</span><span>Dark theme</span>
           </button>
         </div>
@@ -1869,11 +1893,12 @@ function bindMenuHandlers(): void {
         ?.classList.toggle("menu-bar__item--active");
     });
 
-  // Theme buttons (visual only in prototype)
   root.querySelectorAll<HTMLButtonElement>('[data-action="set-theme"]').forEach((btn) => {
     btn.addEventListener("click", () => {
+      const theme = btn.getAttribute("data-theme") ?? "dark";
+      applyTheme(theme);
       root.querySelectorAll<HTMLButtonElement>('[data-action="set-theme"]').forEach((b) =>
-        b.setAttribute("aria-checked", String(b === btn))
+        b.setAttribute("aria-checked", String(b.getAttribute("data-theme") === theme))
       );
       btn.closest<HTMLElement>(".menu-bar__item")?.classList.remove("menu-bar__item--active");
     });

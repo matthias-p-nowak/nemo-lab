@@ -38,6 +38,7 @@ func main() {
 	tiles.Configure(cfg.CacheDir, cfg.CacheLimitMB, cfg.CacheEvictInterval, cfg.TileWorkers)
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/config", makeConfigHandler(cfg))
 	mux.HandleFunc("GET /api/me", makeMeHandler(sqlDB))
 	mux.HandleFunc("GET /api/tasks", makeTasksListHandler(sqlDB))
 	mux.HandleFunc("PUT /api/tasks/{id}", makeTaskUpsertHandler(sqlDB))
@@ -53,6 +54,16 @@ func main() {
 	log.Printf("listening on %s", cfg.ListenAddr)
 	if err := http.ListenAndServe(cfg.ListenAddr, handler); err != nil {
 		log.Fatalf("server error: %v", err)
+	}
+}
+
+func makeConfigHandler(cfg *config.Config) http.HandlerFunc {
+	type configResponse struct {
+		Theme string `json:"theme"`
+	}
+	resp := configResponse{Theme: cfg.Theme}
+	return func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, resp)
 	}
 }
 

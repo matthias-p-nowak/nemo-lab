@@ -4,7 +4,8 @@
   box-sizing: border-box;
 }
 
-:root {
+:root,
+[data-theme="dark"] {
   --bg: #1f252c;
   --bg-panel: #2a313a;
   --bg-panel-alt: #303844;
@@ -16,14 +17,33 @@
   --accent-dot: #ff6f61;
   --button-bg: #3a4452;
   --button-bg-hover: #465164;
+  --body-bg-start: #2b3440;
+  --bg-hover: #2f3844;
+}
+
+[data-theme="light"] {
+  --bg: #f0f2f5;
+  --bg-panel: #ffffff;
+  --bg-panel-alt: #f5f7fa;
+  --bg-toolbar: #e2e6eb;
+  --text: #1a1f27;
+  --text-muted: #5a6370;
+  --line: #c0c7d0;
+  --accent: #0078d4;
+  --accent-dot: #e03e2d;
+  --button-bg: #d0d5de;
+  --button-bg-hover: #bec4ce;
+  --body-bg-start: #dde3ea;
+  --bg-hover: #d4d9e0;
 }
 
 body {
   margin: 0;
   padding: 0;
   font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
-  background: radial-gradient(circle at top left, #2b3440, var(--bg));
+  background: radial-gradient(circle at top left, var(--body-bg-start), var(--bg));
   color: var(--text);
+  transition: background 0.15s, color 0.15s;
 }
 
 #app {
@@ -124,7 +144,7 @@ button.ghost {
   flex-direction: column;
   min-width: 0;
   min-height: 0;
-  background: #1a2026;
+  background: var(--bg);
 }
 
 .image-view__toolbar {
@@ -201,7 +221,7 @@ button.ghost {
   border: 1px solid var(--line);
   border-radius: 8px;
   overflow: hidden;
-  background: #29303a;
+  background: var(--bg-panel);
 }
 
 .panel__header {
@@ -215,7 +235,7 @@ button.ghost {
   justify-content: space-between;
   text-transform: lowercase;
   font-weight: 600;
-  background: #323c48;
+  background: var(--bg-toolbar);
 }
 
 .panel__body {
@@ -263,7 +283,7 @@ textarea {
   min-height: 70px;
   border: 1px solid var(--line);
   border-radius: 6px;
-  background: #232a33;
+  background: var(--bg-panel-alt);
   color: var(--text);
   padding: 8px;
 }
@@ -568,7 +588,7 @@ textarea {
   font-size: 0.95rem;
 
   &:hover {
-    background: var(--bg-hover, #2f3844);
+    background: var(--bg-hover);
   }
 
   &--up {
@@ -927,7 +947,7 @@ textarea {
   cursor: default;
 
   &:hover {
-    background: var(--bg-hover, #2f3844);
+    background: var(--bg-hover);
   }
 
   &:focus {
