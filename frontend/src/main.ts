@@ -50,6 +50,14 @@ const appState = {
   tasksDialogOpen: false,
   /** Whether the current Tasks session is in admin mode (toggled per open). */
   isAdmin: false,
+  /** Monotonic token for in-flight tasks fetches. */
+  tasksLoadToken: 0,
+  /** Whether task dialog data is currently loading from backend. */
+  tasksLoading: false,
+  /** Number of in-flight task save operations. */
+  tasksSavingCount: 0,
+  /** Visible task dialog error message (if any). */
+  tasksError: null as string | null,
   /** Prototype task list. */
   tasks: [
     {
@@ -143,6 +151,33 @@ interface Task {
   labels: LabelNode[];
   /** Currently selected label node id, or null. */
   selectedLabelId: string | null;
+}
+
+/** Backend label tree node shape for /api/tasks responses. */
+interface BackendLabelNode {
+  id: string;
+  text: string;
+  children: BackendLabelNode[];
+}
+
+/** Backend task shape for /api/tasks responses. */
+interface BackendTask {
+  id: string;
+  ord: number;
+  description: string;
+  status: string;
+  tags: string[];
+  images: string;
+  annotations: string;
+  checkmark: boolean;
+  comment: string;
+  labels: BackendLabelNode[];
+}
+
+/** Backend response shape for /api/me. */
+interface BackendMe {
+  username: string;
+  is_admin: boolean;
 }
 
 /** Minimal point annotation model for this prototype. */
@@ -1361,16 +1396,206 @@ function toggleMenu(): void {
   if (btn) btn.setAttribute("aria-expanded", String(appState.menuOpen));
 }
 
-/** Opens the Tasks dialog, alternating admin/non-admin each time. */
+/** Returns the first label id from a nested tree in pre-order, or null if empty. */
+function firstLabelId(nodes: LabelNode[]): string | null {
+  if (nodes.length === 0) return null;
+  const first = nodes[0];
+  return first.id || firstLabelId(first.children);
+}
+
+/** Normalizes a backend status string into a known UI status value. */
+function normalizeTaskStatus(status: string): Task["status"] {
+  return TASK_STATUSES.some((s) => s.key === status) ? (status as Task["status"]) : "new";
+}
+
+/** Normalizes backend label nodes into UI label nodes. */
+function normalizeLabelNodes(nodes: BackendLabelNode[] | undefined): LabelNode[] {
+  if (!Array.isArray(nodes)) return [];
+  return nodes.map((node) => ({
+    id: String(node.id ?? ""),
+    text: String(node.text ?? ""),
+    children: normalizeLabelNodes(node.children),
+  }));
+}
+
+/** Maps backend /api/tasks results into UI task state, sorted by ord. */
+function mapBackendTasksToUi(tasks: BackendTask[]): Task[] {
+  return [...tasks]
+    .sort((a, b) => (a.ord - b.ord) || a.id.localeCompare(b.id))
+    .map((task, index) => {
+      const labels = normalizeLabelNodes(task.labels);
+      return {
+        id: String(task.id ?? ""),
+        description: String(task.description ?? ""),
+        status: normalizeTaskStatus(String(task.status ?? "")),
+        tags: Array.isArray(task.tags) ? task.tags.map((t) => String(t)) : [],
+        images: String(task.images ?? ""),
+        annotations: String(task.annotations ?? ""),
+        checkmark: Boolean(task.checkmark),
+        comment: String(task.comment ?? ""),
+        labels,
+        selectedLabelId: firstLabelId(labels),
+        collapsed: index !== 0,
+      };
+    });
+}
+
+/** Returns current task order index for backend ord persistence. */
+function taskOrd(taskId: string): number {
+  const idx = appState.tasks.findIndex((t) => t.id === taskId);
+  return idx >= 0 ? idx : 0;
+}
+
+/** Starts a save operation and updates dialog status UI. */
+function beginTaskSave(): void {
+  appState.tasksSavingCount += 1;
+  appState.tasksError = null;
+  if (appState.tasksDialogOpen) render();
+}
+
+/** Reports a task-related UI/API error to browser console and backend event log. */
+function reportTaskError(
+  context: string,
+  error: unknown,
+  extra: Record<string, unknown> = {}
+): void {
+  console.error(context, error);
+  const message = error instanceof Error ? error.message : String(error);
+  logEvent("task_error", { context, message, ...extra });
+}
+
+/** Runs a task save operation with shared saving/error status handling. */
+async function runTaskSave(
+  work: () => Promise<void>,
+  errorMessage: string,
+  logContext: string
+): Promise<boolean> {
+  beginTaskSave();
+  try {
+    await work();
+    appState.tasksError = null;
+    return true;
+  } catch (error) {
+    reportTaskError(logContext, error);
+    appState.tasksError = errorMessage;
+    return false;
+  } finally {
+    appState.tasksSavingCount = Math.max(0, appState.tasksSavingCount - 1);
+    if (appState.tasksDialogOpen) render();
+  }
+}
+
+/** Persists scalar task fields to backend. */
+async function persistTaskScalars(task: Task): Promise<void> {
+  const response = await fetch(`/api/tasks/${encodeURIComponent(task.id)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      id: task.id,
+      ord: taskOrd(task.id),
+      description: task.description,
+      status: task.status,
+      images: task.images,
+      annotations: task.annotations,
+      checkmark: task.checkmark,
+      comment: task.comment,
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`save task failed (${response.status})`);
+  }
+}
+
+/** Persists full tag list for a task to backend. */
+async function persistTaskTags(task: Task): Promise<void> {
+  const response = await fetch(`/api/tasks/${encodeURIComponent(task.id)}/tags`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ tags: task.tags }),
+  });
+  if (!response.ok) {
+    throw new Error(`save tags failed (${response.status})`);
+  }
+}
+
+/** Persists full label tree for a task to backend. */
+async function persistTaskLabels(task: Task): Promise<void> {
+  const response = await fetch(`/api/tasks/${encodeURIComponent(task.id)}/labels`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(task.labels),
+  });
+  if (!response.ok) {
+    throw new Error(`save labels failed (${response.status})`);
+  }
+}
+
+/** Deletes one task on backend. */
+async function persistTaskDelete(taskId: string): Promise<void> {
+  const response = await fetch(`/api/tasks/${encodeURIComponent(taskId)}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    throw new Error(`delete task failed (${response.status})`);
+  }
+}
+
+/** Loads current user role and tasks from backend and updates dialog state. */
+async function loadTasksDialogState(loadToken: number): Promise<void> {
+  try {
+    const [meResponse, tasksResponse] = await Promise.all([
+      fetch("/api/me"),
+      fetch("/api/tasks"),
+    ]);
+    if (!meResponse.ok) {
+      throw new Error(`me fetch failed (${meResponse.status})`);
+    }
+    if (!tasksResponse.ok) {
+      throw new Error(`tasks fetch failed (${tasksResponse.status})`);
+    }
+    const meRaw = (await meResponse.json()) as unknown;
+    const raw = (await tasksResponse.json()) as unknown;
+    if (typeof meRaw !== "object" || meRaw === null || !("is_admin" in meRaw)) {
+      throw new Error("me fetch failed (invalid response)");
+    }
+    if (!Array.isArray(raw)) {
+      throw new Error("tasks fetch failed (response is not an array)");
+    }
+    const me = meRaw as BackendMe;
+    const backendTasks = raw as BackendTask[];
+    if (loadToken !== appState.tasksLoadToken) return;
+    appState.tasksError = null;
+    appState.isAdmin = Boolean(me.is_admin);
+    appState.tasks = mapBackendTasksToUi(backendTasks);
+    if (appState.tasksDialogOpen) render();
+  } catch (error) {
+    reportTaskError("tasks dialog: load failed", error, { endpoint: "/api/me,/api/tasks" });
+    if (loadToken !== appState.tasksLoadToken) return;
+    appState.tasksError = "Failed to load tasks from backend.";
+    if (appState.tasksDialogOpen) render();
+  } finally {
+    if (loadToken !== appState.tasksLoadToken) return;
+    appState.tasksLoading = false;
+    if (appState.tasksDialogOpen) render();
+  }
+}
+
+/** Opens the Tasks dialog and loads role/tasks from backend. */
 function openTasksDialog(): void {
-  appState.isAdmin = !appState.isAdmin;
+  appState.isAdmin = false;
   appState.tasksDialogOpen = true;
+  appState.tasksLoading = true;
+  appState.tasksError = null;
+  appState.tasksLoadToken += 1;
+  const loadToken = appState.tasksLoadToken;
   render();
+  void loadTasksDialogState(loadToken);
 }
 
 /** Closes the Tasks dialog. */
 function closeTasksDialog(): void {
   appState.tasksDialogOpen = false;
+  appState.tasksError = null;
   render();
 }
 
@@ -1491,15 +1716,53 @@ function setExpandedTask(task: Task): void {
   });
 }
 
-/** Removes a task by id and re-renders. */
-function removeTask(id: string): void {
+/** Moves a task by delta in list order and persists ord values (admin only). */
+async function moveTaskBy(id: string, delta: number): Promise<void> {
+  if (!appState.isAdmin) return;
   const idx = appState.tasks.findIndex((t) => t.id === id);
-  if (idx !== -1) appState.tasks.splice(idx, 1);
+  if (idx === -1) return;
+  const next = idx + delta;
+  if (next < 0 || next >= appState.tasks.length) return;
+
+  const previousOrder = [...appState.tasks];
+  const [moved] = appState.tasks.splice(idx, 1);
+  appState.tasks.splice(next, 0, moved);
   render();
+
+  const ok = await runTaskSave(
+    async () => {
+      for (const task of appState.tasks) {
+        await persistTaskScalars(task);
+      }
+    },
+    "Failed to persist task order.",
+    "tasks: save order failed"
+  );
+  if (!ok) {
+    appState.tasks = previousOrder;
+    render();
+  }
 }
 
-/** Appends a blank task, expands it, and re-renders. */
-function addTask(): void {
+/** Removes a task by id, persists delete, and re-renders. */
+async function removeTask(id: string): Promise<void> {
+  const idx = appState.tasks.findIndex((t) => t.id === id);
+  if (idx === -1) return;
+  const [removed] = appState.tasks.splice(idx, 1);
+  render();
+  const ok = await runTaskSave(
+    () => persistTaskDelete(id),
+    "Failed to delete task.",
+    "tasks: delete failed"
+  );
+  if (!ok) {
+    appState.tasks.splice(idx, 0, removed);
+    render();
+  }
+}
+
+/** Appends a blank task, persists it, and re-renders. */
+async function addTask(): Promise<void> {
   const task: Task = {
     id: createTaskId(),
     description: "",
@@ -1516,6 +1779,15 @@ function addTask(): void {
   setExpandedTask(task);
   appState.tasks.push(task);
   render();
+  const ok = await runTaskSave(
+    () => persistTaskScalars(task),
+    "Failed to create task.",
+    "tasks: create failed"
+  );
+  if (!ok) {
+    appState.tasks = appState.tasks.filter((t) => t.id !== task.id);
+    render();
+  }
 }
 
 /** Produces the collapsed summary row for one task card. */
@@ -1525,11 +1797,20 @@ function renderTaskCardSummary(task: Task): string {
   const tagsHtml = task.tags
     .map((t) => `<span class="task-pin task-pin--preview">${t.replace(/</g, "&lt;")}</span>`)
     .join("");
+  const reorderButtons = appState.isAdmin
+    ? `
+      <span class="task-reorder-controls">
+        <button type="button" class="task-reorder-btn" data-action="move-task-up" data-task-id="${task.id}" aria-label="Move task up">↑</button>
+        <button type="button" class="task-reorder-btn" data-action="move-task-down" data-task-id="${task.id}" aria-label="Move task down">↓</button>
+      </span>
+    `
+    : "";
   return `
     <div class="task-summary" data-action="toggle-task" data-task-id="${task.id}">
       <span class="task-status-dot" style="background:${color}"></span>
       <span class="task-desc-preview">${firstLine || '<span class="muted">no description</span>'}</span>
       <span class="task-tags-preview">${tagsHtml}</span>
+      ${reorderButtons}
       <span class="task-chevron">${task.collapsed ? "▶" : "▼"}</span>
     </div>
   `;
@@ -1617,6 +1898,13 @@ function refreshLabelTree(treeEl: HTMLElement, task: Task, focusNodeId?: string)
 /** Binds all label tree interaction handlers. */
 function bindLabelTree(treeEl: HTMLElement, task: Task): void {
   const editable = appState.isAdmin;
+  const persistLabels = () => {
+    void runTaskSave(
+      () => persistTaskLabels(task),
+      "Failed to save labels.",
+      "tasks: save labels failed"
+    );
+  };
 
   const selectNode = (nodeId: string) => {
     task.selectedLabelId = nodeId;
@@ -1634,6 +1922,7 @@ function bindLabelTree(treeEl: HTMLElement, task: Task): void {
     meta.parentArr.splice(meta.index, 1);
     meta.parentArr.splice(nextIdx, 0, meta.node);
     refreshLabelTree(treeEl, task, task.selectedLabelId);
+    persistLabels();
   };
 
   const promoteSelected = () => {
@@ -1644,6 +1933,7 @@ function bindLabelTree(treeEl: HTMLElement, task: Task): void {
     const parentIdx = meta.grandParentArr.findIndex((n) => n.id === meta.parentNode!.id);
     meta.grandParentArr.splice(parentIdx + 1, 0, meta.node);
     refreshLabelTree(treeEl, task, task.selectedLabelId);
+    persistLabels();
   };
 
   const demoteSelected = () => {
@@ -1654,6 +1944,7 @@ function bindLabelTree(treeEl: HTMLElement, task: Task): void {
     meta.parentArr.splice(meta.index, 1);
     prevSibling.children.push(meta.node);
     refreshLabelTree(treeEl, task, task.selectedLabelId);
+    persistLabels();
   };
 
   treeEl.querySelectorAll<HTMLElement>(".label-tree__row").forEach((row) => {
@@ -1685,6 +1976,7 @@ function bindLabelTree(treeEl: HTMLElement, task: Task): void {
       removeLabelNode(removedId, task.labels);
       if (task.selectedLabelId === removedId) task.selectedLabelId = null;
       refreshLabelTree(treeEl, task);
+      persistLabels();
     });
   });
 
@@ -1699,6 +1991,7 @@ function bindLabelTree(treeEl: HTMLElement, task: Task): void {
       task.labels.push({ id: newId, text: val, children: [] });
       task.selectedLabelId = newId;
       refreshLabelTree(treeEl, task, newId);
+      persistLabels();
     });
   }
 }
@@ -1802,6 +2095,16 @@ function renderTasksDialog(): string {
   const badge = admin
     ? '<span class="tasks-admin-badge tasks-admin-badge--admin">admin</span>'
     : '<span class="tasks-admin-badge tasks-admin-badge--user">user</span>';
+  const statusText = appState.tasksLoading
+    ? "Loading tasks..."
+    : (appState.tasksSavingCount > 0 ? `Saving (${appState.tasksSavingCount})...` : "");
+  const statusClass = appState.tasksLoading ? "is-loading" : "is-saving";
+  const statusHtml = statusText
+    ? `<span class="tasks-dialog__status ${statusClass}">${statusText}</span>`
+    : "";
+  const errorHtml = appState.tasksError
+    ? `<div class="tasks-dialog__error" role="status">${appState.tasksError.replace(/</g, "&lt;")}</div>`
+    : "";
   const cards = appState.tasks.map(renderTaskCard).join("");
   const addBtn = admin
     ? '<button type="button" class="task-add-btn" data-action="add-task">+ new task</button>'
@@ -1812,9 +2115,11 @@ function renderTasksDialog(): string {
         <div class="tasks-dialog__header">
           <h2 class="tasks-dialog__title">Tasks</h2>
           ${badge}
+          ${statusHtml}
           <button type="button" class="tasks-dialog__close" data-action="close-tasks">✕</button>
         </div>
         <div class="tasks-dialog__body">
+          ${errorHtml}
           ${cards}
           ${addBtn}
         </div>
@@ -1851,6 +2156,20 @@ function bindTasksDialogHandlers(): void {
     });
   });
 
+  // Task reorder
+  root.querySelectorAll<HTMLButtonElement>('[data-action="move-task-up"]').forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      void moveTaskBy(btn.getAttribute("data-task-id")!, -1);
+    });
+  });
+  root.querySelectorAll<HTMLButtonElement>('[data-action="move-task-down"]').forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      void moveTaskBy(btn.getAttribute("data-task-id")!, 1);
+    });
+  });
+
   // Status dropdown
   root.querySelectorAll<HTMLSelectElement>('[data-action="set-status"]').forEach((sel) => {
     sel.addEventListener("change", () => {
@@ -1862,6 +2181,11 @@ function bindTasksDialogHandlers(): void {
       card?.querySelectorAll<HTMLElement>(".task-status-dot").forEach((dot) => {
         dot.style.background = taskStatusColor(task.status);
       });
+      void runTaskSave(
+        () => persistTaskScalars(task),
+        "Failed to save task status.",
+        "tasks: save status failed"
+      );
     });
   });
 
@@ -1883,6 +2207,11 @@ function bindTasksDialogHandlers(): void {
         rebindTagsWrap(card, task);
         updateTaskSummaryTags(card, task);
       }
+      void runTaskSave(
+        () => persistTaskTags(task),
+        "Failed to save task tags.",
+        "tasks: save tags failed"
+      );
     });
   });
 
@@ -1897,6 +2226,11 @@ function bindTasksDialogHandlers(): void {
       btn.closest(".task-pin")?.remove();
       const card = root.querySelector<HTMLElement>(`.task-card[data-task-id="${id}"]`);
       if (card) updateTaskSummaryTags(card, task);
+      void runTaskSave(
+        () => persistTaskTags(task),
+        "Failed to save task tags.",
+        "tasks: save tags failed"
+      );
     });
   });
 
@@ -1919,6 +2253,13 @@ function bindTasksDialogHandlers(): void {
         const card = root.querySelector<HTMLElement>(`.task-card[data-task-id="${id}"]`);
         if (card && task) updateTaskSummaryDesc(card, task);
       }
+      if (task) {
+        void runTaskSave(
+          () => persistTaskScalars(task),
+          "Failed to save task field.",
+          "tasks: save field failed"
+        );
+      }
     };
     input.addEventListener("blur", commit);
     input.addEventListener("keydown", (e) => {
@@ -1931,18 +2272,28 @@ function bindTasksDialogHandlers(): void {
     chk.addEventListener("change", () => {
       const id = chk.getAttribute("data-task-id")!;
       const task = appState.tasks.find((t) => t.id === id);
-      if (task) task.checkmark = chk.checked;
+      if (!task) return;
+      task.checkmark = chk.checked;
+      void runTaskSave(
+        () => persistTaskScalars(task),
+        "Failed to save task checkmark.",
+        "tasks: save checkmark failed"
+      );
     });
   });
 
   // Delete task
   root.querySelectorAll<HTMLButtonElement>('[data-action="delete-task"]').forEach((btn) => {
-    btn.addEventListener("click", () => removeTask(btn.getAttribute("data-task-id")!));
+    btn.addEventListener("click", () => {
+      void removeTask(btn.getAttribute("data-task-id")!);
+    });
   });
 
   // Add task
   root.querySelector<HTMLButtonElement>('[data-action="add-task"]')
-    ?.addEventListener("click", addTask);
+    ?.addEventListener("click", () => {
+      void addTask();
+    });
 
   // Label trees
   root.querySelectorAll<HTMLElement>(".label-tree[data-task-id]").forEach((treeEl) => {
@@ -1976,6 +2327,11 @@ function rebindTagsWrap(card: HTMLElement, task: Task): void {
       task.tags = task.tags.filter((t) => t !== tag);
       btn.closest(".task-pin")?.remove();
       updateTaskSummaryTags(card, task);
+      void runTaskSave(
+        () => persistTaskTags(task),
+        "Failed to save task tags.",
+        "tasks: save tags failed"
+      );
     });
   });
   card.querySelector<HTMLInputElement>('[data-action="add-tag"]')
@@ -1990,6 +2346,11 @@ function rebindTagsWrap(card: HTMLElement, task: Task): void {
       if (wrap) wrap.outerHTML = buildTagsWrapHtml(task);
       rebindTagsWrap(card, task);
       updateTaskSummaryTags(card, task);
+      void runTaskSave(
+        () => persistTaskTags(task),
+        "Failed to save task tags.",
+        "tasks: save tags failed"
+      );
     });
 }
 
