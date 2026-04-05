@@ -35,7 +35,7 @@ func main() {
 	if err := syncAdmins(sqlDB, cfg.Admins); err != nil {
 		log.Fatalf("sync admins: %v", err)
 	}
-	tiles.Configure(cfg.CacheDir, cfg.CacheLimitMB, cfg.CacheEvictInterval)
+	tiles.Configure(cfg.CacheDir, cfg.CacheLimitMB, cfg.CacheEvictInterval, cfg.TileWorkers)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/me", makeMeHandler(sqlDB))

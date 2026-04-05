@@ -32,6 +32,7 @@ const (
 	defaultCacheDir      = "/tmp/nemo-lab/cache"
 	defaultCacheLimitMB  = int64(512)
 	defaultEvictInterval = 5 * time.Minute
+	defaultTileWorkers   = 4
 	imagesDir            = "images"
 )
 
@@ -45,6 +46,7 @@ type Service struct {
 	cacheDir      string
 	cacheLimitB   int64
 	evictInterval time.Duration
+	tileWorkers   int
 
 	inFlightMu sync.Mutex
 	inFlight   map[string]*sync.Mutex
@@ -52,7 +54,7 @@ type Service struct {
 }
 
 // Configure initializes the package-global tile service.
-func Configure(cacheDir string, cacheLimitMB int64, evictIntervalRaw string) {
+func Configure(cacheDir string, cacheLimitMB int64, evictIntervalRaw string, tileWorkers int) {
 	interval, err := time.ParseDuration(evictIntervalRaw)
 	if err != nil || interval <= 0 {
 		interval = defaultEvictInterval
@@ -63,12 +65,16 @@ func Configure(cacheDir string, cacheLimitMB int64, evictIntervalRaw string) {
 	if cacheLimitMB <= 0 {
 		cacheLimitMB = defaultCacheLimitMB
 	}
+	if tileWorkers <= 0 {
+		tileWorkers = defaultTileWorkers
+	}
 	_ = os.MkdirAll(cacheDir, 0o755)
 
 	svc := &Service{
 		cacheDir:      cacheDir,
 		cacheLimitB:   cacheLimitMB * 1024 * 1024,
 		evictInterval: interval,
+		tileWorkers:   tileWorkers,
 		inFlight:      make(map[string]*sync.Mutex),
 		stopCh:        make(chan struct{}),
 	}
@@ -145,7 +151,7 @@ func ensureService() *Service {
 	if svc != nil {
 		return svc
 	}
-	Configure(defaultCacheDir, defaultCacheLimitMB, defaultEvictInterval.String())
+	Configure(defaultCacheDir, defaultCacheLimitMB, defaultEvictInterval.String(), defaultTileWorkers)
 	serviceMu.RLock()
 	defer serviceMu.RUnlock()
 	return service
@@ -321,27 +327,54 @@ func (s *Service) generateTiles(
 		"elapsed_ms": time.Since(t0).Milliseconds(),
 	})
 
+	type tileJob struct {
+		col, row int
+	}
+
 	for _, w := range chain {
 		level, scaled, lw, lh := w.level, w.img, w.lw, w.lh
 		cols := ceilDiv(lw, tileSize)
 		rows := ceilDiv(lh, tileSize)
+
+		// Create all tile subdirectories before spawning workers.
+		levelDir := filepath.Dir(s.tilePath(hash, level, 0, 0))
+		if err := os.MkdirAll(levelDir, 0o755); err != nil {
+			return 0, 0, 0, err
+		}
+
+		jobs := make(chan tileJob, cols*rows)
 		for row := 0; row < rows; row++ {
 			for col := 0; col < cols; col++ {
-				x0 := col * tileSize
-				y0 := row * tileSize
-				x1 := minInt(x0+tileSize, lw)
-				y1 := minInt(y0+tileSize, lh)
-				tile := image.NewRGBA(image.Rect(0, 0, x1-x0, y1-y0))
-				stddraw.Draw(tile, tile.Bounds(), scaled, image.Pt(x0, y0), stddraw.Src)
-				path := s.tilePath(hash, level, col, row)
-				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-					return 0, 0, 0, err
-				}
-				if err := writePNG(path, tile); err != nil {
-					return 0, 0, 0, err
-				}
+				jobs <- tileJob{col, row}
 			}
 		}
+		close(jobs)
+
+		errs := make(chan error, s.tileWorkers)
+		for range s.tileWorkers {
+			go func() {
+				for j := range jobs {
+					x0 := j.col * tileSize
+					y0 := j.row * tileSize
+					x1 := minInt(x0+tileSize, lw)
+					y1 := minInt(y0+tileSize, lh)
+					tile := image.NewRGBA(image.Rect(0, 0, x1-x0, y1-y0))
+					stddraw.Draw(tile, tile.Bounds(), scaled, image.Pt(x0, y0), stddraw.Src)
+					path := s.tilePath(hash, level, j.col, j.row)
+					if err := writePNG(path, tile); err != nil {
+						errs <- err
+						return
+					}
+				}
+				errs <- nil
+			}()
+		}
+		for range s.tileWorkers {
+			if err := <-errs; err != nil {
+				return 0, 0, 0, err
+			}
+		}
+
 		log.Printf("tiles level done hash=%.16s level=%d/%d size=%dx%d elapsed=%s", hash, level, levels-1, lw, lh, time.Since(t0).Round(time.Millisecond))
 		emit("tile_generation_level_done", map[string]any{
 			"hash":         hash,
@@ -520,6 +553,11 @@ func findImageFile(stem string) (string, error) {
 }
 
 func decodeImage(path string) (image.Image, error) {
+	// Try native decoder first (PNG/JPEG via libpng/libjpeg-turbo).
+	if img, err := decodeImageNative(path); img != nil || err != nil {
+		return img, err
+	}
+	// Fall back to pure Go for other formats (TIFF, etc.).
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err

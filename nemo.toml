@@ -6,3 +6,4 @@ admins      = ["ma"]
 cache_dir            = "/tmp/nemo-lab/cache"
 cache_limit_mb       = 260000
 cache_evict_interval = "5m"
+tile_workers         = 3
