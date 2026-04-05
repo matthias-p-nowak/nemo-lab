@@ -289,6 +289,9 @@ function goPreviousImage(): void {
   }
   appState.currentImageIndex =
     (appState.currentImageIndex - 1 + appState.imageList.length) % appState.imageList.length;
+  // Clear active hash so remount does not briefly reload the previous image
+  // while waiting for the next image_ready event.
+  appState.currentImageHash = null;
   appState.annotations = [];
   const current = getCurrentImageEntry();
   if (current) {
@@ -304,6 +307,9 @@ function goNextImage(): void {
     return;
   }
   appState.currentImageIndex = (appState.currentImageIndex + 1) % appState.imageList.length;
+  // Clear active hash so remount does not briefly reload the previous image
+  // while waiting for the next image_ready event.
+  appState.currentImageHash = null;
   appState.annotations = [];
   const current = getCurrentImageEntry();
   if (current) {
@@ -350,7 +356,6 @@ ws.addEventListener("message", (event) => {
     const level = typeof m["level"] === "number" ? m["level"] : 0;
     const totalLevels = typeof m["total_levels"] === "number" ? m["total_levels"] : 0;
     console.log(`ws image_ready hash=${hash.slice(0, 16)} level=${level}/${totalLevels}`);
-    logEvent("image_ready", { hash, level, total_levels: totalLevels });
     const isNewImage = appState.currentImageHash !== hash;
     // Only reset annotations when the image changes.
     if (isNewImage) {
@@ -359,7 +364,7 @@ ws.addEventListener("message", (event) => {
     appState.currentImageHash = hash;
     if (viewer) {
       if (isNewImage) {
-        // New image: full load with zoom reset and animation.
+        // New image: full load with zoom reset.
         void viewer.setImage(hash, level);
       } else {
         // Same image, higher-resolution level available: reload tiles in place.
@@ -589,8 +594,6 @@ class WebGLTileViewer {
 
   /** Current async request generation token. */
   private generation = 0;
-  /** Ongoing entrance animation request id. */
-  private animationId: number | null = null;
 
   /** Lowest-level texture used as immediate placeholder. */
   private level0Tile: LoadedTile | null = null;
@@ -638,8 +641,6 @@ class WebGLTileViewer {
   /** Fallback window resize listener for environments without ResizeObserver. */
   private windowResizeHandler: (() => void) | null = null;
 
-  /** Current animation multiplier between natural and fit scale. */
-  private animationScale = 1;
   /** Current zoom in CSS pixels per source pixel. */
   private zoom = 1;
   /** Current left offset of image in canvas CSS pixels. */
@@ -770,11 +771,6 @@ class WebGLTileViewer {
     const gl = this.gl;
 
     this.generation += 1;
-    if (this.animationId !== null) {
-      cancelAnimationFrame(this.animationId);
-      this.animationId = null;
-    }
-
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     if (this.windowResizeHandler) {
@@ -804,9 +800,8 @@ class WebGLTileViewer {
     this.maxReadyLevel = typeof readyLevel === "number" ? readyLevel : -1;
     this.loadingLevel = -1;
     this.loadingGeneration = 0;
-    this.animationScale = 1;
-
     this.clearTextures();
+    this.updateCanvasZoomLevelClass();
     this.draw();
 
     const requestId = ++this.generation;
@@ -837,12 +832,11 @@ class WebGLTileViewer {
     this.updateCanvasZoomLevelClass();
 
     await this.loadLevel0(requestId);
-    this.startFitAnimation();
     this.loadFitLevelTiles(requestId);
   }
 
   /**
-   * Reloads tiles for the current image without resetting zoom, position, or animation.
+   * Reloads tiles for the current image without resetting zoom or position.
    * Called when a higher-resolution level becomes available for the already-displayed image.
    */
   refreshTiles(readyLevel: number | null = null): void {
@@ -1007,36 +1001,6 @@ class WebGLTileViewer {
     return tileX0 < vpX1 && tileX1 > vpX0 && tileY0 < vpY1 && tileY1 > vpY0;
   }
 
-  /** Runs the 0.5 second level-0 grow animation to fit scale. */
-  private startFitAnimation(): void {
-    if (!this.manifest) {
-      return;
-    }
-
-    if (this.animationId !== null) {
-      cancelAnimationFrame(this.animationId);
-      this.animationId = null;
-    }
-
-    const durationMs = 200;
-    const start = performance.now();
-
-    const step = (now: number): void => {
-      const t = Math.min(1, (now - start) / durationMs);
-      this.animationScale = 1 + (this.fitScaleForLevel(0) - 1) * t;
-      this.draw();
-
-      if (t < 1) {
-        this.animationId = requestAnimationFrame(step);
-      } else {
-        this.animationId = null;
-      }
-    };
-
-    this.animationScale = 1;
-    this.animationId = requestAnimationFrame(step);
-  }
-
   /** Picks the first level whose resolution exceeds canvas pixels*dpr target. */
   private pickFitLevel(): number {
     if (!this.manifest) {
@@ -1062,34 +1026,12 @@ class WebGLTileViewer {
     if (!this.manifest) {
       return;
     }
-
-    if (this.animationId !== null) {
-      const dims = getLevelDimensions(this.manifest, 0);
-      const drawW = dims.width * this.animationScale;
-      const drawH = dims.height * this.animationScale;
-      this.transform = {
-        x: (this.canvas.clientWidth - drawW) / 2,
-        y: (this.canvas.clientHeight - drawH) / 2,
-        width: drawW,
-        height: drawH,
-      };
-    } else {
-      this.transform = {
-        x: this.offsetX,
-        y: this.offsetY,
-        width: this.zoom * this.manifest.width,
-        height: this.zoom * this.manifest.height,
-      };
-    }
-  }
-
-  /** Returns fit scale for a specific level. */
-  private fitScaleForLevel(level: number): number {
-    if (!this.manifest) {
-      return 1;
-    }
-    const dims = getLevelDimensions(this.manifest, level);
-    return this.fitScaleForDimensions(dims.width, dims.height);
+    this.transform = {
+      x: this.offsetX,
+      y: this.offsetY,
+      width: this.zoom * this.manifest.width,
+      height: this.zoom * this.manifest.height,
+    };
   }
 
   /** Returns fit-to-canvas scale for given source dimensions. */
@@ -1148,9 +1090,13 @@ class WebGLTileViewer {
   /** Updates canvas border-color state class based on whether fit level is maxed. */
   private updateCanvasZoomLevelClass(): void {
     if (!this.manifest) {
+      this.canvas.classList.remove("image-view__canvas--zoom-at-max");
+      this.canvas.classList.remove("image-view__canvas--zoom-below-max");
+      this.canvas.classList.toggle("image-view__canvas--zoom-loading", this.imageStem.length > 0);
       return;
     }
     const atMax = this.fitLevel === this.manifest.levels - 1;
+    this.canvas.classList.remove("image-view__canvas--zoom-loading");
     this.canvas.classList.toggle("image-view__canvas--zoom-at-max", atMax);
     this.canvas.classList.toggle("image-view__canvas--zoom-below-max", !atMax);
   }
@@ -1249,7 +1195,6 @@ class WebGLTileViewer {
     console.log(
       `tile upload hash=${this.imageStem.slice(0, 16)} level=${level} tile=${tx},${ty} size=${image.naturalWidth}x${image.naturalHeight}`
     );
-    logEvent("tile_upload", { hash: this.imageStem, level, tx, ty, width: image.naturalWidth, height: image.naturalHeight });
 
     gl.bindTexture(gl.TEXTURE_2D, texture);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
@@ -1363,7 +1308,7 @@ class WebGLTileViewer {
 
   /** Handles wheel-based pan/zoom gestures centered at cursor. */
   private readonly handleWheel = (event: WheelEvent): void => {
-    if (!this.manifest || this.animationId !== null) {
+    if (!this.manifest) {
       return;
     }
     event.preventDefault();
@@ -1405,7 +1350,7 @@ class WebGLTileViewer {
 
   /** Starts drag-pan tracking on primary-pointer down. */
   private readonly handlePointerDown = (event: PointerEvent): void => {
-    if (event.button !== 0 || this.animationId !== null) {
+    if (event.button !== 0) {
       return;
     }
     this.isDragging = true;
@@ -1511,6 +1456,8 @@ function mountViewer(): void {
 
   const { gamma, multiply, add } = appState.optics;
   viewer.setOptics(gamma, multiply, add);
+  const waitingForImageReady = appState.imageList.length > 0 && appState.currentImageHash === null;
+  canvas.classList.toggle("image-view__canvas--zoom-loading", waitingForImageReady);
   if (appState.currentImageHash) {
     void viewer.setImage(appState.currentImageHash);
   }

@@ -309,6 +309,7 @@ Collapsible panel in the right sidebar. Contains three sliders:
 
 The canvas border color reflects the current zoom state relative to the image's native resolution:
 
+- **Yellow** (`#fbc02d`): image not yet ready in the viewer (waiting for `image_ready`/manifest load)
 - **Green** (`#4caf50`): `fitLevel < manifest.levels - 1` — viewing below max tile resolution; more detail is available by zooming in
 - **Brown** (`#795548`): `fitLevel === manifest.levels - 1` — at the finest tile level; zooming further only upscales pixels
 

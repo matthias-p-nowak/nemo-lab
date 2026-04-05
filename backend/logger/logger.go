@@ -14,7 +14,8 @@ const maxFiles = 20
 
 // Logger writes JSONL entries to a single session log file.
 type Logger struct {
-	f *os.File
+	mu sync.Mutex
+	f  *os.File
 }
 
 // New creates logsDir, enforces file cap, and opens a new session log file.
@@ -51,12 +52,16 @@ func (l *Logger) Append(entry map[string]any) error {
 		return err
 	}
 	b = append(b, '\n')
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	_, err = l.f.Write(b)
 	return err
 }
 
 // Close closes the underlying log file.
 func (l *Logger) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	return l.f.Close()
 }
 

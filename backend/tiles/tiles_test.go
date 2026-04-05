@@ -32,7 +32,7 @@ func TestHandlerServesCachedManifestAndCroppedTiles(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chdir(prevWD) })
 
-	Configure(cachePath, 64, "1h")
+	Configure(cachePath, 64, "1h", 2)
 	handler := NewHandler()
 	canonicalPath, err := filepath.Abs(srcPath)
 	if err != nil {
@@ -118,7 +118,7 @@ func TestHandlerReturns404WhenManifestNotCached(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chdir(prevWD) })
 
-	Configure(filepath.Join(temp, "cache"), 64, "1h")
+	Configure(filepath.Join(temp, "cache"), 64, "1h", 2)
 	handler := NewHandler()
 	missingHash := HashForPath("/tmp/non-existent-image.png")
 

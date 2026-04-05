@@ -72,8 +72,12 @@
   - pushes `{ "type": "image_list", "images": [{ "filename", "hash" }, ...] }`.
 - `prefetch` handling:
   - resolves hashes against the session map
-  - synchronously tiles `hashes[0]` via `tiles.EnsureGeneratedByPath`, then pushes `{ "type": "image_ready", "hash": ... }`
-  - tiles remaining hashes asynchronously without additional ready events.
+  - runs in a background goroutine so the WS receive loop remains responsive during long tile generation
+  - aborts prefetch work early when a newer request supersedes it (per-connection sequence check)
+  - processes `hashes[0]` first and emits `{ "type": "image_ready", "hash": ..., "level": ..., "total_levels": ... }` progress events
+  - suppresses stale `image_ready` events from older superseded prefetch requests using a per-connection sequence number
+  - tiles remaining hashes asynchronously without additional ready events, but only for the latest prefetch sequence.
+- During prefetch generation, WS forwards structured tile-generation events from `backend/tiles` into the per-session JSONL logger (`tile_generation_start`, `tile_generation_decoded`, `tile_generation_mipmap_done`, `tile_generation_level_done`, `tile_generation_complete`, `tile_generation_cache_hit`).
 - Logging messages continue to be appended from `{ "type": "log", "entry": { ... } }` payloads; `set_active_task` can arrive either top-level or as a logged event entry.
 
 ## Tasks API
@@ -123,7 +127,7 @@
 - Previous/next navigation updates the current index and sends a new `prefetch` window; image display waits for backend `image_ready`.
 - On `image_ready`, frontend loads viewer manifests/tiles using hash-based URLs (`/images/{hash}/manifest.json` + manifest tile template).
 - Viewer state now tracks `zoom`, `offsetX`, and `offsetY` for interactive navigation.
-- Initial image load sets pan/zoom to centered fit (`fitScaleForDimensions(manifest.width, manifest.height)`), then starts the existing level-0 entrance animation.
+- Initial image load sets pan/zoom to centered fit (`fitScaleForDimensions(manifest.width, manifest.height)`) and renders immediately.
 - Wheel and pointer behavior:
   - `Ctrl+wheel` zooms around cursor.
   - Wheel pans vertically; `Shift+wheel` pans horizontally.
@@ -139,5 +143,4 @@
 - Viewer input handlers emit telemetry with module-level `logEvent(...)` over the shared WebSocket.
 - Logged frontend events: `image_change` and document `focus` (`focusin`/`focusout`).
 - Canvas click adds an annotation only if total pointer travel since `pointerdown` is ≤ `config.clickMaxDragPx` (default 10 CSS px); longer drags are treated as pan gestures and suppressed.
-- The canvas border color indicates zoom resolution: green when `fitLevel < manifest.levels - 1` (below max tile resolution), brown when at the finest level. Updated via a CSS class toggled on the canvas element after each zoom change. The yellow debug box-shadow is removed.
-- The entrance animation duration is 200 ms.
+- The canvas border color indicates viewer readiness/zoom resolution: yellow while the selected image is not yet ready in the viewer, green when `fitLevel < manifest.levels - 1` (below max tile resolution), and brown when at the finest level. Updated via CSS classes toggled on the canvas element. The yellow debug box-shadow is removed.

@@ -2,6 +2,7 @@ package ws
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
@@ -22,6 +23,7 @@ type connState struct {
 	count        int
 	activeTaskID string
 	hashToPath   map[string]string
+	prefetchSeq  uint64
 }
 
 var (
@@ -40,6 +42,7 @@ func NewHandler(db *sql.DB, logsDir string) http.HandlerFunc {
 
 		websocket.Handler(func(conn *websocket.Conn) {
 			defer conn.Close()
+			writeMu := &sync.Mutex{}
 
 			lgr, loggerErr := logger.New(logsDir, time.Now())
 			if loggerErr != nil {
@@ -104,17 +107,18 @@ func NewHandler(db *sql.DB, logsDir string) http.HandlerFunc {
 					}
 					if eventType, _ := entry["type"].(string); eventType == "set_active_task" {
 						taskID, _ := entry["task_id"].(string)
-						handleSetActiveTask(db, cookie.Value, conn, lgr, taskID)
+						handleSetActiveTask(db, cookie.Value, conn, writeMu, lgr, taskID)
 					}
 				case "set_active_task":
 					taskID, _ := entry["task_id"].(string)
 					if lgr != nil {
 						_ = lgr.Append(entry)
 					}
-					handleSetActiveTask(db, cookie.Value, conn, lgr, taskID)
+					handleSetActiveTask(db, cookie.Value, conn, writeMu, lgr, taskID)
 				case "prefetch":
 					hashes := prefetchHashes(msg, entry)
-					handlePrefetch(cookie.Value, conn, lgr, hashes)
+					seq := nextPrefetchSeq(cookie.Value)
+					go handlePrefetch(cookie.Value, conn, writeMu, lgr, hashes, seq)
 				default:
 					if msgType == "" {
 						continue
@@ -125,7 +129,14 @@ func NewHandler(db *sql.DB, logsDir string) http.HandlerFunc {
 	}
 }
 
-func handleSetActiveTask(db *sql.DB, token string, conn *websocket.Conn, lgr *logger.Logger, taskID string) {
+func handleSetActiveTask(
+	db *sql.DB,
+	token string,
+	conn *websocket.Conn,
+	writeMu *sync.Mutex,
+	lgr *logger.Logger,
+	taskID string,
+) {
 	connectionsMu.Lock()
 	if s := connections[token]; s != nil {
 		s.activeTaskID = taskID
@@ -136,14 +147,14 @@ func handleSetActiveTask(db *sql.DB, token string, conn *websocket.Conn, lgr *lo
 	if err != nil {
 		log.Printf("ws set_active_task task lookup failed: task_id=%s err=%v", taskID, err)
 		storeHashMap(token, map[string]string{})
-		_ = websocket.JSON.Send(conn, map[string]any{"type": "image_list", "images": []imageItem{}})
+		_ = wsSendJSON(conn, writeMu, map[string]any{"type": "image_list", "images": []imageItem{}})
 		return
 	}
 	items, hashToPath, err := listTaskImages(imagesRoot)
 	if err != nil {
 		log.Printf("ws set_active_task scan failed: task_id=%s root=%s err=%v", taskID, imagesRoot, err)
 		storeHashMap(token, map[string]string{})
-		_ = websocket.JSON.Send(conn, map[string]any{"type": "image_list", "images": []imageItem{}})
+		_ = wsSendJSON(conn, writeMu, map[string]any{"type": "image_list", "images": []imageItem{}})
 		return
 	}
 	storeHashMap(token, hashToPath)
@@ -152,11 +163,22 @@ func handleSetActiveTask(db *sql.DB, token string, conn *websocket.Conn, lgr *lo
 		"ts":          time.Now().Format(time.RFC3339),
 		"image_count": len(items),
 	})
-	_ = websocket.JSON.Send(conn, map[string]any{"type": "image_list", "images": items})
+	_ = wsSendJSON(conn, writeMu, map[string]any{"type": "image_list", "images": items})
 }
 
-func handlePrefetch(token string, conn *websocket.Conn, lgr *logger.Logger, hashes []string) {
+func handlePrefetch(
+	token string,
+	conn *websocket.Conn,
+	writeMu *sync.Mutex,
+	lgr *logger.Logger,
+	hashes []string,
+	seq uint64,
+) {
 	if len(hashes) == 0 {
+		return
+	}
+	// If a newer prefetch already exists, drop this one before doing any work.
+	if !isCurrentPrefetchSeq(token, seq) {
 		return
 	}
 	log.Printf("ws prefetch token=%s hashes=%d", tokenPrefix(token), len(hashes))
@@ -169,18 +191,16 @@ func handlePrefetch(token string, conn *websocket.Conn, lgr *logger.Logger, hash
 
 	firstHash := hashes[0]
 	if absPath, ok := hashToPath[firstHash]; ok {
+		readySent := false
 		_, err := tiles.GenerateByPathWithProgressAndEvents(
 			absPath,
 			func(level, totalLevels int) {
+				if !isCurrentPrefetchSeq(token, seq) {
+					return
+				}
+				readySent = true
 				log.Printf("ws image_ready token=%s hash=%.16s level=%d/%d", tokenPrefix(token), firstHash, level, totalLevels-1)
-				logAppend(lgr, map[string]any{
-					"type":         "image_ready",
-					"ts":           time.Now().Format(time.RFC3339),
-					"hash":         firstHash,
-					"level":        level,
-					"total_levels": totalLevels,
-				})
-				_ = websocket.JSON.Send(conn, map[string]any{
+				_ = wsSendJSON(conn, writeMu, map[string]any{
 					"type":         "image_ready",
 					"hash":         firstHash,
 					"level":        level,
@@ -200,6 +220,19 @@ func handlePrefetch(token string, conn *websocket.Conn, lgr *logger.Logger, hash
 				"hash":  firstHash,
 				"error": err.Error(),
 			})
+		} else if !readySent && isCurrentPrefetchSeq(token, seq) {
+			totalLevels, levelsErr := readManifestLevels(firstHash)
+			if levelsErr != nil || totalLevels < 1 {
+				totalLevels = 1
+			}
+			level := totalLevels - 1
+			log.Printf("ws image_ready cache-hit token=%s hash=%.16s level=%d/%d", tokenPrefix(token), firstHash, level, totalLevels-1)
+			_ = wsSendJSON(conn, writeMu, map[string]any{
+				"type":         "image_ready",
+				"hash":         firstHash,
+				"level":        level,
+				"total_levels": totalLevels,
+			})
 		}
 	} else {
 		log.Printf("ws prefetch first hash not in session map token=%s hash=%.16s", tokenPrefix(token), firstHash)
@@ -211,6 +244,10 @@ func handlePrefetch(token string, conn *websocket.Conn, lgr *logger.Logger, hash
 		})
 	}
 
+	// Do not warm trailing hashes for superseded requests.
+	if !isCurrentPrefetchSeq(token, seq) {
+		return
+	}
 	for _, hash := range hashes[1:] {
 		absPath, ok := hashToPath[hash]
 		if !ok {
@@ -220,6 +257,24 @@ func handlePrefetch(token string, conn *websocket.Conn, lgr *logger.Logger, hash
 			_, _ = tiles.EnsureGeneratedByPath(path)
 		}(absPath)
 	}
+}
+
+func readManifestLevels(hash string) (int, error) {
+	path := tiles.ManifestPathForHash(hash)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	var manifest struct {
+		Levels int `json:"levels"`
+	}
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return 0, err
+	}
+	if manifest.Levels < 1 {
+		return 0, errors.New("invalid manifest levels")
+	}
+	return manifest.Levels, nil
 }
 
 type imageItem struct {
@@ -387,6 +442,31 @@ func copyHashMap(src map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+func nextPrefetchSeq(token string) uint64 {
+	connectionsMu.Lock()
+	defer connectionsMu.Unlock()
+	if s := connections[token]; s != nil {
+		s.prefetchSeq++
+		return s.prefetchSeq
+	}
+	return 0
+}
+
+func isCurrentPrefetchSeq(token string, seq uint64) bool {
+	connectionsMu.Lock()
+	defer connectionsMu.Unlock()
+	if s := connections[token]; s != nil {
+		return s.prefetchSeq == seq
+	}
+	return false
+}
+
+func wsSendJSON(conn *websocket.Conn, writeMu *sync.Mutex, payload map[string]any) error {
+	writeMu.Lock()
+	defer writeMu.Unlock()
+	return websocket.JSON.Send(conn, payload)
 }
 
 // logAppend appends an entry to lgr if non-nil; silently no-ops otherwise.
