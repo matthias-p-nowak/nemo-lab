@@ -2,6 +2,8 @@ dist/
 tmp/
 previous_work/
 *.db
+*.db-shm
+*.db-wal
 __debug_bin*
 wt/
 images/

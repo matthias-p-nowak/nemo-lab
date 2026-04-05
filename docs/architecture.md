@@ -57,6 +57,7 @@
 - Route behavior in `backend/cmd/server/main.go`:
   - `GET /api/me`: returns authenticated username and admin flag from `users.is_admin`.
   - `GET /api/tasks`: list all tasks for any authenticated user (returns `[]` when empty, never `null`).
+  - `GET /api/dirs?path=...`: returns `{ dirs: [...] }` containing immediate child directory names; returns empty list for non-existent paths or non-directory paths.
   - `PUT /api/tasks/{id}`: upsert task; non-admin path loads existing row and applies only `status` and `comment`.
   - `DELETE /api/tasks/{id}`: admin-only.
   - `PUT /api/tasks/{id}/tags`: authenticated users can replace tags.
@@ -81,6 +82,11 @@
   - saving indicator while write calls are in flight
   - error banner for load/save failures, auto-cleared after a successful later operation
 - Task load/save failures are also forwarded to backend logs from the frontend over WebSocket via `logEvent("task_error", ...)`.
+- Admin-only browse buttons for `images` and `annotations` open a dedicated directory-browser modal.
+- Directory-browser modal behavior:
+  - queries `GET /api/dirs` for current path
+  - supports parent (`..`) navigation
+  - writes selected path into the corresponding input and reuses existing save-on-blur behavior
 
 ## Frontend image viewer
 

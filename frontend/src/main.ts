@@ -117,6 +117,11 @@ const appState = {
   },
 };
 
+/** Current path shown in the directory browser modal. */
+let dirBrowserPath = "/";
+/** Callback invoked when the user confirms a directory selection. */
+let dirBrowserCallback: ((path: string) => void) | null = null;
+
 /** A node in the hierarchical label tree. */
 interface LabelNode {
   /** Stable unique identifier. */
@@ -1599,6 +1604,128 @@ function closeTasksDialog(): void {
   render();
 }
 
+/** Fetches immediate subdirectories for the given filesystem path from backend. */
+async function fetchDirs(path: string): Promise<string[]> {
+  const response = await fetch(`/api/dirs?${new URLSearchParams({ path }).toString()}`, {
+    credentials: "include",
+  });
+  if (!response.ok) {
+    throw new Error(`dir list failed (${response.status})`);
+  }
+  const payload = (await response.json()) as { dirs?: string[] };
+  return Array.isArray(payload.dirs) ? payload.dirs : [];
+}
+
+/** Renders directory entries and breadcrumbs in the open directory browser modal. */
+async function renderDirBrowser(): Promise<void> {
+  const breadcrumb = document.getElementById("dir-browser-breadcrumb");
+  const list = document.getElementById("dir-browser-list");
+  const selected = document.getElementById("dir-browser-selected");
+  if (!breadcrumb || !list || !selected) {
+    return;
+  }
+
+  breadcrumb.textContent = dirBrowserPath;
+  selected.textContent = dirBrowserPath;
+  list.innerHTML = "";
+
+  if (dirBrowserPath !== "/") {
+    const up = document.createElement("div");
+    up.className = "dir-browser-entry dir-browser-entry--up";
+    up.textContent = "..";
+    up.addEventListener("click", () => {
+      const parts = dirBrowserPath.split("/").filter(Boolean);
+      parts.pop();
+      dirBrowserPath = parts.length > 0 ? `/${parts.join("/")}` : "/";
+      void renderDirBrowser();
+    });
+    list.appendChild(up);
+  }
+
+  try {
+    const dirs = await fetchDirs(dirBrowserPath);
+    if (dirs.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "dir-browser-entry";
+      empty.textContent = "(empty)";
+      list.appendChild(empty);
+      return;
+    }
+    for (const name of dirs) {
+      const nextPath = dirBrowserPath === "/" ? `/${name}` : `${dirBrowserPath}/${name}`;
+      const entry = document.createElement("div");
+      entry.className = "dir-browser-entry";
+      entry.textContent = name;
+      entry.addEventListener("click", () => {
+        dirBrowserPath = nextPath;
+        void renderDirBrowser();
+      });
+      list.appendChild(entry);
+    }
+  } catch (error) {
+    reportTaskError("tasks: dir browser load failed", error, { path: dirBrowserPath });
+    const errLine = document.createElement("div");
+    errLine.className = "dir-browser-entry";
+    errLine.textContent = `error: ${error instanceof Error ? error.message : String(error)}`;
+    list.appendChild(errLine);
+  }
+}
+
+/** Opens the directory browser modal. */
+function openDirBrowser(initialPath: string, callback: (path: string) => void): void {
+  dirBrowserCallback = callback;
+  dirBrowserPath = initialPath.trim() || "/";
+  const overlay = document.getElementById("dir-browser-overlay");
+  overlay?.removeAttribute("aria-hidden");
+  overlay?.classList.add("dir-browser-overlay--open");
+  void renderDirBrowser();
+}
+
+/** Closes the directory browser modal. */
+function closeDirBrowser(): void {
+  const overlay = document.getElementById("dir-browser-overlay");
+  overlay?.setAttribute("aria-hidden", "true");
+  overlay?.classList.remove("dir-browser-overlay--open");
+  dirBrowserCallback = null;
+}
+
+/** Returns the directory browser modal markup. */
+function renderDirBrowserOverlay(): string {
+  return `
+    <div id="dir-browser-overlay" class="dir-browser-overlay" aria-hidden="true">
+      <div class="dir-browser-box" role="dialog" aria-modal="true" aria-label="Browse directory">
+        <div class="dir-browser-header">
+          <span>Browse directory</span>
+          <button type="button" class="dir-browser-close" id="dir-browser-close" aria-label="Close">✕</button>
+        </div>
+        <div class="dir-browser-breadcrumb" id="dir-browser-breadcrumb">/</div>
+        <div class="dir-browser-list" id="dir-browser-list"></div>
+        <div class="dir-browser-footer">
+          <span class="dir-browser-selected" id="dir-browser-selected"></span>
+          <button type="button" class="dir-browser-cancel" id="dir-browser-cancel">Cancel</button>
+          <button type="button" class="dir-browser-select" id="dir-browser-select">Select</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+/** Binds directory browser modal handlers. */
+function bindDirBrowserHandlers(): void {
+  document.getElementById("dir-browser-close")?.addEventListener("click", closeDirBrowser);
+  document.getElementById("dir-browser-cancel")?.addEventListener("click", closeDirBrowser);
+  const overlay = document.getElementById("dir-browser-overlay");
+  overlay?.addEventListener("click", (e) => {
+    if (e.target === overlay) {
+      closeDirBrowser();
+    }
+  });
+  document.getElementById("dir-browser-select")?.addEventListener("click", () => {
+    dirBrowserCallback?.(dirBrowserPath);
+    closeDirBrowser();
+  });
+}
+
 /** Produces the hamburger button + menu bar HTML. */
 function renderMenuBar(): string {
   const open = appState.menuOpen;
@@ -2295,6 +2422,18 @@ function bindTasksDialogHandlers(): void {
       void addTask();
     });
 
+  // Browse directory buttons for images/annotations path fields.
+  root.querySelectorAll<HTMLButtonElement>(".task-browse-btn").forEach((btn) => {
+    const input = btn.closest(".task-path-row")?.querySelector<HTMLInputElement>(".task-field-input");
+    if (!input) return;
+    btn.addEventListener("click", () => {
+      openDirBrowser(input.value || "/", (path) => {
+        input.value = path;
+        input.dispatchEvent(new Event("blur"));
+      });
+    });
+  });
+
   // Label trees
   root.querySelectorAll<HTMLElement>(".label-tree[data-task-id]").forEach((treeEl) => {
     const taskId = treeEl.dataset["taskId"]!;
@@ -2431,6 +2570,7 @@ function render(): void {
     </div>
     ${renderMenuBar()}
     ${renderTasksDialog()}
+    ${renderDirBrowserOverlay()}
   `;
 
   const previousBtn = appRoot.querySelector<HTMLButtonElement>('button[data-action="previous"]');
@@ -2455,6 +2595,7 @@ function render(): void {
   bindOpticsPanelHandlers();
   bindMenuHandlers();
   bindTasksDialogHandlers();
+  bindDirBrowserHandlers();
   mountViewer();
 }
 

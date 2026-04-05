@@ -3,9 +3,14 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
 
 	"github.com/matthias-p-nowak/nemo-lab/auth"
 	"github.com/matthias-p-nowak/nemo-lab/config"
@@ -37,6 +42,7 @@ func main() {
 	mux.HandleFunc("DELETE /api/tasks/{id}", makeTaskDeleteHandler(sqlDB))
 	mux.HandleFunc("PUT /api/tasks/{id}/tags", makeTaskTagsHandler(sqlDB))
 	mux.HandleFunc("PUT /api/tasks/{id}/labels", makeTaskLabelsHandler(sqlDB))
+	mux.HandleFunc("GET /api/dirs", makeDirsHandler())
 	mux.Handle("/ws", ws.NewHandler(sqlDB, cfg.LogsDir))
 	mux.Handle("/images/", http.StripPrefix("/images/", http.FileServer(http.Dir("images"))))
 	mux.Handle("/", http.FileServer(http.Dir(cfg.StaticDir)))
@@ -228,6 +234,51 @@ func makeTaskLabelsHandler(db *sql.DB) http.HandlerFunc {
 		w.WriteHeader(http.StatusOK)
 		taskAPILog(db, r, fmt.Sprintf("labels_replace:ok id=%s roots=%d", id, len(nodes)))
 	}
+}
+
+func makeDirsHandler() http.HandlerFunc {
+	type dirsResponse struct {
+		Dirs []string `json:"dirs"`
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Query().Get("path")
+		if path == "" {
+			path = "/"
+		}
+		dirs, err := listDirs(path)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, dirsResponse{Dirs: dirs})
+	}
+}
+
+func listDirs(path string) ([]string, error) {
+	clean := filepath.Clean(path)
+	info, err := os.Stat(clean)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return []string{}, nil
+		}
+		return nil, err
+	}
+	if !info.IsDir() {
+		return []string{}, nil
+	}
+
+	entries, err := os.ReadDir(clean)
+	if err != nil {
+		return nil, err
+	}
+	dirs := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			dirs = append(dirs, entry.Name())
+		}
+	}
+	sort.Strings(dirs)
+	return dirs, nil
 }
 
 func taskAPILog(db *sql.DB, r *http.Request, msg string) {

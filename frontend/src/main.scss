@@ -471,6 +471,146 @@ textarea {
   }
 }
 
+.tasks-dialog__status {
+  margin-left: auto;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+
+  &.is-loading {
+    color: var(--accent);
+  }
+
+  &.is-saving {
+    color: #f0c040;
+  }
+}
+
+.tasks-dialog__error {
+  border: 1px solid #7a2a2a;
+  background: rgba(122, 42, 42, 0.25);
+  color: #ffb3b3;
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 0.85rem;
+}
+
+.dir-browser-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 450;
+  align-items: center;
+  justify-content: center;
+
+  &.dir-browser-overlay--open {
+    display: flex;
+  }
+}
+
+.dir-browser-box {
+  background: var(--bg-panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  width: min(480px, 90vw);
+  max-height: 70vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.dir-browser-header {
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-weight: 600;
+}
+
+.dir-browser-close {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 1rem;
+  padding: 0;
+  line-height: 1;
+
+  &:hover {
+    color: var(--text);
+  }
+}
+
+.dir-browser-breadcrumb {
+  padding: 0.4rem 1rem;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dir-browser-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.4rem 0;
+}
+
+.dir-browser-entry {
+  padding: 0.45rem 1rem;
+  cursor: pointer;
+  font-size: 0.95rem;
+
+  &:hover {
+    background: var(--bg-hover, #2f3844);
+  }
+
+  &--up {
+    font-style: italic;
+    color: var(--text-muted);
+  }
+}
+
+.dir-browser-footer {
+  padding: 0.65rem 1rem;
+  border-top: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.dir-browser-selected {
+  flex: 1;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dir-browser-cancel,
+.dir-browser-select {
+  background: var(--button-bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  cursor: pointer;
+  padding: 4px 12px;
+  font-size: 0.875rem;
+  font: inherit;
+
+  &:hover {
+    background: var(--button-bg-hover);
+  }
+}
+
+.dir-browser-select {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 // ── Task card ─────────────────────────────────────────────────────────────────
 
 .task-card {
@@ -520,6 +660,29 @@ textarea {
   color: var(--text-muted);
   font-size: 0.75rem;
   flex-shrink: 0;
+}
+
+.task-reorder-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.task-reorder-btn {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg-panel-alt);
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  line-height: 1;
+
+  &:hover {
+    color: var(--text);
+    background: var(--button-bg);
+  }
 }
 
 .task-body {

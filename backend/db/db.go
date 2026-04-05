@@ -8,12 +8,20 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const currentSchemaVersion = 1
+const currentSchemaVersion = 2
 
 // Open opens the sqlite database and ensures schema is initialized/migrated.
 func Open(path string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
+		return nil, err
+	}
+	if _, err = db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if _, err = db.Exec("PRAGMA foreign_keys=ON"); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
 
@@ -54,6 +62,41 @@ func initialize(db *sql.DB) error {
 	`); err != nil {
 		return err
 	}
+	if _, err = tx.Exec(`
+		CREATE TABLE IF NOT EXISTS tasks (
+			id          TEXT    PRIMARY KEY,
+			ord         INTEGER NOT NULL DEFAULT 0,
+			description TEXT    NOT NULL DEFAULT '',
+			status      TEXT    NOT NULL DEFAULT 'new',
+			images      TEXT    NOT NULL DEFAULT '',
+			annotations TEXT    NOT NULL DEFAULT '',
+			checkmark   INTEGER NOT NULL DEFAULT 0,
+			comment     TEXT    NOT NULL DEFAULT ''
+		);
+	`); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`
+		CREATE TABLE IF NOT EXISTS task_tags (
+			task_id TEXT    NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+			ord     INTEGER NOT NULL DEFAULT 0,
+			tag     TEXT    NOT NULL,
+			PRIMARY KEY (task_id, tag)
+		);
+	`); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`
+		CREATE TABLE IF NOT EXISTS task_labels (
+			id        TEXT    PRIMARY KEY,
+			task_id   TEXT    NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+			parent_id TEXT    REFERENCES task_labels(id) ON DELETE CASCADE,
+			ord       INTEGER NOT NULL DEFAULT 0,
+			text      TEXT    NOT NULL
+		);
+	`); err != nil {
+		return err
+	}
 
 	var version int
 	queryErr := tx.QueryRow("SELECT version FROM schema_version LIMIT 1").Scan(&version)
@@ -87,6 +130,11 @@ func migrate(tx *sql.Tx, from, to int) error {
 	version := from
 	for version < to {
 		switch version {
+		case 1:
+			if _, err := tx.Exec(`UPDATE schema_version SET version = 2`); err != nil {
+				return err
+			}
+			version = 2
 		default:
 			return fmt.Errorf("no migration available from version %d", version)
 		}

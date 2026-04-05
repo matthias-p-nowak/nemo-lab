@@ -99,6 +99,27 @@ CREATE TABLE users (
 - One connection per browser tab; server tracks open connections keyed by session token
 - Serves as bidirectional communication channel and tab identifier
 
+### Tasks Persistence API
+
+- Tasks are persisted in SQLite and exposed through authenticated REST endpoints.
+- Data model:
+  - `tasks`: scalar fields (`id`, `ord`, `description`, `status`, `images`, `annotations`, `checkmark`, `comment`)
+  - `task_tags`: ordered tags per task
+  - `task_labels`: ordered hierarchical labels per task (`parent_id` for nesting)
+- Endpoints:
+  - `GET /api/me` → returns authenticated user info and admin flag
+  - `GET /api/tasks` → list all tasks ordered by `ord`, including tags and nested labels
+  - `GET /api/dirs?path=...` → list immediate child directory names for a filesystem path
+  - `PUT /api/tasks/{id}` → upsert one task
+  - `DELETE /api/tasks/{id}` → delete one task
+  - `PUT /api/tasks/{id}/tags` → replace complete tag list
+  - `PUT /api/tasks/{id}/labels` → replace complete label tree
+- Authorization:
+  - All endpoints require authenticated users.
+  - `DELETE /api/tasks/{id}` and `PUT /api/tasks/{id}/labels` are admin-only.
+  - For non-admin users, `PUT /api/tasks/{id}` may only change `status` and `comment`; other fields remain unchanged.
+  - `PUT /api/tasks/{id}/tags` is allowed for non-admin users.
+
 ## Frontend
 
 ### Frontend Build Tooling
@@ -131,6 +152,9 @@ Items (left to right):
 
 Modal dialog opened from the menu Tasks item. Contains a scrollable list of task cards. Header shows the title "Tasks" and an admin/user badge.
 
+- On open, the frontend fetches current user role via `GET /api/me` and task data via `GET /api/tasks`.
+- Admin/non-admin UI mode is derived from server response (`is_admin`), not local toggles.
+- Task cards are rendered ordered by backend `ord`.
 - Only one task card is expanded at a time (accordion).
 - **Admin mode** additionally shows:
   - Editable description, images, and annotations fields (readonly for non-admin)
@@ -158,6 +182,32 @@ Each task card is collapsible.
 | comment     | Multi-line text; editable by all |
 
 **Edit feedback**: typing in any text field adds an orange box-shadow; on blur or Enter it switches to green and fades after 1 s.
+
+**Directory browse behavior**:
+- Clicking a browse button opens a modal directory browser overlay.
+- The browser lists immediate subdirectories of the current path via `GET /api/dirs`.
+- Selecting a directory writes the chosen path back to the input and triggers the same blur/save flow as manual edits.
+
+**Persistence behavior**:
+- Scalar task changes persist via `PUT /api/tasks/{id}`.
+- Tag changes persist via `PUT /api/tasks/{id}/tags`.
+- Label-tree changes persist via `PUT /api/tasks/{id}/labels`.
+- Task creation persists via `PUT /api/tasks/{id}` with a generated id and appended `ord`.
+- Task deletion persists via `DELETE /api/tasks/{id}`.
+- Admin task reorder uses up/down controls in the summary row and persists updated `ord` values via task `PUT` calls.
+- Tasks dialog shows loading and saving indicators, and clears prior error banners on successful subsequent operations.
+
+### Tasks Integration Checklist
+
+Remaining implementation checklist for frontend/backend task integration:
+
+1. **Verification**
+   - Verify end-to-end admin and non-admin flows:
+     - load tasks
+     - edit allowed fields
+     - enforce forbidden actions
+     - persist tags and labels
+     - delete/create tasks
 
 ### Optics Panel
 
