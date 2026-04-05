@@ -112,7 +112,21 @@ CREATE TABLE users (
 
 - Left collapsible sidebar: previous / next image buttons
 - Center image view: single WebGL canvas fills the area
-- Right collapsible sidebar: collapsible panels — optics, masks, labels, annotations, comment/annotation, comment/picture
+- Right collapsible sidebar: collapsible panels — [Optics](#optics-panel), masks, labels, annotations, comment/annotation, comment/picture
+
+### Optics Panel
+
+Collapsible panel in the right sidebar. Contains three sliders:
+
+| Slider               | Range       | Default |
+|----------------------|-------------|---------|
+| Gamma correction     | 1.0 – 2.2   | 1.0     |
+| Brightness (multiply)| 0.5 – 2.5   | 1.0     |
+| Brightness (additive)| -100 – 100  | 0.0     |
+
+- Adjustments are applied immediately as sliders move, in order: gamma → multiply → add. Gamma is applied as `pow(rgb, 1/gamma)` (linear-to-sRGB correction: higher gamma = brighter image).
+- Clicking the panel title resets all three values to their defaults.
+- Labels, sliders, and numeric values are aligned in a three-column grid (label | slider | value).
 
 ### Image Viewer
 

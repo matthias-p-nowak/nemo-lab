@@ -44,6 +44,15 @@ const appState = {
     commentPicture: false,
   },
   annotations: [] as AnnotationPoint[],
+  /** Current optics adjustment values. */
+  optics: {
+    /** Gamma exponent applied first (1.0 = no correction). */
+    gamma: 1.0,
+    /** Multiplicative brightness factor (1.0 = no change). */
+    multiply: 1.0,
+    /** Additive brightness offset in [0,1] space (-100..100 maps to -100/255..100/255). */
+    add: 0.0,
+  },
 };
 
 /** Minimal point annotation model for this prototype. */
@@ -252,6 +261,72 @@ function bindAnnotationPanelHandlers(): void {
   });
 }
 
+/** Produces the optics panel body HTML with three labeled sliders. */
+function renderOpticsBody(): string {
+  const { gamma, multiply, add } = appState.optics;
+  return `
+    <label class="optics-row">
+      <span>gamma</span>
+      <input type="range" data-optics="gamma"
+        min="1.0" max="2.2" step="0.01" value="${gamma}">
+      <span class="optics-val">${gamma.toFixed(2)}</span>
+    </label>
+    <label class="optics-row">
+      <span>multiply</span>
+      <input type="range" data-optics="multiply"
+        min="0.5" max="2.5" step="0.01" value="${multiply}">
+      <span class="optics-val">${multiply.toFixed(2)}</span>
+    </label>
+    <label class="optics-row">
+      <span>add</span>
+      <input type="range" data-optics="add"
+        min="-100" max="100" step="1" value="${add}">
+      <span class="optics-val">${add.toFixed(0)}</span>
+    </label>
+  `;
+}
+
+/** Wires optics slider input events after panel render. */
+function bindOpticsPanelHandlers(): void {
+  const panel = appRoot.querySelector('[data-panel="optics"]');
+  if (!panel) {
+    return;
+  }
+
+  panel.querySelectorAll<HTMLInputElement>("input[data-optics]").forEach((slider) => {
+    slider.addEventListener("input", () => {
+      const key = slider.getAttribute("data-optics") as keyof typeof appState.optics;
+      const val = parseFloat(slider.value);
+      appState.optics[key] = val;
+
+      // Update displayed value next to slider without full re-render
+      const valSpan = slider.nextElementSibling as HTMLElement | null;
+      if (valSpan) {
+        valSpan.textContent = key === "add" ? val.toFixed(0) : val.toFixed(2);
+      }
+
+      viewer?.setOptics(appState.optics.gamma, appState.optics.multiply, appState.optics.add);
+    });
+  });
+
+  // Clicking the panel header title span resets all optics to defaults.
+  // The header is a <button> (toggle); we detect clicks on its first <span> (title text).
+  const header = panel.querySelector<HTMLButtonElement>(".panel__header");
+  if (header) {
+    header.addEventListener("click", (e) => {
+      const target = e.target as HTMLElement;
+      // The toggle icon is the second <span>; the title is the first.
+      // Only reset when the title span itself was clicked.
+      if (target.tagName === "SPAN" && target === header.querySelector("span:first-child")) {
+        appState.optics = { gamma: 1.0, multiply: 1.0, add: 0.0 };
+        viewer?.setOptics(1.0, 1.0, 0.0);
+        // Re-render to update slider positions to reset values
+        render();
+      }
+    });
+  }
+}
+
 /** Resolves level dimensions from the full-size manifest dimensions. */
 function getLevelDimensions(manifest: TileManifest, level: number): { width: number; height: number } {
   const scale = 2 ** (level - (manifest.levels - 1));
@@ -313,6 +388,19 @@ class WebGLTileViewer {
   private readonly tileUvAttrib: number;
   /** Tile program sampler uniform location. */
   private readonly tileSamplerUniform: WebGLUniformLocation;
+  /** Tile program gamma uniform location. */
+  private readonly tileGammaUniform: WebGLUniformLocation;
+  /** Tile program multiply uniform location. */
+  private readonly tileMultiplyUniform: WebGLUniformLocation;
+  /** Tile program additive uniform location. */
+  private readonly tileAddUniform: WebGLUniformLocation;
+
+  /** Current optics: gamma exponent. */
+  private opticsGamma = 1.0;
+  /** Current optics: multiplicative brightness. */
+  private opticsMultiply = 1.0;
+  /** Current optics: additive brightness offset (normalized). */
+  private opticsAdd = 0.0;
 
   /** Point shader program. */
   private readonly pointProgram: WebGLProgram;
@@ -379,8 +467,14 @@ class WebGLTileViewer {
       precision mediump float;
       varying vec2 v_uv;
       uniform sampler2D u_tex;
+      uniform float u_gamma;
+      uniform float u_multiply;
+      uniform float u_add;
       void main() {
-        gl_FragColor = texture2D(u_tex, v_uv);
+        vec4 c = texture2D(u_tex, v_uv);
+        vec3 rgb = pow(c.rgb, vec3(1.0 / u_gamma));
+        rgb = rgb * u_multiply + vec3(u_add);
+        gl_FragColor = vec4(clamp(rgb, 0.0, 1.0), c.a);
       }
       `
     );
@@ -410,10 +504,16 @@ class WebGLTileViewer {
     this.tilePosAttrib = gl.getAttribLocation(this.tileProgram, "a_pos");
     this.tileUvAttrib = gl.getAttribLocation(this.tileProgram, "a_uv");
     const tileSampler = gl.getUniformLocation(this.tileProgram, "u_tex");
-    if (!tileSampler) {
-      throw new Error("Tile sampler uniform missing");
+    const tileGamma = gl.getUniformLocation(this.tileProgram, "u_gamma");
+    const tileMultiply = gl.getUniformLocation(this.tileProgram, "u_multiply");
+    const tileAdd = gl.getUniformLocation(this.tileProgram, "u_add");
+    if (!tileSampler || !tileGamma || !tileMultiply || !tileAdd) {
+      throw new Error("Tile uniforms missing");
     }
     this.tileSamplerUniform = tileSampler;
+    this.tileGammaUniform = tileGamma;
+    this.tileMultiplyUniform = tileMultiply;
+    this.tileAddUniform = tileAdd;
 
     this.pointPosAttrib = gl.getAttribLocation(this.pointProgram, "a_pos");
     const pointColor = gl.getUniformLocation(this.pointProgram, "u_color");
@@ -434,6 +534,16 @@ class WebGLTileViewer {
 
     this.setupCanvasListeners();
     this.resize();
+  }
+
+  /** Updates optics adjustment values and redraws. */
+  setOptics(gamma: number, multiply: number, add: number): void {
+    this.opticsGamma = gamma;
+    this.opticsMultiply = multiply;
+    /** Add value is stored as a normalized offset (divide by 255 so the shader
+     *  operates in [0,1] color space regardless of the slider's -100..100 range). */
+    this.opticsAdd = add / 255;
+    this.draw();
   }
 
   /** Releases listeners and GPU resources. */
@@ -833,6 +943,9 @@ class WebGLTileViewer {
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, tile.texture);
     gl.uniform1i(this.tileSamplerUniform, 0);
+    gl.uniform1f(this.tileGammaUniform, this.opticsGamma);
+    gl.uniform1f(this.tileMultiplyUniform, this.opticsMultiply);
+    gl.uniform1f(this.tileAddUniform, this.opticsAdd);
 
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
@@ -1140,6 +1253,8 @@ function mountViewer(): void {
     (x, y) => addAnnotation(x, y)
   );
 
+  const { gamma, multiply, add } = appState.optics;
+  viewer.setOptics(gamma, multiply, add);
   void viewer.setImage(toImageStem(getCurrentImageName()));
 }
 
@@ -1181,7 +1296,7 @@ function render(): void {
           <strong>Controls</strong>
         </div>
         <div class="sidebar__content panels">
-          ${renderPanel("optics", "optics", '<div class="muted">Prototype placeholder</div>')}
+          ${renderPanel("optics", "optics", renderOpticsBody())}
           ${renderPanel("masks", "masks", '<div class="muted">Prototype placeholder</div>')}
           ${renderPanel("labels", "labels", '<div class="muted">Prototype placeholder</div>')}
           ${renderPanel(
@@ -1223,6 +1338,7 @@ function render(): void {
   });
 
   bindAnnotationPanelHandlers();
+  bindOpticsPanelHandlers();
   mountViewer();
 }
 

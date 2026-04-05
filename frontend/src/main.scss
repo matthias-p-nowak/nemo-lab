@@ -225,6 +225,28 @@ button.ghost {
   display: none;
 }
 
+.optics-row {
+  display: grid;
+  grid-template-columns: 78px minmax(0, 1fr) 44px;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+  color: var(--text);
+
+  input[type="range"] {
+    width: 100%;
+    margin: 0;
+    accent-color: var(--accent);
+  }
+
+  .optics-val {
+    text-align: right;
+    min-width: 44px;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
 .annotation-list {
   margin: 0;
   padding-left: 22px;
