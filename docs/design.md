@@ -114,6 +114,51 @@ CREATE TABLE users (
 - Center image view: single WebGL canvas fills the area
 - Right collapsible sidebar: collapsible panels — [Optics](#optics-panel), masks, labels, annotations, comment/annotation, comment/picture
 
+### Menu Bar
+
+A fixed overlay across the top of the screen, toggled by a hamburger icon pinned to the top-left corner. The bar sits above page content (does not shift layout).
+
+Items (left to right):
+- **Tasks** — opens the Tasks dialog
+- **Views** — dropdown with:
+  - Left sidebar (checkmark = visible)
+  - Right sidebar (checkmark = visible)
+  - ── separator ──
+  - Light theme / Dark theme (checkmark = active)
+- **Help** — right-aligned
+
+### Tasks Dialog
+
+Modal dialog opened from the menu Tasks item. Contains a scrollable list of task cards. Header shows the title "Tasks" and an admin/user badge.
+
+- Only one task card is expanded at a time (accordion).
+- **Admin mode** additionally shows:
+  - Editable description, images, and annotations fields (readonly for non-admin)
+  - Browse buttons on images and annotations fields
+  - Enabled checkmark (disabled for non-admin)
+  - Delete button at the bottom of each expanded card
+  - "+ new task" button at the end of the list
+
+### Task Card
+
+Each task card is collapsible.
+
+**Collapsed view** shows: status color bullet · first line of description · all tags as inline pins.
+
+**Expanded view** fields:
+
+| Field       | Type / behaviour |
+|-------------|-----------------|
+| description | Multi-line text; admin-editable |
+| status      | Dropdown — new (yellow), doing (blue), done (green), error (red); color bullet updates on change |
+| tags        | Inline pins with ✕ delete; text input on right — Enter adds a tag; collapsed summary updates on change |
+| images      | Path to a server-side folder; browse button (admin only) |
+| annotations | Path to a folder or file; browse button (admin only) |
+| checkmark   | Checkbox — "single annotation file 'nemolab.json'"; admin-editable |
+| comment     | Multi-line text; editable by all |
+
+**Edit feedback**: typing in any text field adds an orange box-shadow; on blur or Enter it switches to green and fades after 1 s.
+
 ### Optics Panel
 
 Collapsible panel in the right sidebar. Contains three sliders:

@@ -44,6 +44,60 @@ const appState = {
     commentPicture: false,
   },
   annotations: [] as AnnotationPoint[],
+  /** Whether the top menu bar is visible. */
+  menuOpen: false,
+  /** Whether the Tasks modal is open. */
+  tasksDialogOpen: false,
+  /** Whether the current Tasks session is in admin mode (toggled per open). */
+  isAdmin: false,
+  /** Prototype task list. */
+  tasks: [
+    {
+      id: "t1",
+      description: "Review the optics panel and verify gamma correction across zoom levels.",
+      status: "doing" as const,
+      tags: ["optics", "webgl"],
+      images: "/data/images/sample",
+      annotations: "/data/annotations/sample.json",
+      checkmark: false,
+      comment: "Gamma inversion confirmed.",
+      collapsed: false,
+      labels: [
+        { id: "l1", text: "Tissue", children: [
+          { id: "l2", text: "Healthy", children: [] },
+          { id: "l3", text: "Necrotic", children: [] },
+        ]},
+        { id: "l4", text: "Background", children: [] },
+      ],
+      selectedLabelId: "l1",
+    },
+    {
+      id: "t2",
+      description: "Add mask support to the right sidebar panel.",
+      status: "new" as const,
+      tags: ["masks", "ui"],
+      images: "",
+      annotations: "",
+      checkmark: false,
+      comment: "",
+      collapsed: true,
+      labels: [],
+      selectedLabelId: null,
+    },
+    {
+      id: "t3",
+      description: "Write end-to-end tests for the tile viewport culling logic.",
+      status: "done" as const,
+      tags: ["testing"],
+      images: "",
+      annotations: "",
+      checkmark: true,
+      comment: "All 12 cases pass.",
+      collapsed: true,
+      labels: [{ id: "l5", text: "Test cases", children: [] }],
+      selectedLabelId: "l5",
+    },
+  ] as Task[],
   /** Current optics adjustment values. */
   optics: {
     /** Gamma exponent applied first (1.0 = no correction). */
@@ -54,6 +108,42 @@ const appState = {
     add: 0.0,
   },
 };
+
+/** A node in the hierarchical label tree. */
+interface LabelNode {
+  /** Stable unique identifier. */
+  id: string;
+  /** Display text. */
+  text: string;
+  /** Child nodes. */
+  children: LabelNode[];
+}
+
+/** A single task item in the Tasks dialog. */
+interface Task {
+  /** Stable unique identifier. */
+  id: string;
+  /** Full multi-line description. */
+  description: string;
+  /** Workflow status. */
+  status: "new" | "doing" | "done" | "error";
+  /** Inline tag labels. */
+  tags: string[];
+  /** Server-side folder path for associated images. */
+  images: string;
+  /** Server-side path for annotation folder or file. */
+  annotations: string;
+  /** Whether the single-file annotation 'nemolab.json' is active. */
+  checkmark: boolean;
+  /** Free-text comment visible to all users. */
+  comment: string;
+  /** Whether the card is collapsed in the accordion. */
+  collapsed: boolean;
+  /** Hierarchical label tree for this task. */
+  labels: LabelNode[];
+  /** Currently selected label node id, or null. */
+  selectedLabelId: string | null;
+}
 
 /** Minimal point annotation model for this prototype. */
 interface AnnotationPoint {
@@ -118,7 +208,9 @@ interface TilePlacementRect {
 }
 
 /** Main app container. */
-const appRoot = document.querySelector<HTMLDivElement>("#app");
+// Non-null assertion is safe: the throw below ensures the app never proceeds without #app.
+// eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+const appRoot = document.querySelector<HTMLDivElement>("#app")!;
 if (!appRoot) {
   throw new Error("#app root not found");
 }
@@ -1258,6 +1350,665 @@ function mountViewer(): void {
   void viewer.setImage(toImageStem(getCurrentImageName()));
 }
 
+// ── Menu bar ─────────────────────────────────────────────────────────────────
+
+/** Toggles the top menu bar open/closed without a full re-render. */
+function toggleMenu(): void {
+  appState.menuOpen = !appState.menuOpen;
+  const nav = appRoot.querySelector<HTMLElement>(".menu-bar");
+  const btn = appRoot.querySelector<HTMLButtonElement>(".hamburger");
+  if (nav) nav.classList.toggle("menu-bar--open", appState.menuOpen);
+  if (btn) btn.setAttribute("aria-expanded", String(appState.menuOpen));
+}
+
+/** Opens the Tasks dialog, alternating admin/non-admin each time. */
+function openTasksDialog(): void {
+  appState.isAdmin = !appState.isAdmin;
+  appState.tasksDialogOpen = true;
+  render();
+}
+
+/** Closes the Tasks dialog. */
+function closeTasksDialog(): void {
+  appState.tasksDialogOpen = false;
+  render();
+}
+
+/** Produces the hamburger button + menu bar HTML. */
+function renderMenuBar(): string {
+  const open = appState.menuOpen;
+  return `
+    <button class="hamburger" type="button" aria-label="Toggle menu" aria-expanded="${open}"
+            data-action="toggle-menu">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+        <line x1="3" y1="6"  x2="21" y2="6"/>
+        <line x1="3" y1="12" x2="21" y2="12"/>
+        <line x1="3" y1="18" x2="21" y2="18"/>
+      </svg>
+    </button>
+    <nav class="menu-bar ${open ? "menu-bar--open" : ""}" aria-hidden="${!open}">
+      <div class="menu-bar__item" data-menu="tasks">
+        <button type="button" class="menu-bar__btn" data-action="open-tasks">Tasks</button>
+      </div>
+      <div class="menu-bar__item" data-menu="views">
+        <button type="button" class="menu-bar__btn" data-action="toggle-menu-dropdown">Views</button>
+        <div class="menu-bar__dropdown">
+          <button type="button" class="menu-bar__dropdown-btn" data-action="toggle-left-sidebar"
+                  aria-checked="${!appState.leftCollapsed}">
+            <span class="menu-bar__check">✓</span><span>Left sidebar</span>
+          </button>
+          <button type="button" class="menu-bar__dropdown-btn" data-action="toggle-right-sidebar"
+                  aria-checked="${!appState.rightCollapsed}">
+            <span class="menu-bar__check">✓</span><span>Right sidebar</span>
+          </button>
+          <hr class="menu-bar__separator">
+          <button type="button" class="menu-bar__dropdown-btn" aria-checked="false" data-action="set-theme" data-theme="light">
+            <span class="menu-bar__check">✓</span><span>Light theme</span>
+          </button>
+          <button type="button" class="menu-bar__dropdown-btn" aria-checked="true" data-action="set-theme" data-theme="dark">
+            <span class="menu-bar__check">✓</span><span>Dark theme</span>
+          </button>
+        </div>
+      </div>
+      <div class="menu-bar__item menu-bar__item--right" data-menu="help">
+        <button type="button" class="menu-bar__btn">Help</button>
+      </div>
+    </nav>
+  `;
+}
+
+/** Wires menu bar and hamburger handlers after render. */
+function bindMenuHandlers(): void {
+  const root = appRoot!;
+
+  root.querySelector<HTMLButtonElement>('[data-action="toggle-menu"]')
+    ?.addEventListener("click", toggleMenu);
+
+  root.querySelector<HTMLButtonElement>('[data-action="open-tasks"]')
+    ?.addEventListener("click", () => {
+      appState.menuOpen = false;
+      openTasksDialog();
+    });
+
+  root.querySelector<HTMLButtonElement>('[data-action="toggle-left-sidebar"]')
+    ?.addEventListener("click", () => { toggleLeftSidebar(); });
+
+  root.querySelector<HTMLButtonElement>('[data-action="toggle-right-sidebar"]')
+    ?.addEventListener("click", () => { toggleRightSidebar(); });
+
+  // Views dropdown toggle
+  root.querySelector<HTMLButtonElement>('[data-action="toggle-menu-dropdown"]')
+    ?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      (e.currentTarget as HTMLElement).closest<HTMLElement>(".menu-bar__item")
+        ?.classList.toggle("menu-bar__item--active");
+    });
+
+  // Theme buttons (visual only in prototype)
+  root.querySelectorAll<HTMLButtonElement>('[data-action="set-theme"]').forEach((btn) => {
+    btn.addEventListener("click", () => {
+      root.querySelectorAll<HTMLButtonElement>('[data-action="set-theme"]').forEach((b) =>
+        b.setAttribute("aria-checked", String(b === btn))
+      );
+      btn.closest<HTMLElement>(".menu-bar__item")?.classList.remove("menu-bar__item--active");
+    });
+  });
+
+  // Close dropdowns on outside click
+  document.addEventListener("click", closeMenuDropdowns, { once: true });
+}
+
+/** Closes all open menu dropdowns. */
+function closeMenuDropdowns(): void {
+  appRoot.querySelectorAll(".menu-bar__item--active").forEach((el) =>
+    el.classList.remove("menu-bar__item--active")
+  );
+}
+
+// ── Tasks dialog ──────────────────────────────────────────────────────────────
+
+const TASK_STATUSES: Array<{ key: Task["status"]; label: string; color: string }> = [
+  { key: "new",   label: "new",   color: "#f0c040" },
+  { key: "doing", label: "doing", color: "#5baaf5" },
+  { key: "done",  label: "done",  color: "#4caf50" },
+  { key: "error", label: "error", color: "#e05555" },
+];
+
+/** Returns the color for a task status. */
+function taskStatusColor(status: Task["status"]): string {
+  return TASK_STATUSES.find((s) => s.key === status)?.color ?? "#aaa";
+}
+
+/** Returns a unique id for new tasks. */
+function createTaskId(): string {
+  return `task-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+}
+
+/** Collapses all tasks except the given one. */
+function setExpandedTask(task: Task): void {
+  appState.tasks.forEach((t) => {
+    t.collapsed = t !== task;
+  });
+}
+
+/** Removes a task by id and re-renders. */
+function removeTask(id: string): void {
+  const idx = appState.tasks.findIndex((t) => t.id === id);
+  if (idx !== -1) appState.tasks.splice(idx, 1);
+  render();
+}
+
+/** Appends a blank task, expands it, and re-renders. */
+function addTask(): void {
+  const task: Task = {
+    id: createTaskId(),
+    description: "",
+    status: "new",
+    tags: [],
+    images: "",
+    annotations: "",
+    checkmark: false,
+    comment: "",
+    collapsed: false,
+    labels: [],
+    selectedLabelId: null,
+  };
+  setExpandedTask(task);
+  appState.tasks.push(task);
+  render();
+}
+
+/** Produces the collapsed summary row for one task card. */
+function renderTaskCardSummary(task: Task): string {
+  const color = taskStatusColor(task.status);
+  const firstLine = (task.description.split("\n")[0] ?? "").replace(/</g, "&lt;");
+  const tagsHtml = task.tags
+    .map((t) => `<span class="task-pin task-pin--preview">${t.replace(/</g, "&lt;")}</span>`)
+    .join("");
+  return `
+    <div class="task-summary" data-action="toggle-task" data-task-id="${task.id}">
+      <span class="task-status-dot" style="background:${color}"></span>
+      <span class="task-desc-preview">${firstLine || '<span class="muted">no description</span>'}</span>
+      <span class="task-tags-preview">${tagsHtml}</span>
+      <span class="task-chevron">${task.collapsed ? "▶" : "▼"}</span>
+    </div>
+  `;
+}
+
+/** Generates a unique id for a new label node. */
+function labelNodeId(): string {
+  return `ln-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+}
+
+/** Recursively renders a label tree as HTML. */
+function renderLabelTree(
+  nodes: LabelNode[],
+  selectedId: string | null = null,
+  editable = true,
+  isRoot = true
+): string {
+  if (!nodes.length) return isRoot ? `<span class="label-tree__empty">no labels</span>` : "";
+  const items = nodes
+    .map((node) => {
+      const selected = node.id === selectedId ? " is-selected" : "";
+      const children = renderLabelTree(node.children, selectedId, editable, false);
+      return `
+      <li class="label-tree__item" data-node-id="${node.id}">
+        <div class="label-tree__row${selected}" tabindex="${editable ? "0" : "-1"}" data-node-id="${node.id}">
+          <span class="label-tree__text">${node.text.replace(/</g, "&lt;")}</span>
+          ${editable ? `<button class="label-tree__delete" tabindex="-1" data-action="remove-label" data-node-id="${node.id}" aria-label="remove" title="remove">✕</button>` : ""}
+        </div>
+        ${children}
+      </li>`;
+    })
+    .join("");
+  return `<ul class="label-tree__list">${items}</ul>`;
+}
+
+/** Metadata returned by findLabelNodeMeta for tree manipulation. */
+interface LabelNodeMeta {
+  node: LabelNode;
+  parentArr: LabelNode[];
+  index: number;
+  parentNode: LabelNode | null;
+  grandParentArr: LabelNode[] | null;
+}
+
+/** Finds a label node by id and returns it with parent context. */
+function findLabelNodeMeta(
+  id: string,
+  nodes: LabelNode[],
+  parentArr: LabelNode[] = nodes,
+  parentNode: LabelNode | null = null,
+  grandParentArr: LabelNode[] | null = null
+): LabelNodeMeta | null {
+  for (let i = 0; i < nodes.length; i++) {
+    const node = nodes[i];
+    if (node.id === id) return { node, parentArr, index: i, parentNode, grandParentArr };
+    const found = findLabelNodeMeta(id, node.children, node.children, node, nodes);
+    if (found) return found;
+  }
+  return null;
+}
+
+/** Recursively removes a label node by id. Returns true if removed. */
+function removeLabelNode(id: string, nodes: LabelNode[]): boolean {
+  const idx = nodes.findIndex((n) => n.id === id);
+  if (idx !== -1) { nodes.splice(idx, 1); return true; }
+  for (const node of nodes) {
+    if (removeLabelNode(id, node.children)) return true;
+  }
+  return false;
+}
+
+/** Re-renders the label tree inside treeEl and re-binds handlers. */
+function refreshLabelTree(treeEl: HTMLElement, task: Task, focusNodeId?: string): void {
+  const editable = appState.isAdmin;
+  treeEl.innerHTML =
+    renderLabelTree(task.labels, task.selectedLabelId, editable) +
+    (editable ? `<input class="label-tree__new" type="text" placeholder="new label" />` : "");
+  bindLabelTree(treeEl, task);
+  if (focusNodeId) {
+    const row = treeEl.querySelector<HTMLElement>(`.label-tree__row[data-node-id="${focusNodeId}"]`);
+    row?.focus();
+  }
+}
+
+/** Binds all label tree interaction handlers. */
+function bindLabelTree(treeEl: HTMLElement, task: Task): void {
+  const editable = appState.isAdmin;
+
+  const selectNode = (nodeId: string) => {
+    task.selectedLabelId = nodeId;
+    treeEl.querySelectorAll(".label-tree__row").forEach((row) => {
+      row.classList.toggle("is-selected", (row as HTMLElement).dataset["nodeId"] === nodeId);
+    });
+  };
+
+  const moveSelectedWithinParent = (delta: number) => {
+    if (!task.selectedLabelId) return;
+    const meta = findLabelNodeMeta(task.selectedLabelId, task.labels);
+    if (!meta) return;
+    const nextIdx = meta.index + delta;
+    if (nextIdx < 0 || nextIdx >= meta.parentArr.length) return;
+    meta.parentArr.splice(meta.index, 1);
+    meta.parentArr.splice(nextIdx, 0, meta.node);
+    refreshLabelTree(treeEl, task, task.selectedLabelId);
+  };
+
+  const promoteSelected = () => {
+    if (!task.selectedLabelId) return;
+    const meta = findLabelNodeMeta(task.selectedLabelId, task.labels);
+    if (!meta || !meta.parentNode || !meta.grandParentArr) return;
+    meta.parentArr.splice(meta.index, 1);
+    const parentIdx = meta.grandParentArr.findIndex((n) => n.id === meta.parentNode!.id);
+    meta.grandParentArr.splice(parentIdx + 1, 0, meta.node);
+    refreshLabelTree(treeEl, task, task.selectedLabelId);
+  };
+
+  const demoteSelected = () => {
+    if (!task.selectedLabelId) return;
+    const meta = findLabelNodeMeta(task.selectedLabelId, task.labels);
+    if (!meta || meta.index === 0) return;
+    const prevSibling = meta.parentArr[meta.index - 1];
+    meta.parentArr.splice(meta.index, 1);
+    prevSibling.children.push(meta.node);
+    refreshLabelTree(treeEl, task, task.selectedLabelId);
+  };
+
+  treeEl.querySelectorAll<HTMLElement>(".label-tree__row").forEach((row) => {
+    row.addEventListener("click", () => selectNode(row.dataset["nodeId"]!));
+    row.addEventListener("focus", () => selectNode(row.dataset["nodeId"]!));
+    if (!editable) return;
+    row.addEventListener("keydown", (e) => {
+      const ke = e as KeyboardEvent;
+      if (ke.key === "Tab") {
+        const rows = Array.from(treeEl.querySelectorAll<HTMLElement>(".label-tree__row"));
+        if (!rows.length) return;
+        ke.preventDefault();
+        const idx = rows.indexOf(row);
+        const step = ke.shiftKey ? -1 : 1;
+        rows[(idx + step + rows.length) % rows.length].focus();
+        return;
+      }
+      if (ke.key === "ArrowUp")   { ke.preventDefault(); moveSelectedWithinParent(-1); return; }
+      if (ke.key === "ArrowDown") { ke.preventDefault(); moveSelectedWithinParent(1);  return; }
+      if (ke.key === "ArrowLeft") { ke.preventDefault(); promoteSelected();            return; }
+      if (ke.key === "ArrowRight"){ ke.preventDefault(); demoteSelected();             }
+    });
+  });
+
+  treeEl.querySelectorAll<HTMLButtonElement>("[data-action='remove-label']").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const removedId = btn.dataset["nodeId"]!;
+      removeLabelNode(removedId, task.labels);
+      if (task.selectedLabelId === removedId) task.selectedLabelId = null;
+      refreshLabelTree(treeEl, task);
+    });
+  });
+
+  const addInput = treeEl.querySelector<HTMLInputElement>(".label-tree__new");
+  if (addInput) {
+    addInput.addEventListener("keydown", (e) => {
+      if ((e as KeyboardEvent).key !== "Enter") return;
+      e.preventDefault();
+      const val = addInput.value.trim();
+      if (!val) return;
+      const newId = labelNodeId();
+      task.labels.push({ id: newId, text: val, children: [] });
+      task.selectedLabelId = newId;
+      refreshLabelTree(treeEl, task, newId);
+    });
+  }
+}
+
+/** Produces the expanded body for one task card. */
+function renderTaskCardBody(task: Task): string {
+  const admin = appState.isAdmin;
+  const statusOptions = TASK_STATUSES.map((s) =>
+    `<option value="${s.key}" ${task.status === s.key ? "selected" : ""}>${s.label}</option>`
+  ).join("");
+  const tagsHtml = task.tags
+    .map(
+      (t) =>
+        `<span class="task-pin"><span>${t.replace(/</g, "&lt;")}</span>` +
+        `<button type="button" class="task-pin__remove" data-action="remove-tag" data-task-id="${task.id}" data-tag="${t.replace(/"/g, "&quot;")}">✕</button></span>`
+    )
+    .join("");
+
+  return `
+    <div class="task-body">
+      <div class="task-field-row">
+        <span class="task-field-label">description</span>
+        <textarea class="task-field-input" data-field="description" data-task-id="${task.id}"
+          rows="3" ${admin ? "" : "readonly"}>${task.description.replace(/</g, "&lt;")}</textarea>
+      </div>
+      <div class="task-field-row">
+        <span class="task-field-label">status</span>
+        <div class="task-status-wrap">
+          <span class="task-status-dot" style="background:${taskStatusColor(task.status)}"></span>
+          <select class="task-status-select" data-action="set-status" data-task-id="${task.id}">
+            ${statusOptions}
+          </select>
+        </div>
+      </div>
+      <div class="task-field-row">
+        <span class="task-field-label">tags</span>
+        <div class="task-tags-wrap" data-task-id="${task.id}">
+          ${tagsHtml}
+          <input class="task-tag-input" type="text" placeholder="add tag…"
+                 data-action="add-tag" data-task-id="${task.id}">
+        </div>
+      </div>
+      <div class="task-field-row">
+        <span class="task-field-label">images</span>
+        <div class="task-path-row">
+          <input class="task-field-input" type="text" data-field="images" data-task-id="${task.id}"
+            value="${task.images.replace(/"/g, "&quot;")}" placeholder="/path/to/folder"
+            ${admin ? "" : "readonly"}>
+          ${admin ? '<button type="button" class="task-browse-btn">browse</button>' : ""}
+        </div>
+      </div>
+      <div class="task-field-row">
+        <span class="task-field-label">annotations</span>
+        <div class="task-path-row">
+          <input class="task-field-input" type="text" data-field="annotations" data-task-id="${task.id}"
+            value="${task.annotations.replace(/"/g, "&quot;")}" placeholder="/path/to/file"
+            ${admin ? "" : "readonly"}>
+          ${admin ? '<button type="button" class="task-browse-btn">browse</button>' : ""}
+        </div>
+      </div>
+      <div class="task-field-row">
+        <span class="task-field-label"></span>
+        <div class="task-checkbox-row">
+          <input type="checkbox" id="task-chk-${task.id}"
+                 data-action="set-checkmark" data-task-id="${task.id}"
+                 ${task.checkmark ? "checked" : ""} ${admin ? "" : "disabled"}>
+          <label for="task-chk-${task.id}">single annotation file 'nemolab.json'</label>
+        </div>
+      </div>
+      <div class="task-field-row">
+        <span class="task-field-label">labels</span>
+        <div class="label-tree" data-task-id="${task.id}">
+          ${renderLabelTree(task.labels, task.selectedLabelId, admin)}
+          ${admin ? `<input class="label-tree__new" type="text" placeholder="new label" />` : ""}
+        </div>
+      </div>
+      <div class="task-field-row">
+        <span class="task-field-label">comment</span>
+        <textarea class="task-field-input" data-field="comment" data-task-id="${task.id}"
+          rows="2">${task.comment.replace(/</g, "&lt;")}</textarea>
+      </div>
+      ${admin ? `<button type="button" class="task-delete-btn" data-action="delete-task" data-task-id="${task.id}">delete task</button>` : ""}
+    </div>
+  `;
+}
+
+/** Produces one full task card element HTML string. */
+function renderTaskCard(task: Task): string {
+  return `
+    <div class="task-card ${task.collapsed ? "task-card--collapsed" : ""}" data-task-id="${task.id}">
+      ${renderTaskCardSummary(task)}
+      ${task.collapsed ? "" : renderTaskCardBody(task)}
+    </div>
+  `;
+}
+
+/** Produces the full Tasks modal HTML. */
+function renderTasksDialog(): string {
+  if (!appState.tasksDialogOpen) return "";
+  const admin = appState.isAdmin;
+  const badge = admin
+    ? '<span class="tasks-admin-badge tasks-admin-badge--admin">admin</span>'
+    : '<span class="tasks-admin-badge tasks-admin-badge--user">user</span>';
+  const cards = appState.tasks.map(renderTaskCard).join("");
+  const addBtn = admin
+    ? '<button type="button" class="task-add-btn" data-action="add-task">+ new task</button>'
+    : "";
+  return `
+    <div class="tasks-backdrop" data-action="close-tasks-backdrop">
+      <div class="tasks-dialog" role="dialog" aria-modal="true" aria-label="Tasks">
+        <div class="tasks-dialog__header">
+          <h2 class="tasks-dialog__title">Tasks</h2>
+          ${badge}
+          <button type="button" class="tasks-dialog__close" data-action="close-tasks">✕</button>
+        </div>
+        <div class="tasks-dialog__body">
+          ${cards}
+          ${addBtn}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+/** Wires all Tasks dialog handlers after render. */
+function bindTasksDialogHandlers(): void {
+  if (!appState.tasksDialogOpen) return;
+  const root = appRoot!;
+
+  // Close on backdrop click
+  root.querySelector<HTMLElement>('[data-action="close-tasks-backdrop"]')
+    ?.addEventListener("click", (e) => {
+      if ((e.target as HTMLElement).classList.contains("tasks-backdrop")) closeTasksDialog();
+    });
+  root.querySelector<HTMLButtonElement>('[data-action="close-tasks"]')
+    ?.addEventListener("click", closeTasksDialog);
+
+  // Accordion toggle
+  root.querySelectorAll<HTMLElement>('[data-action="toggle-task"]').forEach((el) => {
+    el.addEventListener("click", () => {
+      const id = el.getAttribute("data-task-id")!;
+      const task = appState.tasks.find((t) => t.id === id);
+      if (!task) return;
+      if (task.collapsed) {
+        setExpandedTask(task);
+      } else {
+        task.collapsed = true;
+      }
+      render();
+    });
+  });
+
+  // Status dropdown
+  root.querySelectorAll<HTMLSelectElement>('[data-action="set-status"]').forEach((sel) => {
+    sel.addEventListener("change", () => {
+      const id = sel.getAttribute("data-task-id")!;
+      const task = appState.tasks.find((t) => t.id === id);
+      if (!task) return;
+      task.status = sel.value as Task["status"];
+      const card = root.querySelector<HTMLElement>(`.task-card[data-task-id="${id}"]`);
+      card?.querySelectorAll<HTMLElement>(".task-status-dot").forEach((dot) => {
+        dot.style.background = taskStatusColor(task.status);
+      });
+    });
+  });
+
+  // Tag add on Enter
+  root.querySelectorAll<HTMLInputElement>('[data-action="add-tag"]').forEach((input) => {
+    input.addEventListener("keydown", (e) => {
+      if ((e as KeyboardEvent).key !== "Enter") return;
+      const val = input.value.trim();
+      if (!val) return;
+      const id = input.getAttribute("data-task-id")!;
+      const task = appState.tasks.find((t) => t.id === id);
+      if (!task) return;
+      task.tags.push(val);
+      input.value = "";
+      const card = root.querySelector<HTMLElement>(`.task-card[data-task-id="${id}"]`);
+      if (card) {
+        const wrap = card.querySelector<HTMLElement>(".task-tags-wrap");
+        if (wrap) wrap.outerHTML = buildTagsWrapHtml(task);
+        rebindTagsWrap(card, task);
+        updateTaskSummaryTags(card, task);
+      }
+    });
+  });
+
+  // Tag remove
+  root.querySelectorAll<HTMLButtonElement>('[data-action="remove-tag"]').forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-task-id")!;
+      const tag = btn.getAttribute("data-tag")!;
+      const task = appState.tasks.find((t) => t.id === id);
+      if (!task) return;
+      task.tags = task.tags.filter((t) => t !== tag);
+      btn.closest(".task-pin")?.remove();
+      const card = root.querySelector<HTMLElement>(`.task-card[data-task-id="${id}"]`);
+      if (card) updateTaskSummaryTags(card, task);
+    });
+  });
+
+  // Text field dirty/saved feedback
+  root.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(".task-field-input[data-field]").forEach((input) => {
+    if ((input as HTMLInputElement).readOnly) return;
+    input.addEventListener("input", () => {
+      input.classList.add("task-field--dirty");
+      input.classList.remove("task-field--saved");
+    });
+    const commit = (): void => {
+      const id = input.getAttribute("data-task-id")!;
+      const field = input.getAttribute("data-field") as keyof Pick<Task, "description" | "images" | "annotations" | "comment">;
+      const task = appState.tasks.find((t) => t.id === id);
+      if (task) task[field] = input.value;
+      input.classList.remove("task-field--dirty");
+      input.classList.add("task-field--saved");
+      setTimeout(() => input.classList.remove("task-field--saved"), 1000);
+      if (field === "description") {
+        const card = root.querySelector<HTMLElement>(`.task-card[data-task-id="${id}"]`);
+        if (card && task) updateTaskSummaryDesc(card, task);
+      }
+    };
+    input.addEventListener("blur", commit);
+    input.addEventListener("keydown", (e) => {
+      if ((e as KeyboardEvent).key === "Enter" && (input as HTMLElement).tagName !== "TEXTAREA") commit();
+    });
+  });
+
+  // Checkmark
+  root.querySelectorAll<HTMLInputElement>('[data-action="set-checkmark"]').forEach((chk) => {
+    chk.addEventListener("change", () => {
+      const id = chk.getAttribute("data-task-id")!;
+      const task = appState.tasks.find((t) => t.id === id);
+      if (task) task.checkmark = chk.checked;
+    });
+  });
+
+  // Delete task
+  root.querySelectorAll<HTMLButtonElement>('[data-action="delete-task"]').forEach((btn) => {
+    btn.addEventListener("click", () => removeTask(btn.getAttribute("data-task-id")!));
+  });
+
+  // Add task
+  root.querySelector<HTMLButtonElement>('[data-action="add-task"]')
+    ?.addEventListener("click", addTask);
+
+  // Label trees
+  root.querySelectorAll<HTMLElement>(".label-tree[data-task-id]").forEach((treeEl) => {
+    const taskId = treeEl.dataset["taskId"]!;
+    const task = appState.tasks.find((t) => t.id === taskId);
+    if (task) bindLabelTree(treeEl, task);
+  });
+}
+
+/** Builds the tags-wrap innerHTML for a task (used in incremental updates). */
+function buildTagsWrapHtml(task: Task): string {
+  const tagsHtml = task.tags
+    .map(
+      (t) =>
+        `<span class="task-pin"><span>${t.replace(/</g, "&lt;")}</span>` +
+        `<button type="button" class="task-pin__remove" data-action="remove-tag" data-task-id="${task.id}" data-tag="${t.replace(/"/g, "&quot;")}">✕</button></span>`
+    )
+    .join("");
+  return `<div class="task-tags-wrap" data-task-id="${task.id}">
+    ${tagsHtml}
+    <input class="task-tag-input" type="text" placeholder="add tag…"
+           data-action="add-tag" data-task-id="${task.id}">
+  </div>`;
+}
+
+/** Re-binds tag handlers inside a card after incremental tag-wrap update. */
+function rebindTagsWrap(card: HTMLElement, task: Task): void {
+  card.querySelectorAll<HTMLButtonElement>('[data-action="remove-tag"]').forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const tag = btn.getAttribute("data-tag")!;
+      task.tags = task.tags.filter((t) => t !== tag);
+      btn.closest(".task-pin")?.remove();
+      updateTaskSummaryTags(card, task);
+    });
+  });
+  card.querySelector<HTMLInputElement>('[data-action="add-tag"]')
+    ?.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter") return;
+      const input = e.currentTarget as HTMLInputElement;
+      const val = input.value.trim();
+      if (!val) return;
+      task.tags.push(val);
+      input.value = "";
+      const wrap = card.querySelector<HTMLElement>(".task-tags-wrap");
+      if (wrap) wrap.outerHTML = buildTagsWrapHtml(task);
+      rebindTagsWrap(card, task);
+      updateTaskSummaryTags(card, task);
+    });
+}
+
+/** Updates the tags preview in the collapsed summary row. */
+function updateTaskSummaryTags(card: HTMLElement, task: Task): void {
+  const preview = card.querySelector<HTMLElement>(".task-tags-preview");
+  if (preview) {
+    preview.innerHTML = task.tags
+      .map((t) => `<span class="task-pin task-pin--preview">${t.replace(/</g, "&lt;")}</span>`)
+      .join("");
+  }
+}
+
+/** Updates the description preview in the collapsed summary row. */
+function updateTaskSummaryDesc(card: HTMLElement, task: Task): void {
+  const preview = card.querySelector<HTMLElement>(".task-desc-preview");
+  if (preview) preview.textContent = task.description.split("\n")[0] ?? "";
+}
+
 /** Renders the prototype UI and rebinds event handlers. */
 function render(): void {
   appRoot.innerHTML = `
@@ -1317,6 +2068,8 @@ function render(): void {
         </div>
       </aside>
     </div>
+    ${renderMenuBar()}
+    ${renderTasksDialog()}
   `;
 
   const previousBtn = appRoot.querySelector<HTMLButtonElement>('button[data-action="previous"]');
@@ -1339,6 +2092,8 @@ function render(): void {
 
   bindAnnotationPanelHandlers();
   bindOpticsPanelHandlers();
+  bindMenuHandlers();
+  bindTasksDialogHandlers();
   mountViewer();
 }
 
