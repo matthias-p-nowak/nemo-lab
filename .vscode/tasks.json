@@ -1,0 +1,74 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "compile js",
+      "type": "shell",
+      "command": "esbuild",
+      "args": [
+        "--bundle",
+        "frontend/src/main.ts",
+        "--outdir=${workspaceFolder}/dist/js",
+        "--sourcemap"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "watch-scss",
+      "type": "shell",
+      "command": "sass",
+      "args": [
+        "frontend/src/main.scss:dist/css/main.css"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "start-nemo-server",
+      "type": "shell",
+      "command": "go",
+      "args": [
+        "run",
+        "./cmd/server"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/backend"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    },
+    {
+      "label": "copy-resources",
+      "type": "shell",
+      "command": "cp",
+      "args": [
+        "-r",
+        "frontend/resources/.",
+        "dist/"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "start-all",
+      "dependsOn": [
+        "copy-resources",
+        "watch-scss",
+        "compile js"
+      ],
+      "dependsOrder": "sequence",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": []
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+listen_addr = ":7255"
+static_dir  = "dist"
+db_path     = "nemo.db"
+admins      = ["ma"]
+
+theme                = "light"
+
+cache_dir            = "/tmp/nemo-lab/cache"
+cache_limit_mb       = 260000
+cache_evict_interval = "5m"
+tile_workers         = 3
