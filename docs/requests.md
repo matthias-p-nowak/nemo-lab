@@ -28,4 +28,6 @@
 
 - **Task path directory browser**: In admin mode, browse buttons on task `images` and `annotations` open a directory-browser modal backed by `GET /api/dirs?path=...`; selecting a path applies it to the field and persists via the existing blur/save flow. (2026-04-05)
 
+- **Optics transform toggles**: The Optics panel exposes three independent toggle controls (R = Rotate 90 CW, H = Horizontal flip, V = Vertical flip). Transforms compose in fixed order R→H→V. `PageUp`/`PageDown` with Main Area focus cycles through all 8 transform states; cycling updates the checkmarks. Panel-title reset clears all three toggles. (2026-04-06)
+
 - **On-demand image list + prefetch tiling**: Backend derives task image lists from `task.images`, computes image hash as SHA-256 of canonical absolute file path, pushes `image_list` over WS, and handles `prefetch`/`image_ready` flow. `/images/{hash}/manifest.json` and `/images/{hash}/tiles/{z}/{x}_{y}.png` are cache-only HTTP reads; tile generation happens via WS prefetch processing. (2026-04-05)

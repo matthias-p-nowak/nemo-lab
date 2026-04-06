@@ -277,6 +277,24 @@ Collapsible panel in the right sidebar. Contains three sliders:
 - Clicking the panel title resets all three values to their defaults.
 - Labels, sliders, and numeric values are aligned in a three-column grid (label | slider | value).
 
+#### Transform toggles
+
+Three checkmark controls below the sliders, laid out in the same column grid (checkmark | label):
+
+| Control           | Label             |
+|-------------------|-------------------|
+| R                 | Rotate 90 CW      |
+| H                 | Horizontal flip   |
+| V                 | Vertical flip     |
+
+- Each control is an independent toggle.
+- Transforms are applied in fixed order: R first, then H, then V. The 3-bit state `(R, H, V)` fully describes the active transform (e.g. `100` = rotate only, `010` = H-flip only, `011` = H+V = rotate 180).
+- When Main Area has focus, `PageUp`/`PageDown` cycles this exact sequence:
+  - normal (`000`) → rotate 90 CW (`100`) → rotate 180 (`011`) → rotate 270 (`111`) → horizontal flip (`010`) → horizontal flip + rotate 90 (`110`) → horizontal flip + rotate 180 (`001`) → horizontal flip + rotate 270 (`101`).
+- Cycling wraps at both ends.
+- Keyboard cycling updates the R/H/V checkmarks to match the active state.
+- Clicking the panel title reset also resets R/H/V to off (`000`).
+
 ### Image Viewer
 
 - Single WebGL canvas fills the center image-view area

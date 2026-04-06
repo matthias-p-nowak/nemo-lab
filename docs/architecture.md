@@ -127,7 +127,7 @@
 - Previous/next navigation updates the current index and sends a new `prefetch` window; image display waits for backend `image_ready`.
 - On `image_ready`, frontend loads viewer manifests/tiles using hash-based URLs (`/images/{hash}/manifest.json` + manifest tile template).
 - Viewer state now tracks `zoom`, `offsetX`, and `offsetY` for interactive navigation.
-- Initial image load sets pan/zoom to centered fit (`fitScaleForDimensions(manifest.width, manifest.height)`) and renders immediately.
+- Initial image load sets pan/zoom to centered fit using rotation-aware displayed dimensions (swaps width/height when 90° rotate is active) and renders immediately.
 - Wheel and pointer behavior:
   - `Ctrl+wheel` zooms around cursor.
   - Wheel pans vertically; `Shift+wheel` pans horizontally.
@@ -137,6 +137,10 @@
 - Tile level selection (`pickFitLevel`) is based on current zoomed image target (`zoom * manifest dimension * dpr`), and `maybeChangeFitLevel()` reloads tiles when level changes.
 - Fit-level tile streaming uses a monotonic load-batch generation token so stale async tile callbacks are ignored, including revisits to the same level after intermediate zoom changes.
 - Fit-level tile requests are viewport-culled: only tiles whose level-space rectangle intersects the current viewport are fetched.
+- Optics R/H/V transform rendering uses a shared GPU `mat3` path in vertex shaders (tile program and point program). The matrix is recomputed from current optics state and image center in NDC (`T(c) * M * T(-c)`) and uploaded for draw passes.
+- Tile draw UV coordinates remain fixed (`[0,0, 1,0, 0,1, 1,1]`); transform behavior is applied in vertex space.
+- Culling remains JS-side and uses inverse-viewport mapping into source-normalized space, so CPU culling and GPU placement stay mathematically aligned.
+- Annotation points are positioned from image-normalized coordinates into base NDC geometry, then transformed by the same vertex `mat3` used for tiles.
 - After wheel zoom/pan and drag-pan movement, fit-level loading is re-evaluated so newly revealed visible tiles are requested even when the selected level does not change.
 - Resize handling clamps pan/zoom, redraws, and re-evaluates fit level.
 - Canvas interaction styling is in `frontend/src/main.scss` with `touch-action: none` and grab/grabbing cursors.

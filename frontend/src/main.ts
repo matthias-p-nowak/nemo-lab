@@ -68,6 +68,10 @@ const appState = {
     commentPicture: false,
   },
   annotations: [] as AnnotationPoint[],
+  /** Label tree of the currently active task, shown in the right sidebar. */
+  activeLabels: [] as LabelNode[],
+  /** Selected label id in the active task's label tree. */
+  activeLabelSelectedId: null as string | null,
   /** Whether the top menu bar is visible. */
   menuOpen: false,
   /** Whether the Tasks modal is open. */
@@ -138,8 +142,40 @@ const appState = {
     multiply: 1.0,
     /** Additive brightness offset in [0,1] space (-100..100 maps to -100/255..100/255). */
     add: 0.0,
+    /** Rotate the view 90 degrees clockwise when true. */
+    rotate90cw: false,
+    /** Flip the view horizontally when true. */
+    flipH: false,
+    /** Flip the view vertically when true. */
+    flipV: false,
   },
 };
+
+const OPTICS_TRANSFORM_SEQUENCE: Array<{
+  rotate90cw: boolean;
+  flipH: boolean;
+  flipV: boolean;
+}> = [
+  { rotate90cw: false, flipH: false, flipV: false }, // 000
+  { rotate90cw: true,  flipH: false, flipV: false }, // 100
+  { rotate90cw: false, flipH: true,  flipV: true  }, // 011
+  { rotate90cw: true,  flipH: true,  flipV: true  }, // 111
+  { rotate90cw: false, flipH: true,  flipV: false }, // 010
+  { rotate90cw: true,  flipH: true,  flipV: false }, // 110
+  { rotate90cw: false, flipH: false, flipV: true  }, // 001
+  { rotate90cw: true,  flipH: false, flipV: true  }, // 101
+];
+
+const PURE_TRANSFORM_MATRICES: ReadonlyArray<Float32Array> = [
+  new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]), // 000
+  new Float32Array([1, 0, 0, 0, -1, 0, 0, 0, 1]), // 001 V
+  new Float32Array([-1, 0, 0, 0, 1, 0, 0, 0, 1]), // 010 H
+  new Float32Array([-1, 0, 0, 0, -1, 0, 0, 0, 1]), // 011 H+V
+  new Float32Array([0, -1, 0, 1, 0, 0, 0, 0, 1]), // 100 R
+  new Float32Array([0, 1, 0, 1, 0, 0, 0, 0, 1]), // 101 R+V
+  new Float32Array([0, -1, 0, -1, 0, 0, 0, 0, 1]), // 110 R+H
+  new Float32Array([0, 1, 0, -1, 0, 0, 0, 0, 1]), // 111 R+H+V
+];
 
 /** Current path shown in the directory browser modal. */
 let dirBrowserPath = "/";
@@ -503,9 +539,9 @@ function bindAnnotationPanelHandlers(): void {
   });
 }
 
-/** Produces the optics panel body HTML with three labeled sliders. */
+/** Produces the optics panel body HTML with sliders and transform toggles. */
 function renderOpticsBody(): string {
-  const { gamma, multiply, add } = appState.optics;
+  const { gamma, multiply, add, rotate90cw, flipH, flipV } = appState.optics;
   return `
     <label class="optics-row">
       <span>gamma</span>
@@ -525,6 +561,21 @@ function renderOpticsBody(): string {
         min="-100" max="100" step="1" value="${add}">
       <span class="optics-val">${add.toFixed(0)}</span>
     </label>
+    <label class="optics-row">
+      <input type="checkbox" data-transform="rotate90cw" ${rotate90cw ? "checked" : ""}>
+      <span>Rotate 90 CW</span>
+      <span class="optics-val"></span>
+    </label>
+    <label class="optics-row">
+      <input type="checkbox" data-transform="flipH" ${flipH ? "checked" : ""}>
+      <span>Horizontal flip</span>
+      <span class="optics-val"></span>
+    </label>
+    <label class="optics-row">
+      <input type="checkbox" data-transform="flipV" ${flipV ? "checked" : ""}>
+      <span>Vertical flip</span>
+      <span class="optics-val"></span>
+    </label>
   `;
 }
 
@@ -537,7 +588,7 @@ function bindOpticsPanelHandlers(): void {
 
   panel.querySelectorAll<HTMLInputElement>("input[data-optics]").forEach((slider) => {
     slider.addEventListener("input", () => {
-      const key = slider.getAttribute("data-optics") as keyof typeof appState.optics;
+      const key = slider.getAttribute("data-optics") as "gamma" | "multiply" | "add";
       const val = parseFloat(slider.value);
       appState.optics[key] = val;
 
@@ -547,7 +598,15 @@ function bindOpticsPanelHandlers(): void {
         valSpan.textContent = key === "add" ? val.toFixed(0) : val.toFixed(2);
       }
 
-      viewer?.setOptics(appState.optics.gamma, appState.optics.multiply, appState.optics.add);
+      applyOpticsToViewer();
+    });
+  });
+
+  panel.querySelectorAll<HTMLInputElement>("input[data-transform]").forEach((checkbox) => {
+    checkbox.addEventListener("change", () => {
+      const key = checkbox.getAttribute("data-transform") as "rotate90cw" | "flipH" | "flipV";
+      appState.optics[key] = checkbox.checked;
+      applyOpticsToViewer();
     });
   });
 
@@ -560,13 +619,48 @@ function bindOpticsPanelHandlers(): void {
       // The toggle icon is the second <span>; the title is the first.
       // Only reset when the title span itself was clicked.
       if (target.tagName === "SPAN" && target === header.querySelector("span:first-child")) {
-        appState.optics = { gamma: 1.0, multiply: 1.0, add: 0.0 };
-        viewer?.setOptics(1.0, 1.0, 0.0);
+        appState.optics = {
+          gamma: 1.0,
+          multiply: 1.0,
+          add: 0.0,
+          rotate90cw: false,
+          flipH: false,
+          flipV: false,
+        };
+        applyOpticsToViewer();
         // Re-render to update slider positions to reset values
         render();
       }
     });
   }
+}
+
+function applyOpticsToViewer(): void {
+  viewer?.setOptics(
+    appState.optics.gamma,
+    appState.optics.multiply,
+    appState.optics.add,
+    appState.optics.rotate90cw,
+    appState.optics.flipH,
+    appState.optics.flipV
+  );
+}
+
+function cycleOpticsTransform(step: 1 | -1): void {
+  const currentIndex = OPTICS_TRANSFORM_SEQUENCE.findIndex(
+    (state) =>
+      state.rotate90cw === appState.optics.rotate90cw &&
+      state.flipH === appState.optics.flipH &&
+      state.flipV === appState.optics.flipV
+  );
+  const base = currentIndex >= 0 ? currentIndex : 0;
+  const next = (base + step + OPTICS_TRANSFORM_SEQUENCE.length) % OPTICS_TRANSFORM_SEQUENCE.length;
+  const nextState = OPTICS_TRANSFORM_SEQUENCE[next];
+  appState.optics.rotate90cw = nextState.rotate90cw;
+  appState.optics.flipH = nextState.flipH;
+  appState.optics.flipV = nextState.flipV;
+  applyOpticsToViewer();
+  render();
 }
 
 /** Resolves level dimensions from the full-size manifest dimensions. */
@@ -605,6 +699,8 @@ class WebGLTileViewer {
   private imageStem = "";
   /** Fit transform for current draw pass. */
   private transform: ViewTransform = { x: 0, y: 0, width: 0, height: 0 };
+  /** Unrotated source-geometry transform used before shader matrix is applied. */
+  private baseTransform: ViewTransform = { x: 0, y: 0, width: 0, height: 0 };
   /** Selected fit-level index. */
   private fitLevel = 0;
   /** Highest backend-ready level seen for the current image, if provided. */
@@ -636,6 +732,8 @@ class WebGLTileViewer {
   private readonly tileMultiplyUniform: WebGLUniformLocation;
   /** Tile program additive uniform location. */
   private readonly tileAddUniform: WebGLUniformLocation;
+  /** Tile program transform matrix uniform location. */
+  private readonly tileTransformUniform: WebGLUniformLocation;
 
   /** Current optics: gamma exponent. */
   private opticsGamma = 1.0;
@@ -643,6 +741,12 @@ class WebGLTileViewer {
   private opticsMultiply = 1.0;
   /** Current optics: additive brightness offset (normalized). */
   private opticsAdd = 0.0;
+  /** Current transform: rotate 90 degrees clockwise flag. */
+  private opticsRotate90cw = false;
+  /** Current transform: horizontal-flip flag. */
+  private opticsFlipH = false;
+  /** Current transform: vertical-flip flag. */
+  private opticsFlipV = false;
 
   /** Point shader program. */
   private readonly pointProgram: WebGLProgram;
@@ -652,6 +756,8 @@ class WebGLTileViewer {
   private readonly pointColorUniform: WebGLUniformLocation;
   /** Point program size uniform location. */
   private readonly pointSizeUniform: WebGLUniformLocation;
+  /** Point program transform matrix uniform location. */
+  private readonly pointTransformUniform: WebGLUniformLocation;
 
   /** Shared buffer for quad positions and point positions. */
   private readonly positionBuffer: WebGLBuffer;
@@ -679,6 +785,8 @@ class WebGLTileViewer {
   private dragLastY = 0;
 /** Accumulated pointer travel in CSS px since last pointerdown. */
   private dragTotalDistance = 0;
+  /** Current full R/H/V transform matrix in NDC (column-major mat3). */
+  private transformMatrix = new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]);
 
   constructor(
     canvas: HTMLCanvasElement,
@@ -700,9 +808,11 @@ class WebGLTileViewer {
       attribute vec2 a_pos;
       attribute vec2 a_uv;
       varying vec2 v_uv;
+      uniform mat3 u_transform;
       void main() {
         v_uv = a_uv;
-        gl_Position = vec4(a_pos, 0.0, 1.0);
+        vec3 pos = u_transform * vec3(a_pos, 1.0);
+        gl_Position = vec4(pos.xy, 0.0, 1.0);
       }
       `,
       `
@@ -725,8 +835,10 @@ class WebGLTileViewer {
       `
       attribute vec2 a_pos;
       uniform float u_size;
+      uniform mat3 u_transform;
       void main() {
-        gl_Position = vec4(a_pos, 0.0, 1.0);
+        vec3 pos = u_transform * vec3(a_pos, 1.0);
+        gl_Position = vec4(pos.xy, 0.0, 1.0);
         gl_PointSize = u_size;
       }
       `,
@@ -749,22 +861,26 @@ class WebGLTileViewer {
     const tileGamma = gl.getUniformLocation(this.tileProgram, "u_gamma");
     const tileMultiply = gl.getUniformLocation(this.tileProgram, "u_multiply");
     const tileAdd = gl.getUniformLocation(this.tileProgram, "u_add");
-    if (!tileSampler || !tileGamma || !tileMultiply || !tileAdd) {
+    const tileTransform = gl.getUniformLocation(this.tileProgram, "u_transform");
+    if (!tileSampler || !tileGamma || !tileMultiply || !tileAdd || !tileTransform) {
       throw new Error("Tile uniforms missing");
     }
     this.tileSamplerUniform = tileSampler;
     this.tileGammaUniform = tileGamma;
     this.tileMultiplyUniform = tileMultiply;
     this.tileAddUniform = tileAdd;
+    this.tileTransformUniform = tileTransform;
 
     this.pointPosAttrib = gl.getAttribLocation(this.pointProgram, "a_pos");
     const pointColor = gl.getUniformLocation(this.pointProgram, "u_color");
     const pointSize = gl.getUniformLocation(this.pointProgram, "u_size");
-    if (!pointColor || !pointSize) {
+    const pointTransform = gl.getUniformLocation(this.pointProgram, "u_transform");
+    if (!pointColor || !pointSize || !pointTransform) {
       throw new Error("Point uniforms missing");
     }
     this.pointColorUniform = pointColor;
     this.pointSizeUniform = pointSize;
+    this.pointTransformUniform = pointTransform;
 
     const positionBuffer = gl.createBuffer();
     const uvBuffer = gl.createBuffer();
@@ -779,12 +895,47 @@ class WebGLTileViewer {
   }
 
   /** Updates optics adjustment values and redraws. */
-  setOptics(gamma: number, multiply: number, add: number): void {
+  setOptics(
+    gamma: number,
+    multiply: number,
+    add: number,
+    rotate90cw: boolean,
+    flipH: boolean,
+    flipV: boolean
+  ): void {
+    const rotationChanged = this.opticsRotate90cw !== rotate90cw;
+    const transformChanged =
+      rotationChanged ||
+      this.opticsFlipH !== flipH ||
+      this.opticsFlipV !== flipV;
     this.opticsGamma = gamma;
     this.opticsMultiply = multiply;
     /** Add value is stored as a normalized offset (divide by 255 so the shader
      *  operates in [0,1] color space regardless of the slider's -100..100 range). */
     this.opticsAdd = add / 255;
+    this.opticsRotate90cw = rotate90cw;
+    this.opticsFlipH = flipH;
+    this.opticsFlipV = flipV;
+
+    if (transformChanged) {
+      if (rotationChanged && this.manifest) {
+        const displayed = this.getDisplayedImageDimensions();
+        const fitScale = this.fitScaleForDimensions(displayed.width, displayed.height);
+        this.zoom = fitScale;
+        this.offsetX = (this.canvas.clientWidth - fitScale * displayed.width) / 2;
+        this.offsetY = (this.canvas.clientHeight - fitScale * displayed.height) / 2;
+      } else {
+        this.clampPanZoom();
+      }
+      this.draw();
+      const previousLevel = this.fitLevel;
+      this.maybeChangeFitLevel();
+      if (this.fitLevel === previousLevel) {
+        this.loadFitLevelTiles(this.generation);
+      }
+      return;
+    }
+
     this.draw();
   }
 
@@ -846,10 +997,11 @@ class WebGLTileViewer {
     }
 
     this.manifest = manifest;
-    const fitScale = this.fitScaleForDimensions(manifest.width, manifest.height);
+    const displayed = this.getDisplayedImageDimensions();
+    const fitScale = this.fitScaleForDimensions(displayed.width, displayed.height);
     this.zoom = fitScale;
-    this.offsetX = (this.canvas.clientWidth - fitScale * manifest.width) / 2;
-    this.offsetY = (this.canvas.clientHeight - fitScale * manifest.height) / 2;
+    this.offsetX = (this.canvas.clientWidth - fitScale * displayed.width) / 2;
+    this.offsetY = (this.canvas.clientHeight - fitScale * displayed.height) / 2;
     this.fitLevel = this.pickFitLevel();
     this.updateCanvasZoomLevelClass();
 
@@ -889,6 +1041,7 @@ class WebGLTileViewer {
     }
 
     this.computeTransform();
+    this.updateTransformMatrix();
 
     if (this.level0Tile) {
       const dims = getLevelDimensions(this.manifest, 0);
@@ -915,6 +1068,12 @@ class WebGLTileViewer {
     if (this.canvas.width !== width || this.canvas.height !== height) {
       this.canvas.width = width;
       this.canvas.height = height;
+      this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+      if (this.manifest) {
+        this.clampPanZoom();
+        this.draw();
+      }
+      return;
     }
 
     this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
@@ -1003,24 +1162,39 @@ class WebGLTileViewer {
       return false;
     }
 
-    const vpImageX0 = (0 - this.offsetX) / this.zoom;
-    const vpImageY0 = (0 - this.offsetY) / this.zoom;
-    const vpImageX1 = (this.canvas.clientWidth - this.offsetX) / this.zoom;
-    const vpImageY1 = (this.canvas.clientHeight - this.offsetY) / this.zoom;
+    const drawW = this.transform.width;
+    const drawH = this.transform.height;
+    if (drawW <= 0 || drawH <= 0) {
+      return false;
+    }
 
-    const scaleX = levelWidth / this.manifest.width;
-    const scaleY = levelHeight / this.manifest.height;
-    const vpX0 = vpImageX0 * scaleX;
-    const vpY0 = vpImageY0 * scaleY;
-    const vpX1 = vpImageX1 * scaleX;
-    const vpY1 = vpImageY1 * scaleY;
+    const vpX0 = (0 - this.offsetX) / drawW;
+    const vpY0 = (0 - this.offsetY) / drawH;
+    const vpX1 = (this.canvas.clientWidth - this.offsetX) / drawW;
+    const vpY1 = (this.canvas.clientHeight - this.offsetY) / drawH;
 
-    const tileX0 = tx * tileSize;
-    const tileY0 = ty * tileSize;
-    const tileX1 = Math.min((tx + 1) * tileSize, levelWidth);
-    const tileY1 = Math.min((ty + 1) * tileSize, levelHeight);
+    const vpCorners = [
+      this.applyInverseTransformToNormalizedPoint(vpX0, vpY0),
+      this.applyInverseTransformToNormalizedPoint(vpX1, vpY0),
+      this.applyInverseTransformToNormalizedPoint(vpX0, vpY1),
+      this.applyInverseTransformToNormalizedPoint(vpX1, vpY1),
+    ];
+    const sourceMinX = Math.min(vpCorners[0].x, vpCorners[1].x, vpCorners[2].x, vpCorners[3].x);
+    const sourceMaxX = Math.max(vpCorners[0].x, vpCorners[1].x, vpCorners[2].x, vpCorners[3].x);
+    const sourceMinY = Math.min(vpCorners[0].y, vpCorners[1].y, vpCorners[2].y, vpCorners[3].y);
+    const sourceMaxY = Math.max(vpCorners[0].y, vpCorners[1].y, vpCorners[2].y, vpCorners[3].y);
 
-    return tileX0 < vpX1 && tileX1 > vpX0 && tileY0 < vpY1 && tileY1 > vpY0;
+    const nx0 = (tx * tileSize) / levelWidth;
+    const ny0 = (ty * tileSize) / levelHeight;
+    const nx1 = Math.min(nx0 + (tileSize / levelWidth), 1);
+    const ny1 = Math.min(ny0 + (tileSize / levelHeight), 1);
+
+    return (
+      nx0 < sourceMaxX &&
+      nx1 > sourceMinX &&
+      ny0 < sourceMaxY &&
+      ny1 > sourceMinY
+    );
   }
 
   /** Picks the first level whose resolution exceeds canvas pixels*dpr target. */
@@ -1030,8 +1204,9 @@ class WebGLTileViewer {
     }
 
     const dpr = window.devicePixelRatio || 1;
-    const targetW = this.zoom * this.manifest.width * dpr;
-    const targetH = this.zoom * this.manifest.height * dpr;
+    const displayed = this.getDisplayedImageDimensions();
+    const targetW = this.zoom * displayed.width * dpr;
+    const targetH = this.zoom * displayed.height * dpr;
 
     for (let level = 0; level < this.manifest.levels; level += 1) {
       const dims = getLevelDimensions(this.manifest, level);
@@ -1048,11 +1223,22 @@ class WebGLTileViewer {
     if (!this.manifest) {
       return;
     }
+    const displayed = this.getDisplayedImageDimensions();
     this.transform = {
       x: this.offsetX,
       y: this.offsetY,
-      width: this.zoom * this.manifest.width,
-      height: this.zoom * this.manifest.height,
+      width: this.zoom * displayed.width,
+      height: this.zoom * displayed.height,
+    };
+    const centerX = this.transform.x + this.transform.width / 2;
+    const centerY = this.transform.y + this.transform.height / 2;
+    const baseWidth = this.zoom * this.manifest.width;
+    const baseHeight = this.zoom * this.manifest.height;
+    this.baseTransform = {
+      x: centerX - baseWidth / 2,
+      y: centerY - baseHeight / 2,
+      width: baseWidth,
+      height: baseHeight,
     };
   }
 
@@ -1069,18 +1255,19 @@ class WebGLTileViewer {
     const cw = this.canvas.clientWidth;
     const ch = this.canvas.clientHeight;
     const pad = 20;
+    const displayed = this.getDisplayedImageDimensions();
 
     const minZoom = Math.max(
       Math.min(
-        (cw - 2 * pad) / this.manifest.width,
-        (ch - 2 * pad) / this.manifest.height
+        (cw - 2 * pad) / displayed.width,
+        (ch - 2 * pad) / displayed.height
       ),
       1e-6
     );
     this.zoom = Math.max(minZoom, Math.min(2, this.zoom));
 
-    const imgW = this.zoom * this.manifest.width;
-    const imgH = this.zoom * this.manifest.height;
+    const imgW = this.zoom * displayed.width;
+    const imgH = this.zoom * displayed.height;
 
     const xA = -pad;
     const xB = cw + pad - imgW;
@@ -1155,6 +1342,7 @@ class WebGLTileViewer {
     gl.uniform1f(this.tileGammaUniform, this.opticsGamma);
     gl.uniform1f(this.tileMultiplyUniform, this.opticsMultiply);
     gl.uniform1f(this.tileAddUniform, this.opticsAdd);
+    gl.uniformMatrix3fv(this.tileTransformUniform, false, this.transformMatrix);
 
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
@@ -1166,10 +1354,12 @@ class WebGLTileViewer {
     levelHeight: number
   ): TilePlacementRect {
     const tileSize = this.manifest?.tile_size ?? 256;
-    const x = this.transform.x + ((tile.tx * tileSize) / levelWidth) * this.transform.width;
-    const y = this.transform.y + ((tile.ty * tileSize) / levelHeight) * this.transform.height;
-    const width = (tile.width / levelWidth) * this.transform.width;
-    const height = (tile.height / levelHeight) * this.transform.height;
+    const nx0 = (tile.tx * tileSize) / levelWidth;
+    const ny0 = (tile.ty * tileSize) / levelHeight;
+    const x = this.baseTransform.x + nx0 * this.baseTransform.width;
+    const y = this.baseTransform.y + ny0 * this.baseTransform.height;
+    const width = (tile.width / levelWidth) * this.baseTransform.width;
+    const height = (tile.height / levelHeight) * this.baseTransform.height;
     return { x, y, width, height };
   }
 
@@ -1184,8 +1374,8 @@ class WebGLTileViewer {
     const points = new Float32Array(annotations.length * 2);
 
     annotations.forEach((annotation, index) => {
-      const x = this.transform.x + annotation.x * this.transform.width;
-      const y = this.transform.y + annotation.y * this.transform.height;
+      const x = this.baseTransform.x + annotation.x * this.baseTransform.width;
+      const y = this.baseTransform.y + annotation.y * this.baseTransform.height;
       points[index * 2] = (x / this.canvas.clientWidth) * 2 - 1;
       points[index * 2 + 1] = 1 - (y / this.canvas.clientHeight) * 2;
     });
@@ -1198,6 +1388,7 @@ class WebGLTileViewer {
     gl.bufferData(gl.ARRAY_BUFFER, points, gl.STREAM_DRAW);
     gl.enableVertexAttribArray(this.pointPosAttrib);
     gl.vertexAttribPointer(this.pointPosAttrib, 2, gl.FLOAT, false, 0, 0);
+    gl.uniformMatrix3fv(this.pointTransformUniform, false, this.transformMatrix);
     gl.uniform4f(this.pointColorUniform, 1, 0.44, 0.38, 1);
     gl.uniform1f(this.pointSizeUniform, 10);
 
@@ -1323,10 +1514,59 @@ class WebGLTileViewer {
       return;
     }
 
-    const x = (px - this.transform.x) / this.transform.width;
-    const y = (py - this.transform.y) / this.transform.height;
-    this.onAddAnnotation(x, y);
+    const displayX = (px - this.transform.x) / this.transform.width;
+    const displayY = (py - this.transform.y) / this.transform.height;
+    const source = this.applyInverseTransformToNormalizedPoint(displayX, displayY);
+    this.onAddAnnotation(source.x, source.y);
   };
+
+  /** Returns the effective displayed image dimensions after rotation toggle. */
+  private getDisplayedImageDimensions(): { width: number; height: number } {
+    if (!this.manifest) {
+      return { width: 1, height: 1 };
+    }
+    if (!this.opticsRotate90cw) {
+      return { width: this.manifest.width, height: this.manifest.height };
+    }
+    return { width: this.manifest.height, height: this.manifest.width };
+  }
+
+  /** Applies inverse active transform to map display-normalized point to source-normalized point. */
+  private applyInverseTransformToNormalizedPoint(x: number, y: number): { x: number; y: number } {
+    let tx = x;
+    let ty = y;
+    if (this.opticsFlipV) {
+      ty = 1 - ty;
+    }
+    if (this.opticsFlipH) {
+      tx = 1 - tx;
+    }
+    if (this.opticsRotate90cw) {
+      const nextX = ty;
+      const nextY = 1 - tx;
+      tx = nextX;
+      ty = nextY;
+    }
+    return { x: tx, y: ty };
+  }
+
+  /** Recomputes the full image transform matrix in NDC for current optics + pan/zoom. */
+  private updateTransformMatrix(): void {
+    const idx = (this.opticsRotate90cw ? 4 : 0) | (this.opticsFlipH ? 2 : 0) | (this.opticsFlipV ? 1 : 0);
+    const pure = PURE_TRANSFORM_MATRICES[idx];
+    const cw = Math.max(1, this.canvas.clientWidth);
+    const ch = Math.max(1, this.canvas.clientHeight);
+    // Compensate NDC anisotropy so 90-degree rotations are correct in pixel space.
+    const m00 = pure[0];
+    const m01 = pure[1] * (cw / ch);
+    const m10 = pure[3] * (ch / cw);
+    const m11 = pure[4];
+    const cx = ((this.transform.x + this.transform.width / 2) / this.canvas.clientWidth) * 2 - 1;
+    const cy = 1 - ((this.transform.y + this.transform.height / 2) / this.canvas.clientHeight) * 2;
+    const tx = cx - (m00 * cx + m10 * cy);
+    const ty = cy - (m01 * cx + m11 * cy);
+    this.transformMatrix = new Float32Array([m00, m01, 0, m10, m11, 0, tx, ty, 1]);
+  }
 
   /** Handles wheel-based pan/zoom gestures centered at cursor. */
   private readonly handleWheel = (event: WheelEvent): void => {
@@ -1375,6 +1615,7 @@ class WebGLTileViewer {
     if (event.button !== 0) {
       return;
     }
+    this.canvas.focus();
     this.isDragging = true;
     this.dragLastX = event.clientX;
     this.dragLastY = event.clientY;
@@ -1476,13 +1717,24 @@ function mountViewer(): void {
     (x, y) => addAnnotation(x, y)
   );
 
-  const { gamma, multiply, add } = appState.optics;
-  viewer.setOptics(gamma, multiply, add);
+  applyOpticsToViewer();
   const waitingForImageReady = appState.imageList.length > 0 && appState.currentImageHash === null;
   canvas.classList.toggle("image-view__canvas--zoom-loading", waitingForImageReady);
   if (appState.currentImageHash) {
     void viewer.setImage(appState.currentImageHash);
   }
+
+  canvas.addEventListener("keydown", (e) => {
+    if (e.key === "PageUp") {
+      e.preventDefault();
+      cycleOpticsTransform(1);
+      return;
+    }
+    if (e.key === "PageDown") {
+      e.preventDefault();
+      cycleOpticsTransform(-1);
+    }
+  });
 }
 
 // ── Menu bar ─────────────────────────────────────────────────────────────────
@@ -2554,6 +2806,8 @@ function bindTasksDialogHandlers(): void {
 
       logEvent("set_active_task", { task_id: id });
 
+      appState.activeLabels = task.labels;
+      appState.activeLabelSelectedId = task.selectedLabelId;
       appState.imageList = [];
       appState.currentImageIndex = 0;
       appState.currentImageHash = null;
@@ -2665,7 +2919,7 @@ function render(): void {
           <span>Click canvas to add point annotation</span>
         </div>
         <div class="image-view__canvas-wrap">
-          <canvas class="image-view__canvas" aria-label="Tile image viewer"></canvas>
+          <canvas class="image-view__canvas" aria-label="Tile image viewer" tabindex="0"></canvas>
         </div>
       </main>
 
@@ -2679,7 +2933,7 @@ function render(): void {
         <div class="sidebar__content panels">
           ${renderPanel("optics", "optics", renderOpticsBody())}
           ${renderPanel("masks", "masks", '<div class="muted">Prototype placeholder</div>')}
-          ${renderPanel("labels", "labels", '<div class="muted">Prototype placeholder</div>')}
+          ${renderPanel("labels", "labels", renderLabelTree(appState.activeLabels, appState.activeLabelSelectedId, false))}
           ${renderPanel(
             "annotations",
             "annotations",
