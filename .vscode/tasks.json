@@ -17,7 +17,7 @@
       "problemMatcher": []
     },
     {
-      "label": "watch-scss",
+      "label": "compile scss",
       "type": "shell",
       "command": "sass",
       "args": [
@@ -63,7 +63,7 @@
       "label": "start-all",
       "dependsOn": [
         "copy-resources",
-        "watch-scss",
+        "compile scss",
         "compile js"
       ],
       "dependsOrder": "sequence",
