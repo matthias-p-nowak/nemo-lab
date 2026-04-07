@@ -197,17 +197,12 @@ button:hover {
 }
 
 .panel__header {
-  width: 100%;
-  border: none;
   border-bottom: 1px solid var(--line);
-  border-radius: 0;
   padding: 8px 10px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
   text-transform: lowercase;
   font-weight: 600;
   background: var(--bg-toolbar);
+  cursor: default;
 }
 
 .panel__body {
@@ -217,8 +212,8 @@ button:hover {
   gap: 8px;
 }
 
-.panel.is-collapsed .panel__body {
-  display: none;
+.panel[data-panel="optics"] {
+  margin-top: 36px;
 }
 
 .optics-row {

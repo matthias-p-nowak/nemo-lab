@@ -374,8 +374,11 @@ Certain UI preferences are persisted per user in the backend and restored on nex
 
 ### GUI Cleanup
 
-- Both sidebar headers (`sidebar--left` and `sidebar--right`) have no label text — remove `<strong>` from `.sidebar__header` in both sidebars. The header retains only the toggle button.
-- `div.image-view__toolbar` (containing the "Image View" caption and "Click canvas to add point annotation" hint) is removed entirely from the layout.
+- Both sidebar headers (`sidebar--left` and `sidebar--right`) have no label text — the header retains only the toggle button.
+- `div.image-view__toolbar` is removed entirely from the layout.
+- The "Masks" panel in the right sidebar is removed.
+- Panels are no longer collapsible — `panel__header` is a plain `<div>`, no toggle button. The optics panel header retains a click-to-reset behavior on its title span.
+- The optics panel has a top margin (`36px`) to clear the right sidebar collapse/expand button.
 
 ### Menu Bar
 

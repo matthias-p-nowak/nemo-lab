@@ -72,7 +72,23 @@ function handleDocumentPageCycleKeydown(e: KeyboardEvent): void {
   cycleOpticsTransform(e.key === "PageUp" ? 1 : -1);
 }
 
+/** Closes the floating mask label context menu. */
+function closeMaskContextMenu(): void {
+  appState.maskContextMenu.open = false;
+  appState.maskContextMenu.maskId = null;
+}
+
+/** Handles Escape for closing mask context menu (guarded, global listener). */
+function handleDocumentMaskMenuEscape(e: KeyboardEvent): void {
+  if (e.key !== "Escape") return;
+  if (!appState.maskContextMenu.open) return;
+  e.preventDefault();
+  closeMaskContextMenu();
+  render();
+}
+
 document.addEventListener("keydown", handleDocumentPageCycleKeydown);
+document.addEventListener("keydown", handleDocumentMaskMenuEscape);
 
 /** Mutable prototype application state. */
 const appState = {
@@ -82,14 +98,6 @@ const appState = {
   leftCollapsed: false,
   rightCollapsed: false,
   rightSidebarWidth: 320,
-  panelCollapsed: {
-    optics: false,
-    masks: false,
-    labels: false,
-    annotations: false,
-    commentAnnotation: false,
-    commentPicture: false,
-  },
   masks: [] as MaskPoint[],
   /** Recently assigned labels, most recent first. */
   recentLabels: [] as string[],
@@ -604,11 +612,6 @@ function bindRightSidebarResizeHandle(): void {
   });
 }
 
-/** Toggles a single right-side panel open/closed state. */
-function togglePanel(panelName: keyof typeof appState.panelCollapsed): void {
-  appState.panelCollapsed[panelName] = !appState.panelCollapsed[panelName];
-  render();
-}
 
 /** Creates a compact unique ID for a new mask point. */
 function createMaskId(): string {
@@ -707,20 +710,17 @@ function clearMasks(): void {
   updateAnnotationUI();
 }
 
-/** Produces markup for a collapsible panel in right sidebar. */
+/** Produces markup for a panel in the right sidebar. */
 function renderPanel(
-  panelName: keyof typeof appState.panelCollapsed,
+  panelName: string,
   title: string,
   contentHtml: string
 ): string {
-  const collapsed = appState.panelCollapsed[panelName];
-
   return `
-    <section class="panel ${collapsed ? "is-collapsed" : ""}" data-panel="${panelName}">
-      <button class="panel__header" type="button" data-action="toggle-panel" data-panel="${panelName}">
+    <section class="panel" data-panel="${panelName}">
+      <div class="panel__header">
         <span>${title}</span>
-        <span>${collapsed ? "+" : "-"}</span>
-      </button>
+      </div>
       <div class="panel__body">${contentHtml}</div>
     </section>
   `;
@@ -802,8 +802,7 @@ function bindMaskContextMenuHandlers(): void {
       const maskId = appState.maskContextMenu.maskId;
       if (!labelName || !maskId) return;
       assignLabelToMask(maskId, labelName);
-      appState.maskContextMenu.open = false;
-      appState.maskContextMenu.maskId = null;
+      closeMaskContextMenu();
       render();
     });
   });
@@ -811,8 +810,7 @@ function bindMaskContextMenuHandlers(): void {
   document.addEventListener("click", (event) => {
     const target = event.target as Element | null;
     if (target?.closest(".mask-context-menu")) return;
-    appState.maskContextMenu.open = false;
-    appState.maskContextMenu.maskId = null;
+    closeMaskContextMenu();
     render();
   }, { once: true });
 }
@@ -900,14 +898,11 @@ function bindOpticsPanelHandlers(): void {
     });
   });
 
-  // Clicking the panel header title span resets all optics to defaults.
-  // The header is a <button> (toggle); we detect clicks on its first <span> (title text).
-  const header = panel.querySelector<HTMLButtonElement>(".panel__header");
+  // Clicking the panel header title resets all optics to defaults.
+  const header = panel.querySelector<HTMLElement>(".panel__header");
   if (header) {
     header.addEventListener("click", (e) => {
       const target = e.target as HTMLElement;
-      // The toggle icon is the second <span>; the title is the first.
-      // Only reset when the title span itself was clicked.
       if (target.tagName === "SPAN" && target === header.querySelector("span:first-child")) {
         appState.optics = {
           gamma: 1.0,
@@ -2098,8 +2093,7 @@ function mountViewer(): void {
         image_y: payload.imageY,
       });
       if (payload.button === "left") {
-        appState.maskContextMenu.open = false;
-        appState.maskContextMenu.maskId = null;
+        closeMaskContextMenu();
         if (payload.shiftKey) {
           if (payload.hitMaskId) {
             removeMask(payload.hitMaskId);
@@ -2115,8 +2109,7 @@ function mountViewer(): void {
         appState.maskContextMenu.clientY = payload.clientY;
         appState.maskContextMenu.maskId = payload.hitMaskId;
       } else {
-        appState.maskContextMenu.open = false;
-        appState.maskContextMenu.maskId = null;
+        closeMaskContextMenu();
       }
       render();
     }
@@ -3204,12 +3197,13 @@ function bindTasksDialogHandlers(): void {
       logEvent("set_active_task", { task_id: id });
 
       appState.activeLabels = task.labels;
+      appState.recentLabels = [];
       appState.activeLabelSelectedId = task.selectedLabelId;
       appState.imageList = [];
       appState.currentImageIndex = 0;
       appState.currentImageHash = null;
       appState.masks = [];
-      appState.maskContextMenu.open = false;
+      closeMaskContextMenu();
 
       appState.tasksDialogOpen = false;
       render();
@@ -3315,7 +3309,6 @@ function render(): void {
         <div class="sidebar__resize-handle" role="separator" aria-orientation="vertical" aria-label="Resize right sidebar"></div>
         <div class="sidebar__content panels">
           ${renderPanel("optics", "optics", renderOpticsBody())}
-          ${renderPanel("masks", "masks", '<div class="muted">Prototype placeholder</div>')}
           ${renderPanel("labels", "labels", renderLabelTree(appState.activeLabels, appState.activeLabelSelectedId, false))}
           ${renderPanel(
             "annotations",
@@ -3351,19 +3344,10 @@ function render(): void {
   const nextBtn = appRoot.querySelector<HTMLButtonElement>('button[data-action="next"]');
   const toggleLeftBtn = appRoot.querySelector<HTMLButtonElement>('button[data-action="toggle-left"]');
   const toggleRightBtn = appRoot.querySelector<HTMLButtonElement>('button[data-action="toggle-right"]');
-  const panelToggles = appRoot.querySelectorAll<HTMLButtonElement>('button[data-action="toggle-panel"]');
-
   previousBtn?.addEventListener("click", goPreviousImage);
   nextBtn?.addEventListener("click", goNextImage);
   toggleLeftBtn?.addEventListener("click", toggleLeftSidebar);
   toggleRightBtn?.addEventListener("click", toggleRightSidebar);
-
-  panelToggles.forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const panelName = btn.getAttribute("data-panel") as keyof typeof appState.panelCollapsed;
-      togglePanel(panelName);
-    });
-  });
 
   bindAnnotationPanelHandlers();
   bindOpticsPanelHandlers();
