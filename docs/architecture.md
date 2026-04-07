@@ -154,12 +154,12 @@
 - Optics R/H/V transform rendering uses a shared GPU `mat3` path in vertex shaders (tile program and point program). The matrix is recomputed from current optics state and image center in NDC (`T(c) * M * T(-c)`) and uploaded for draw passes.
 - Tile draw UV coordinates remain fixed (`[0,0, 1,0, 0,1, 1,1]`); transform behavior is applied in vertex space.
 - Culling remains JS-side and uses inverse-viewport mapping into source-normalized space, so CPU culling and GPU placement stay mathematically aligned.
-- Annotation points are positioned from image-normalized coordinates into base NDC geometry, then transformed by the same vertex `mat3` used for tiles.
+- Mask points are positioned from image-normalized coordinates into base NDC geometry, then transformed by the same vertex `mat3` used for tiles.
 - After wheel zoom/pan and drag-pan movement, fit-level loading is re-evaluated so newly revealed visible tiles are requested even when the selected level does not change.
 - Resize handling clamps pan/zoom, redraws, and re-evaluates fit level.
-- Canvas interaction styling is in `frontend/src/main.scss` with `touch-action: none` and grab/grabbing cursors.
+- Canvas interaction styling is in `frontend/src/main.scss` with `touch-action: none` and crosshair cursor.
 - Viewer input handlers emit telemetry with module-level `logEvent(...)` over the shared WebSocket.
 - `PageUp`/`PageDown` optics transform cycling is bound once at module init on `document` keydown so it works independent of canvas focus across rerenders; handler ignores editable targets (`INPUT`, `TEXTAREA`, `SELECT`, contenteditable) and calls `preventDefault()` to suppress browser page scroll.
-- Logged frontend events: `image_change` and document `focus` (`focusin`/`focusout`).
-- Canvas click adds an annotation only if total pointer travel since `pointerdown` is ≤ `config.clickMaxDragPx` (default 10 CSS px); longer drags are treated as pan gestures and suppressed.
+- Logged frontend events include `image_change`, document `focus` (`focusin`/`focusout`), and temporary mask interaction events (`mouse_click`, `mask_created`, `mask_removed`, `label_assigned`).
+- Canvas left-click adds a mask point only if total pointer travel since `pointerdown` is ≤ `config.clickMaxDragPx` (default 10 CSS px); longer drags are treated as pan gestures and suppressed. `Shift+left-click` removes nearest mask within 10 CSS px. Right-click near a mask opens a floating label assignment menu.
 - The canvas border color indicates viewer readiness/zoom resolution: yellow while the selected image is not yet ready in the viewer, green when `fitLevel < manifest.levels - 1` (below max tile resolution), and brown when at the finest level. Updated via CSS classes toggled on the canvas element. The yellow debug box-shadow is removed.

@@ -399,8 +399,39 @@ The menu bar is restructured so that sidebar toggle buttons are always visible a
 - `.sidebar__content` has `flex: 1` and `overflow-y: auto` so panels scroll vertically and are never clipped.
 - Each `.panel` expands to its natural content height — no fixed or max height on `.panel` or `.panel__body`.
 
+### Masks
+
+A mask is a geometric figure placed on the image canvas. Currently only point masks are supported; rectangle and freehand are future extensions.
+
+- Masks are numbered sequentially (1, 2, 3, …) per image.
+- The image view cursor is a **crosshair** at all times.
+- **Left-click**: places a point mask at the cursor position.
+- **Shift+left-click**: removes the closest existing mask (if any within a reasonable hit radius).
+- Masks are rendered in the WebGL pass on top of image tiles — no overlay div.
+
+### Labels
+
+- A hierarchical system of categories, each identified by name.
+- The label tree is per-task (already modeled in `task_labels`).
+
 ### Annotations
 
-- Drawn in the same WebGL render pass on top of image tiles — no overlay div
-- Click on canvas → convert to image coordinates → add annotation point → redraw
-- Removing a dot: update annotation list, redraw — no image reload
+An annotation is the assignment of a label to a mask.
+
+- **Right-click** within 10 CSS px of a mask opens a context menu:
+  - Lists recently used labels, most recent on top.
+  - Clicking a list item assigns that label to the mask.
+- The **last assigned label** is the default for the next placed mask (auto-assigned on placement).
+
+### Annotation Logging (temporary)
+
+Until persistence is implemented, the frontend logs the following events to the backend over WebSocket:
+
+| Event | Payload fields |
+|---|---|
+| `mask_created` | image hash, mask index, image-normalized `x`, `y` |
+| `mask_removed` | image hash, mask index |
+| `label_assigned` | image hash, mask index, label name |
+| `mouse_click` | button (`left`\|`right`), canvas `x`, `y`, image-normalized `x`, `y` |
+
+> Persistence of masks and annotations to `nemolab.json` or DB is out of scope for this task.

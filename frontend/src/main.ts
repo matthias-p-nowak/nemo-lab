@@ -90,7 +90,16 @@ const appState = {
     commentAnnotation: false,
     commentPicture: false,
   },
-  annotations: [] as AnnotationPoint[],
+  masks: [] as MaskPoint[],
+  /** Recently assigned labels, most recent first. */
+  recentLabels: [] as string[],
+  /** Context menu state for right-click label assignment on masks. */
+  maskContextMenu: {
+    open: false,
+    clientX: 0,
+    clientY: 0,
+    maskId: null as string | null,
+  },
   /** Label tree of the currently active task, shown in the right sidebar. */
   activeLabels: [] as LabelNode[],
   /** Selected label id in the active task's label tree. */
@@ -332,14 +341,18 @@ interface BackendMe {
   is_admin: boolean;
 }
 
-/** Minimal point annotation model for this prototype. */
-interface AnnotationPoint {
-  /** Stable annotation identifier. */
+/** Minimal point-mask model for the current image. */
+interface MaskPoint {
+  /** Stable mask identifier. */
   id: string;
+  /** Sequential mask index within the current image. */
+  index: number;
   /** X coordinate in normalized image space (0..1). */
   x: number;
   /** Y coordinate in normalized image space (0..1). */
   y: number;
+  /** Optional assigned label name. */
+  labelName: string | null;
 }
 
 /** Tile manifest produced by the tiling script. */
@@ -394,6 +407,28 @@ interface TilePlacementRect {
   height: number;
 }
 
+/** Canvas click payload used for mask interactions. */
+interface MaskCanvasClick {
+  /** Mouse button label. */
+  button: "left" | "right";
+  /** Canvas-local X coordinate in CSS pixels. */
+  canvasX: number;
+  /** Canvas-local Y coordinate in CSS pixels. */
+  canvasY: number;
+  /** Source image-normalized X coordinate. */
+  imageX: number;
+  /** Source image-normalized Y coordinate. */
+  imageY: number;
+  /** Whether Shift key was held. */
+  shiftKey: boolean;
+  /** Closest hit mask id when within hit radius. */
+  hitMaskId: string | null;
+  /** Client X for floating context menu positioning. */
+  clientX: number;
+  /** Client Y for floating context menu positioning. */
+  clientY: number;
+}
+
 /** Main app container. */
 // Non-null assertion is safe: the throw below ensures the app never proceeds without #app.
 // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
@@ -427,7 +462,7 @@ function sendPrefetch(images: { hash: string }[], fromIndex: number): void {
   ws.send(JSON.stringify({ type: "prefetch", hashes }));
 }
 
-/** Moves to previous image and resets annotation list. */
+/** Moves to previous image and resets mask state for the new image. */
 function goPreviousImage(): void {
   if (appState.imageList.length === 0) {
     return;
@@ -437,7 +472,8 @@ function goPreviousImage(): void {
   // Clear active hash so remount does not briefly reload the previous image
   // while waiting for the next image_ready event.
   appState.currentImageHash = null;
-  appState.annotations = [];
+  appState.masks = [];
+  appState.maskContextMenu.open = false;
   const current = getCurrentImageEntry();
   if (current) {
     logEvent("image_change", { filename: current.filename, hash: current.hash });
@@ -446,7 +482,7 @@ function goPreviousImage(): void {
   render();
 }
 
-/** Moves to next image and resets annotation list. */
+/** Moves to next image and resets mask state for the new image. */
 function goNextImage(): void {
   if (appState.imageList.length === 0) {
     return;
@@ -455,7 +491,8 @@ function goNextImage(): void {
   // Clear active hash so remount does not briefly reload the previous image
   // while waiting for the next image_ready event.
   appState.currentImageHash = null;
-  appState.annotations = [];
+  appState.masks = [];
+  appState.maskContextMenu.open = false;
   const current = getCurrentImageEntry();
   if (current) {
     logEvent("image_change", { filename: current.filename, hash: current.hash });
@@ -485,7 +522,8 @@ ws.addEventListener("message", (event) => {
     appState.imageList = images;
     appState.currentImageIndex = 0;
     appState.currentImageHash = null;
-    appState.annotations = [];
+    appState.masks = [];
+    appState.maskContextMenu.open = false;
     render();
     if (images.length > 0) {
       sendPrefetch(images, 0);
@@ -502,9 +540,10 @@ ws.addEventListener("message", (event) => {
     const totalLevels = typeof m["total_levels"] === "number" ? m["total_levels"] : 0;
     console.log(`ws image_ready hash=${hash.slice(0, 16)} level=${level}/${totalLevels}`);
     const isNewImage = appState.currentImageHash !== hash;
-    // Only reset annotations when the image changes.
+    // Only reset masks when the image changes.
     if (isNewImage) {
-      appState.annotations = [];
+      appState.masks = [];
+      appState.maskContextMenu.open = false;
     }
     appState.currentImageHash = hash;
     if (viewer) {
@@ -571,30 +610,100 @@ function togglePanel(panelName: keyof typeof appState.panelCollapsed): void {
   render();
 }
 
-/** Creates a compact unique ID for a new annotation. */
-function createAnnotationId(): string {
-  return `a-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+/** Creates a compact unique ID for a new mask point. */
+function createMaskId(): string {
+  return `m-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
 }
 
-/** Adds a point annotation and refreshes dependent UI elements only. */
-function addAnnotation(x: number, y: number): void {
-  appState.annotations.push({ id: createAnnotationId(), x, y });
-  updateAnnotationUI();
+/** Returns all label names from a hierarchical label tree in pre-order. */
+function flattenLabelNames(nodes: LabelNode[]): string[] {
+  const out: string[] = [];
+  const walk = (items: LabelNode[]): void => {
+    items.forEach((node) => {
+      const name = node.text.trim();
+      if (name) out.push(name);
+      if (node.children.length > 0) walk(node.children);
+    });
+  };
+  walk(nodes);
+  return out;
 }
 
-/** Removes a single point annotation by identifier. */
-function removeAnnotation(annotationId: string): void {
-  const next = appState.annotations.filter((a) => a.id !== annotationId);
-  if (next.length === appState.annotations.length) {
-    return;
+/** Moves label to front of recent labels while preserving order and uniqueness. */
+function touchRecentLabel(labelName: string): void {
+  const next = [labelName, ...appState.recentLabels.filter((name) => name !== labelName)];
+  appState.recentLabels = next;
+}
+
+/** Returns context-menu labels: recents first, then remaining task labels. */
+function getMaskContextMenuLabels(): string[] {
+  const allLabels = flattenLabelNames(appState.activeLabels);
+  return [...appState.recentLabels, ...allLabels.filter((name) => !appState.recentLabels.includes(name))];
+}
+
+/** Applies a label to a mask and emits assignment logging. */
+function assignLabelToMask(maskId: string, labelName: string): void {
+  const mask = appState.masks.find((m) => m.id === maskId);
+  if (!mask) return;
+  mask.labelName = labelName;
+  touchRecentLabel(labelName);
+  if (appState.currentImageHash) {
+    logEvent("label_assigned", {
+      image_hash: appState.currentImageHash,
+      mask_index: mask.index,
+      label_name: labelName,
+    });
   }
-  appState.annotations = next;
+}
+
+/** Adds a mask point and applies last-used label if available. */
+function addMask(x: number, y: number): void {
+  const nextIndex = appState.masks.reduce((max, mask) => Math.max(max, mask.index), 0) + 1;
+  const mask: MaskPoint = {
+    id: createMaskId(),
+    index: nextIndex,
+    x,
+    y,
+    labelName: appState.recentLabels[0] ?? null,
+  };
+  appState.masks.push(mask);
+  if (appState.currentImageHash) {
+    logEvent("mask_created", {
+      image_hash: appState.currentImageHash,
+      mask_index: mask.index,
+      x: mask.x,
+      y: mask.y,
+    });
+  }
+  if (mask.labelName) {
+    assignLabelToMask(mask.id, mask.labelName);
+  }
   updateAnnotationUI();
 }
 
-/** Clears all point annotations for current image. */
-function clearAnnotations(): void {
-  appState.annotations = [];
+/** Removes one mask by id and emits logging. */
+function removeMask(maskId: string): void {
+  const idx = appState.masks.findIndex((mask) => mask.id === maskId);
+  if (idx === -1) return;
+  const [removed] = appState.masks.splice(idx, 1);
+  if (appState.currentImageHash) {
+    logEvent("mask_removed", {
+      image_hash: appState.currentImageHash,
+      mask_index: removed.index,
+    });
+  }
+  if (appState.maskContextMenu.maskId === maskId) {
+    appState.maskContextMenu.open = false;
+    appState.maskContextMenu.maskId = null;
+  }
+  updateAnnotationUI();
+}
+
+/** Clears all masks for the current image. */
+function clearMasks(): void {
+  appState.masks = [];
+  appState.maskContextMenu.open = false;
+  appState.maskContextMenu.maskId = null;
   updateAnnotationUI();
 }
 
@@ -617,19 +726,44 @@ function renderPanel(
   `;
 }
 
-/** Produces list markup for current annotation points. */
+/** Produces list markup for current masks and assigned labels. */
 function renderAnnotationList(): string {
-  if (appState.annotations.length === 0) {
-    return '<div class="muted">No annotations yet. Click on image to add.</div>';
+  if (appState.masks.length === 0) {
+    return '<div class="muted">No masks yet. Left-click to add, Shift+left-click to remove nearest.</div>';
   }
 
-  const items = appState.annotations
+  const items = appState.masks
     .map(
-      (a, idx) =>
-        `<li>#${idx + 1} (${Math.round(a.x * 100)}%, ${Math.round(a.y * 100)}%) <button type="button" data-action="remove-annotation" data-id="${a.id}">remove</button></li>`
+      (mask) =>
+        `<li>#${mask.index} (${Math.round(mask.x * 100)}%, ${Math.round(mask.y * 100)}%)` +
+        ` <span class="mask-label-chip">${mask.labelName ? mask.labelName.replace(/</g, "&lt;") : "unlabeled"}</span>` +
+        ` <button type="button" data-action="remove-mask" data-id="${mask.id}">remove</button></li>`
     )
     .join("");
   return `<ol class="annotation-list">${items}</ol>`;
+}
+
+/** Renders the mask label-assignment context menu. */
+function renderMaskContextMenu(): string {
+  if (!appState.maskContextMenu.open || !appState.maskContextMenu.maskId) return "";
+  const labels = getMaskContextMenuLabels();
+  if (labels.length === 0) {
+    return `
+      <div class="mask-context-menu" style="left:${appState.maskContextMenu.clientX}px;top:${appState.maskContextMenu.clientY}px;">
+        <div class="mask-context-menu__empty">No labels</div>
+      </div>
+    `;
+  }
+  const items = labels
+    .map((label) =>
+      `<button type="button" class="mask-context-menu__item" data-action="assign-mask-label" data-label="${label.replace(/"/g, "&quot;")}">${label.replace(/</g, "&lt;")}</button>`
+    )
+    .join("");
+  return `
+    <div class="mask-context-menu" style="left:${appState.maskContextMenu.clientX}px;top:${appState.maskContextMenu.clientY}px;">
+      ${items}
+    </div>
+  `;
 }
 
 /** Re-renders annotation panel body and redraws WebGL annotations only. */
@@ -638,7 +772,7 @@ function updateAnnotationUI(): void {
     '[data-panel="annotations"] .panel__body'
   );
   if (annotationsPanelBody) {
-    annotationsPanelBody.innerHTML = `${renderAnnotationList()}<button type="button" data-action="clear-annotations">clear annotations</button>`;
+    annotationsPanelBody.innerHTML = `${renderAnnotationList()}<button type="button" data-action="clear-annotations">clear masks</button>`;
     bindAnnotationPanelHandlers();
   }
   viewer?.draw();
@@ -647,17 +781,40 @@ function updateAnnotationUI(): void {
 /** Wires annotation list action buttons after panel-body updates. */
 function bindAnnotationPanelHandlers(): void {
   const clearBtn = appRoot.querySelector<HTMLButtonElement>('button[data-action="clear-annotations"]');
-  clearBtn?.addEventListener("click", clearAnnotations);
+  clearBtn?.addEventListener("click", clearMasks);
 
-  const removeButtons = appRoot.querySelectorAll<HTMLButtonElement>('button[data-action="remove-annotation"]');
+  const removeButtons = appRoot.querySelectorAll<HTMLButtonElement>('button[data-action="remove-mask"]');
   removeButtons.forEach((btn) => {
     btn.addEventListener("click", () => {
       const id = btn.getAttribute("data-id");
       if (id) {
-        removeAnnotation(id);
+        removeMask(id);
       }
     });
   });
+}
+
+/** Binds handlers for the floating mask context menu. */
+function bindMaskContextMenuHandlers(): void {
+  appRoot.querySelectorAll<HTMLButtonElement>('button[data-action="assign-mask-label"]').forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const labelName = btn.getAttribute("data-label");
+      const maskId = appState.maskContextMenu.maskId;
+      if (!labelName || !maskId) return;
+      assignLabelToMask(maskId, labelName);
+      appState.maskContextMenu.open = false;
+      appState.maskContextMenu.maskId = null;
+      render();
+    });
+  });
+  if (!appState.maskContextMenu.open) return;
+  document.addEventListener("click", (event) => {
+    const target = event.target as Element | null;
+    if (target?.closest(".mask-context-menu")) return;
+    appState.maskContextMenu.open = false;
+    appState.maskContextMenu.maskId = null;
+    render();
+  }, { once: true });
 }
 
 /** Produces the optics panel body HTML with sliders and transform toggles. */
@@ -817,16 +974,16 @@ function loadImage(url: string): Promise<HTMLImageElement> {
   });
 }
 
-/** WebGL tile viewer that renders tiles and annotation points into one canvas. */
+/** WebGL tile viewer that renders tiles and mask points into one canvas. */
 class WebGLTileViewer {
   /** Drawing canvas. */
   private readonly canvas: HTMLCanvasElement;
   /** Current WebGL context. */
   private readonly gl: WebGLRenderingContext;
-  /** Access to current annotation array. */
-  private readonly getAnnotations: () => AnnotationPoint[];
-  /** Callback for click-to-annotation creation. */
-  private readonly onAddAnnotation: (x: number, y: number) => void;
+  /** Access to current mask array. */
+  private readonly getMasks: () => MaskPoint[];
+  /** Callback for primary/secondary mask interactions from canvas clicks. */
+  private readonly onMaskCanvasClick: (payload: MaskCanvasClick) => void;
 
   /** Manifest for current image. */
   private manifest: TileManifest | null = null;
@@ -925,12 +1082,12 @@ class WebGLTileViewer {
 
   constructor(
     canvas: HTMLCanvasElement,
-    getAnnotations: () => AnnotationPoint[],
-    onAddAnnotation: (x: number, y: number) => void
+    getMasks: () => MaskPoint[],
+    onMaskCanvasClick: (payload: MaskCanvasClick) => void
   ) {
     this.canvas = canvas;
-    this.getAnnotations = getAnnotations;
-    this.onAddAnnotation = onAddAnnotation;
+    this.getMasks = getMasks;
+    this.onMaskCanvasClick = onMaskCanvasClick;
 
     const gl = canvas.getContext("webgl", { alpha: false, antialias: true });
     if (!gl) {
@@ -1086,6 +1243,7 @@ class WebGLTileViewer {
       this.windowResizeHandler = null;
     }
     this.canvas.removeEventListener("click", this.handleCanvasClick);
+    this.canvas.removeEventListener("contextmenu", this.handleCanvasContextMenu);
     this.canvas.removeEventListener("wheel", this.handleWheel);
     this.canvas.removeEventListener("pointerdown", this.handlePointerDown);
     this.canvas.removeEventListener("pointermove", this.handlePointerMove);
@@ -1498,19 +1656,19 @@ class WebGLTileViewer {
     return { x, y, width, height };
   }
 
-/** Draws normalized annotation points over image content. */
+/** Draws normalized mask points over image content. */
   private drawAnnotations(): void {
-    const annotations = this.getAnnotations();
-    if (annotations.length === 0) {
+    const masks = this.getMasks();
+    if (masks.length === 0) {
       return;
     }
 
     const gl = this.gl;
-    const points = new Float32Array(annotations.length * 2);
+    const points = new Float32Array(masks.length * 2);
 
-    annotations.forEach((annotation, index) => {
-      const x = this.baseTransform.x + annotation.x * this.baseTransform.width;
-      const y = this.baseTransform.y + annotation.y * this.baseTransform.height;
+    masks.forEach((mask, index) => {
+      const x = this.baseTransform.x + mask.x * this.baseTransform.width;
+      const y = this.baseTransform.y + mask.y * this.baseTransform.height;
       points[index * 2] = (x / this.canvas.clientWidth) * 2 - 1;
       points[index * 2 + 1] = 1 - (y / this.canvas.clientHeight) * 2;
     });
@@ -1527,7 +1685,7 @@ class WebGLTileViewer {
     gl.uniform4f(this.pointColorUniform, 1, 0.44, 0.38, 1);
     gl.uniform1f(this.pointSizeUniform, 10);
 
-    gl.drawArrays(gl.POINTS, 0, annotations.length);
+    gl.drawArrays(gl.POINTS, 0, masks.length);
 
     gl.disable(gl.BLEND);
   }
@@ -1631,11 +1789,29 @@ class WebGLTileViewer {
     return new Float32Array([left, bottom, right, bottom, left, top, right, top]);
   }
 
-  /** Handles canvas click by mapping into normalized image coordinates. */
+  /** Finds the closest mask to a canvas-space point within a CSS-pixel radius. */
+  private findClosestMaskId(px: number, py: number, radiusPx: number): string | null {
+    const maxDistSq = radiusPx * radiusPx;
+    let best: { id: string; distSq: number } | null = null;
+    this.getMasks().forEach((mask) => {
+      const display = this.applyForwardTransformToNormalizedPoint(mask.x, mask.y);
+      const mx = this.transform.x + display.x * this.transform.width;
+      const my = this.transform.y + display.y * this.transform.height;
+      const dx = mx - px;
+      const dy = my - py;
+      const distSq = dx * dx + dy * dy;
+      if (distSq > maxDistSq) return;
+      if (!best || distSq < best.distSq) {
+        best = { id: mask.id, distSq };
+      }
+    });
+    return best?.id ?? null;
+  }
+
+  /** Handles primary-button click by mapping into normalized image coordinates. */
   private readonly handleCanvasClick = (event: MouseEvent): void => {
-    if (this.dragTotalDistance > config.clickMaxDragPx) {
-      return;
-    }
+    if (event.button !== 0) return;
+    if (this.dragTotalDistance > config.clickMaxDragPx) return;
     const bounds = this.canvas.getBoundingClientRect();
     const px = event.clientX - bounds.left;
     const py = event.clientY - bounds.top;
@@ -1652,7 +1828,50 @@ class WebGLTileViewer {
     const displayX = (px - this.transform.x) / this.transform.width;
     const displayY = (py - this.transform.y) / this.transform.height;
     const source = this.applyInverseTransformToNormalizedPoint(displayX, displayY);
-    this.onAddAnnotation(source.x, source.y);
+    this.onMaskCanvasClick({
+      button: "left",
+      canvasX: px,
+      canvasY: py,
+      imageX: source.x,
+      imageY: source.y,
+      shiftKey: event.shiftKey,
+      hitMaskId: this.findClosestMaskId(px, py, 10),
+      clientX: event.clientX,
+      clientY: event.clientY,
+    });
+  };
+
+  /** Handles right-click by mapping into normalized image coordinates and nearest mask hit. */
+  private readonly handleCanvasContextMenu = (event: MouseEvent): void => {
+    event.preventDefault();
+    if (this.dragTotalDistance > config.clickMaxDragPx) return;
+    const bounds = this.canvas.getBoundingClientRect();
+    const px = event.clientX - bounds.left;
+    const py = event.clientY - bounds.top;
+
+    if (
+      px < this.transform.x ||
+      py < this.transform.y ||
+      px > this.transform.x + this.transform.width ||
+      py > this.transform.y + this.transform.height
+    ) {
+      return;
+    }
+
+    const displayX = (px - this.transform.x) / this.transform.width;
+    const displayY = (py - this.transform.y) / this.transform.height;
+    const source = this.applyInverseTransformToNormalizedPoint(displayX, displayY);
+    this.onMaskCanvasClick({
+      button: "right",
+      canvasX: px,
+      canvasY: py,
+      imageX: source.x,
+      imageY: source.y,
+      shiftKey: event.shiftKey,
+      hitMaskId: this.findClosestMaskId(px, py, 10),
+      clientX: event.clientX,
+      clientY: event.clientY,
+    });
   };
 
   /** Returns the effective displayed image dimensions after rotation toggle. */
@@ -1681,6 +1900,25 @@ class WebGLTileViewer {
       const nextY = 1 - tx;
       tx = nextX;
       ty = nextY;
+    }
+    return { x: tx, y: ty };
+  }
+
+  /** Applies active transform to map source-normalized point to display-normalized point. */
+  private applyForwardTransformToNormalizedPoint(x: number, y: number): { x: number; y: number } {
+    let tx = x;
+    let ty = y;
+    if (this.opticsRotate90cw) {
+      const nextX = 1 - ty;
+      const nextY = tx;
+      tx = nextX;
+      ty = nextY;
+    }
+    if (this.opticsFlipH) {
+      tx = 1 - tx;
+    }
+    if (this.opticsFlipV) {
+      ty = 1 - ty;
     }
     return { x: tx, y: ty };
   }
@@ -1795,6 +2033,7 @@ class WebGLTileViewer {
   /** Sets up listeners for click and resize-driven level refit. */
   private setupCanvasListeners(): void {
     this.canvas.addEventListener("click", this.handleCanvasClick);
+    this.canvas.addEventListener("contextmenu", this.handleCanvasContextMenu);
     this.canvas.addEventListener("wheel", this.handleWheel, { passive: false });
     this.canvas.addEventListener("pointerdown", this.handlePointerDown);
     this.canvas.addEventListener("pointermove", this.handlePointerMove);
@@ -1848,8 +2087,39 @@ function mountViewer(): void {
   viewer?.destroy();
   viewer = new WebGLTileViewer(
     canvas,
-    () => appState.annotations,
-    (x, y) => addAnnotation(x, y)
+    () => appState.masks,
+    (payload) => {
+      if (!appState.currentImageHash) return;
+      logEvent("mouse_click", {
+        button: payload.button,
+        canvas_x: payload.canvasX,
+        canvas_y: payload.canvasY,
+        image_x: payload.imageX,
+        image_y: payload.imageY,
+      });
+      if (payload.button === "left") {
+        appState.maskContextMenu.open = false;
+        appState.maskContextMenu.maskId = null;
+        if (payload.shiftKey) {
+          if (payload.hitMaskId) {
+            removeMask(payload.hitMaskId);
+          }
+          return;
+        }
+        addMask(payload.imageX, payload.imageY);
+        return;
+      }
+      if (payload.hitMaskId) {
+        appState.maskContextMenu.open = true;
+        appState.maskContextMenu.clientX = payload.clientX;
+        appState.maskContextMenu.clientY = payload.clientY;
+        appState.maskContextMenu.maskId = payload.hitMaskId;
+      } else {
+        appState.maskContextMenu.open = false;
+        appState.maskContextMenu.maskId = null;
+      }
+      render();
+    }
   );
 
   applyOpticsToViewer();
@@ -2938,7 +3208,8 @@ function bindTasksDialogHandlers(): void {
       appState.imageList = [];
       appState.currentImageIndex = 0;
       appState.currentImageHash = null;
-      appState.annotations = [];
+      appState.masks = [];
+      appState.maskContextMenu.open = false;
 
       appState.tasksDialogOpen = false;
       render();
@@ -3049,7 +3320,7 @@ function render(): void {
           ${renderPanel(
             "annotations",
             "annotations",
-            `${renderAnnotationList()}<button type="button" data-action="clear-annotations">clear annotations</button>`
+            `${renderAnnotationList()}<button type="button" data-action="clear-annotations">clear masks</button>`
           )}
           ${renderPanel(
             "commentAnnotation",
@@ -3071,6 +3342,7 @@ function render(): void {
     <button type="button" class="sidebar-toggle sidebar-toggle--right" data-action="toggle-right" aria-label="Toggle right sidebar">
       ${appState.rightCollapsed ? "<" : ">"}
     </button>
+    ${renderMaskContextMenu()}
     ${renderTasksDialog()}
     ${renderDirBrowserOverlay()}
   `;
@@ -3096,6 +3368,7 @@ function render(): void {
   bindAnnotationPanelHandlers();
   bindOpticsPanelHandlers();
   bindMenuHandlers();
+  bindMaskContextMenuHandlers();
   bindTasksDialogHandlers();
   bindDirBrowserHandlers();
   bindRightSidebarResizeHandle();

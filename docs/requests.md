@@ -30,6 +30,8 @@
 
 - **Optics transform toggles**: The Optics panel exposes three independent toggle controls (R = Rotate 90 CW, H = Horizontal flip, V = Vertical flip). Transforms compose in fixed order R→H→V. `PageUp`/`PageDown` cycles through all 8 transform states from a document-level key handler (except when focus is in `input`/`textarea`/`select`), and cycling updates the checkmarks. Panel-title reset clears all three toggles. (2026-04-06, clarified 2026-04-07)
 
+- **Masks and annotations**: Point masks placed by left-click, removed by shift+left-click (closest within hit radius). Crosshair cursor on image view. Right-click within 10px of a mask opens context menu with recent labels; clicking assigns label to mask. Last assigned label auto-assigned to next mask. Logged to backend over WS (`mask_created`, `mask_removed`, `label_assigned`, `mouse_click`). Persistence deferred. (2026-04-07)
+
 - **Menu bar restructure**: Left and right sidebar toggles are always-visible fixed buttons. The hamburger + menu items form a middle section that is invisible and `pointer-events: none` when closed (mouse events pass through to canvas). Hamburger moves inside the menu bar middle section. (2026-04-07)
 
 - **GUI cleanup**: Remove `<strong>` label text from both sidebar headers; remove `div.image-view__toolbar` entirely; fix hamburger/left-sidebar-toggle collision by moving hamburger to `left: 52px`. (2026-04-07)
