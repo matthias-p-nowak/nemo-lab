@@ -52,14 +52,15 @@ body {
 }
 
 .layout {
+  --sidebar-right-width: 320px;
   display: grid;
-  grid-template-columns: 240px minmax(0, 1fr) 320px;
+  grid-template-columns: 240px minmax(0, 1fr) var(--sidebar-right-width);
   width: 100%;
   height: 100%;
 }
 
 .layout.left-collapsed {
-  grid-template-columns: 48px minmax(0, 1fr) 320px;
+  grid-template-columns: 48px minmax(0, 1fr) var(--sidebar-right-width);
 }
 
 .layout.right-collapsed {
@@ -79,9 +80,24 @@ body {
 }
 
 .sidebar--right {
+  position: relative;
   border-right: none;
   border-left: 1px solid var(--line);
   background: var(--bg-panel-alt);
+}
+
+.sidebar__resize-handle {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  cursor: ew-resize;
+  z-index: 3;
+}
+
+.layout.right-collapsed .sidebar--right .sidebar__resize-handle {
+  display: none;
 }
 
 .sidebar__header {
@@ -97,15 +113,14 @@ body {
 .sidebar__content {
   display: flex;
   flex-direction: column;
+  flex: 1;
   gap: 8px;
   padding: 10px;
-  overflow: auto;
+  overflow-y: auto;
 }
 
 .layout.left-collapsed .sidebar--left .sidebar__content,
-.layout.right-collapsed .sidebar--right .sidebar__content,
-.layout.left-collapsed .sidebar--left .sidebar__header strong,
-.layout.right-collapsed .sidebar--right .sidebar__header strong {
+.layout.right-collapsed .sidebar--right .sidebar__content {
   display: none;
 }
 
@@ -127,12 +142,6 @@ button:hover {
   background: var(--button-bg-hover);
 }
 
-button.ghost {
-  width: 28px;
-  height: 28px;
-  padding: 0;
-}
-
 .meta,
 .muted {
   color: var(--text-muted);
@@ -145,21 +154,6 @@ button.ghost {
   min-width: 0;
   min-height: 0;
   background: var(--bg);
-}
-
-.image-view__toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 10px 14px;
-  border-bottom: 1px solid var(--line);
-  background: var(--bg-toolbar);
-}
-
-.image-view__toolbar span {
-  color: var(--text-muted);
-  font-size: 0.9rem;
 }
 
 .image-view__canvas-wrap {
@@ -176,12 +170,8 @@ button.ghost {
   border: 1px solid var(--line);
   border-radius: 6px;
   touch-action: none;
-  cursor: grab;
+  cursor: crosshair;
   background: #11161b;
-
-  &:active {
-    cursor: grabbing;
-  }
 }
 
 .image-view__canvas--zoom-below-max {
@@ -196,23 +186,6 @@ button.ghost {
   border-color: #fbc02d;
 }
 
-.annotation-overlay {
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-}
-
-.annotation-dot {
-  position: absolute;
-  width: 10px;
-  height: 10px;
-  background: var(--accent-dot);
-  border: 2px solid #fff;
-  border-radius: 50%;
-  transform: translate(-50%, -50%);
-  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.35);
-}
-
 .panels {
   gap: 10px;
 }
@@ -220,22 +193,7 @@ button.ghost {
 .panel {
   border: 1px solid var(--line);
   border-radius: 8px;
-  overflow: hidden;
   background: var(--bg-panel);
-}
-
-.panel__header {
-  width: 100%;
-  border: none;
-  border-bottom: 1px solid var(--line);
-  border-radius: 0;
-  padding: 8px 10px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  text-transform: lowercase;
-  font-weight: 600;
-  background: var(--bg-toolbar);
 }
 
 .panel__body {
@@ -245,8 +203,13 @@ button.ghost {
   gap: 8px;
 }
 
-.panel.is-collapsed .panel__body {
-  display: none;
+.panel[data-panel="optics"] {
+  margin-top: 36px;
+}
+
+.optics-reset-row {
+  display: flex;
+  justify-content: flex-end;
 }
 
 .optics-row {
@@ -273,9 +236,53 @@ button.ghost {
 
 .annotation-list {
   margin: 0;
-  padding-left: 22px;
+  padding: 0;
+  list-style: none;
   max-height: 120px;
   overflow: auto;
+}
+
+.mask-label-chip {
+  display: inline-block;
+  margin: 0 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--bg-panel-alt);
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+.mask-context-menu {
+  position: fixed;
+  min-width: 180px;
+  max-width: 280px;
+  background: var(--bg-panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+  padding: 4px 0;
+  z-index: 500;
+}
+
+.mask-context-menu__item {
+  width: 100%;
+  border: none;
+  border-radius: 0;
+  background: none;
+  color: var(--text);
+  text-align: left;
+  padding: 8px 12px;
+}
+
+.mask-context-menu__item:hover {
+  background: var(--button-bg);
+}
+
+.mask-context-menu__empty {
+  padding: 8px 12px;
+  color: var(--text-muted);
+  font-size: 0.85rem;
 }
 
 textarea {
@@ -291,10 +298,8 @@ textarea {
 // ── Hamburger ────────────────────────────────────────────────────────────────
 
 .hamburger {
-  position: fixed;
-  top: 10px;
-  left: 10px;
-  z-index: 200;
+  position: static;
+  pointer-events: auto;
   background: none;
   border: none;
   cursor: pointer;
@@ -313,29 +318,39 @@ textarea {
 
 .menu-bar {
   position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 44px;
-  background: var(--bg-toolbar);
-  border-bottom: 1px solid var(--line);
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  pointer-events: none;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  z-index: 200;
+
+  &.menu-bar--open {
+    pointer-events: auto;
+    background: var(--bg-toolbar);
+    border-color: var(--line);
+    padding: 2px 8px;
+  }
+}
+
+.menu-bar__items {
   display: none;
   align-items: center;
   gap: 4px;
-  padding: 0 8px 0 48px;
-  z-index: 100;
+}
 
-  &.menu-bar--open {
-    display: flex;
-  }
+.menu-bar.menu-bar--open .menu-bar__items {
+  display: flex;
 }
 
 .menu-bar__item {
   position: relative;
-
-  &--right {
-    margin-left: auto;
-  }
 
   &--active .menu-bar__dropdown {
     display: block;
@@ -404,6 +419,23 @@ textarea {
 
 .menu-bar__dropdown-btn[aria-checked="true"] .menu-bar__check {
   visibility: visible;
+}
+
+.sidebar-toggle {
+  position: fixed;
+  top: 10px;
+  z-index: 220;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+}
+
+.sidebar-toggle--left {
+  left: 10px;
+}
+
+.sidebar-toggle--right {
+  right: 10px;
 }
 
 // ── Tasks dialog ─────────────────────────────────────────────────────────────
@@ -1025,11 +1057,11 @@ textarea {
 
 @media (max-width: 960px) {
   .layout {
-    grid-template-columns: 180px minmax(0, 1fr) 220px;
+    grid-template-columns: 180px minmax(0, 1fr) var(--sidebar-right-width);
   }
 
   .layout.left-collapsed {
-    grid-template-columns: 40px minmax(0, 1fr) 220px;
+    grid-template-columns: 40px minmax(0, 1fr) var(--sidebar-right-width);
   }
 
   .layout.right-collapsed {

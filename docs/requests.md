@@ -28,4 +28,18 @@
 
 - **Task path directory browser**: In admin mode, browse buttons on task `images` and `annotations` open a directory-browser modal backed by `GET /api/dirs?path=...`; selecting a path applies it to the field and persists via the existing blur/save flow. (2026-04-05)
 
+- **Optics transform toggles**: The Optics panel exposes three independent toggle controls (R = Rotate 90 CW, H = Horizontal flip, V = Vertical flip). Transforms compose in fixed order R→H→V. `PageUp`/`PageDown` cycles through all 8 transform states from a document-level key handler (except when focus is in `input`/`textarea`/`select`), and cycling updates the checkmarks. Panel-title reset clears all three toggles. (2026-04-06, clarified 2026-04-07)
+
+- **Default label selection**: Label panel in right sidebar is a selector — clicking a row sets `activeLabelSelectedId` as the default for new masks. On task load, first leaf label is auto-selected. Label assignment via right-click context menu also updates the selection. (2026-04-07)
+
+- **Masks and annotations**: Point masks placed by left-click, removed by shift+left-click (closest within hit radius). Crosshair cursor on image view. Right-click within 10px of a mask opens context menu with recent labels; clicking assigns label to mask. Last assigned label auto-assigned to next mask. Logged to backend over WS (`mask_created`, `mask_removed`, `label_assigned`, `mouse_click`). Persistence deferred. (2026-04-07)
+
+- **Menu bar restructure**: Left and right sidebar toggles are always-visible fixed buttons. The hamburger + menu items form a middle section that is invisible and `pointer-events: none` when closed (mouse events pass through to canvas). Hamburger moves inside the menu bar middle section. (2026-04-07)
+
+- **GUI cleanup**: Remove `<strong>` label text from both sidebar headers; remove `div.image-view__toolbar` entirely; fix hamburger/left-sidebar-toggle collision by moving hamburger to `left: 52px`. (2026-04-07)
+
+- **Right sidebar resizable**: The right sidebar width is user-resizable via a drag handle on its left edge. Default `320px`, min `200px`. Width is persisted in `user_settings` as `sidebar_right_width`. Layout uses CSS variable `--sidebar-right-width`. Sidebar content scrolls vertically; panels expand to natural height. (2026-04-07)
+
+- **User settings persistence**: UI preferences (theme, sidebar visibility, optics sliders and transform toggles) are persisted per user in a `user_settings` SQLite table (one row per user_id + key, value as string). Exposed via `GET /api/settings` and `PUT /api/settings`. Frontend loads settings on page load and writes each setting immediately on change. Theme is no longer sourced from `nemo.toml`; default is `light`. (2026-04-07)
+
 - **On-demand image list + prefetch tiling**: Backend derives task image lists from `task.images`, computes image hash as SHA-256 of canonical absolute file path, pushes `image_list` over WS, and handles `prefetch`/`image_ready` flow. `/images/{hash}/manifest.json` and `/images/{hash}/tiles/{z}/{x}_{y}.png` are cache-only HTTP reads; tile generation happens via WS prefetch processing. (2026-04-05)

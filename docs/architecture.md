@@ -5,6 +5,7 @@
 - `backend/cmd/server/main.go` loads config from `nemo.toml`, opens SQLite, syncs `users.is_admin` from config admins, configures tile cache service, registers routes, wraps all routes with auth middleware, and starts the HTTP server.
 - Routes:
   - `/api/me` handled by `backend/cmd/server/main.go` and returns `username` + `is_admin` for the authenticated user.
+  - `/api/settings` handled by `backend/cmd/server/main.go` for per-user UI settings load/save.
   - `/api/tasks` handled by task handlers in `backend/cmd/server/main.go` backed by `backend/tasks`.
   - `/ws` handled by `backend/ws`.
   - `/images/` handled by `backend/tiles` for tile-manifest and tile-PNG requests, with static fallback to `images/` for other paths.
@@ -39,10 +40,11 @@
 - Schema includes:
   - `schema_version(version INTEGER NOT NULL)` single-row version tracking.
   - `users(id, username UNIQUE, password, is_admin)`.
+  - `user_settings(user_id, key, value)` with composite primary key `(user_id, key)`.
   - `tasks(id, ord, description, status, images, annotations, checkmark, comment)`.
   - `task_tags(task_id, ord, tag)` with `ON DELETE CASCADE` to `tasks`.
   - `task_labels(id, task_id, parent_id, ord, text)` with cascading delete for task and label subtree removal.
-- Current schema version is `2`; newer DB versions are rejected.
+- Current schema version is `3`; newer DB versions are rejected.
 - On DB open, SQLite pragmas enable WAL mode and foreign-key enforcement.
 
 ## Authentication
@@ -88,6 +90,8 @@
 - `tasks.ReplaceTags` and `tasks.ReplaceLabels` run in explicit transactions and replace complete sets.
 - Route behavior in `backend/cmd/server/main.go`:
   - `GET /api/me`: returns authenticated username and admin flag from `users.is_admin`.
+  - `GET /api/settings`: returns `{ key: value }` for current user from `user_settings`.
+  - `PUT /api/settings`: upserts each provided key/value for current user in `user_settings`.
   - `GET /api/tasks`: list all tasks for any authenticated user (returns `[]` when empty, never `null`).
   - `GET /api/dirs?path=...`: returns `{ dirs: [...] }` containing immediate child directory names; returns empty list for non-existent paths or non-directory paths.
   - `PUT /api/tasks/{id}`: upsert task; non-admin path loads existing row and applies only `status` and `comment`.
@@ -120,6 +124,16 @@
   - supports parent (`..`) navigation
   - writes selected path into the corresponding input and reuses existing save-on-blur behavior
 
+## Frontend user settings
+
+- Implemented in `frontend/src/main.ts`.
+- On startup, frontend fetches `GET /api/settings`, applies theme/sidebar/optics settings, then performs first `render()`.
+- UI changes immediately persist via `PUT /api/settings`:
+  - theme menu selection (`theme`)
+  - sidebar visibility toggles (`sidebar_left`, `sidebar_right`)
+  - right sidebar drag width (`sidebar_right_width`)
+  - optics sliders and transform toggles (`optics_*` keys)
+
 ## Frontend image viewer
 
 - Implemented in `frontend/src/main.ts` (`WebGLTileViewer`).
@@ -127,7 +141,7 @@
 - Previous/next navigation updates the current index and sends a new `prefetch` window; image display waits for backend `image_ready`.
 - On `image_ready`, frontend loads viewer manifests/tiles using hash-based URLs (`/images/{hash}/manifest.json` + manifest tile template).
 - Viewer state now tracks `zoom`, `offsetX`, and `offsetY` for interactive navigation.
-- Initial image load sets pan/zoom to centered fit (`fitScaleForDimensions(manifest.width, manifest.height)`) and renders immediately.
+- Initial image load sets pan/zoom to centered fit using rotation-aware displayed dimensions (swaps width/height when 90° rotate is active) and renders immediately.
 - Wheel and pointer behavior:
   - `Ctrl+wheel` zooms around cursor.
   - Wheel pans vertically; `Shift+wheel` pans horizontally.
@@ -137,10 +151,15 @@
 - Tile level selection (`pickFitLevel`) is based on current zoomed image target (`zoom * manifest dimension * dpr`), and `maybeChangeFitLevel()` reloads tiles when level changes.
 - Fit-level tile streaming uses a monotonic load-batch generation token so stale async tile callbacks are ignored, including revisits to the same level after intermediate zoom changes.
 - Fit-level tile requests are viewport-culled: only tiles whose level-space rectangle intersects the current viewport are fetched.
+- Optics R/H/V transform rendering uses a shared GPU `mat3` path in vertex shaders (tile program and point program). The matrix is recomputed from current optics state and image center in NDC (`T(c) * M * T(-c)`) and uploaded for draw passes.
+- Tile draw UV coordinates remain fixed (`[0,0, 1,0, 0,1, 1,1]`); transform behavior is applied in vertex space.
+- Culling remains JS-side and uses inverse-viewport mapping into source-normalized space, so CPU culling and GPU placement stay mathematically aligned.
+- Mask points are positioned from image-normalized coordinates into base NDC geometry, then transformed by the same vertex `mat3` used for tiles.
 - After wheel zoom/pan and drag-pan movement, fit-level loading is re-evaluated so newly revealed visible tiles are requested even when the selected level does not change.
 - Resize handling clamps pan/zoom, redraws, and re-evaluates fit level.
-- Canvas interaction styling is in `frontend/src/main.scss` with `touch-action: none` and grab/grabbing cursors.
+- Canvas interaction styling is in `frontend/src/main.scss` with `touch-action: none` and crosshair cursor.
 - Viewer input handlers emit telemetry with module-level `logEvent(...)` over the shared WebSocket.
-- Logged frontend events: `image_change` and document `focus` (`focusin`/`focusout`).
-- Canvas click adds an annotation only if total pointer travel since `pointerdown` is ≤ `config.clickMaxDragPx` (default 10 CSS px); longer drags are treated as pan gestures and suppressed.
+- `PageUp`/`PageDown` optics transform cycling is bound once at module init on `document` keydown so it works independent of canvas focus across rerenders; handler ignores editable targets (`INPUT`, `TEXTAREA`, `SELECT`, contenteditable) and calls `preventDefault()` to suppress browser page scroll.
+- Logged frontend events include `image_change`, document `focus` (`focusin`/`focusout`), and temporary mask interaction events (`mouse_click`, `mask_created`, `mask_removed`, `label_assigned`).
+- Canvas left-click adds a mask point only if total pointer travel since `pointerdown` is ≤ `config.clickMaxDragPx` (default 10 CSS px); longer drags are treated as pan gestures and suppressed. `Shift+left-click` removes nearest mask within 10 CSS px. Right-click near a mask opens a floating label assignment menu.
 - The canvas border color indicates viewer readiness/zoom resolution: yellow while the selected image is not yet ready in the viewer, green when `fitLevel < manifest.levels - 1` (below max tile resolution), and brown when at the finest level. Updated via CSS classes toggled on the canvas element. The yellow debug box-shadow is removed.

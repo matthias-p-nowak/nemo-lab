@@ -187,7 +187,7 @@ CREATE TABLE users (
 
 - Left collapsible sidebar: previous / next image buttons
 - Center image view: single WebGL canvas fills the area
-- Right collapsible sidebar: collapsible panels — [Optics](#optics-panel), masks, labels, annotations, comment/annotation, comment/picture
+- Right collapsible sidebar: collapsible panels — [Optics](#optics-panel), masks, labels, annotations, comment/annotation, comment/picture. Width is user-resizable (drag left edge); see [Right Sidebar](#right-sidebar).
 
 ### Menu Bar
 
@@ -277,6 +277,24 @@ Collapsible panel in the right sidebar. Contains three sliders:
 - Clicking the panel title resets all three values to their defaults.
 - Labels, sliders, and numeric values are aligned in a three-column grid (label | slider | value).
 
+#### Transform toggles
+
+Three checkmark controls below the sliders, laid out in the same column grid (checkmark | label):
+
+| Control           | Label             |
+|-------------------|-------------------|
+| R                 | Rotate 90 CW      |
+| H                 | Horizontal flip   |
+| V                 | Vertical flip     |
+
+- Each control is an independent toggle.
+- Transforms are applied in fixed order: R first, then H, then V. The 3-bit state `(R, H, V)` fully describes the active transform (e.g. `100` = rotate only, `010` = H-flip only, `011` = H+V = rotate 180).
+- `PageUp`/`PageDown` cycles this exact sequence from a document-level handler (except when focus is in `input`/`textarea`/`select`):
+  - normal (`000`) → rotate 90 CW (`100`) → rotate 180 (`011`) → rotate 270 (`111`) → horizontal flip (`010`) → horizontal flip + rotate 90 (`110`) → horizontal flip + rotate 180 (`001`) → horizontal flip + rotate 270 (`101`).
+- Cycling wraps at both ends.
+- Keyboard cycling updates the R/H/V checkmarks to match the active state.
+- Clicking the panel title reset also resets R/H/V to off (`000`).
+
 ### Image Viewer
 
 - Single WebGL canvas fills the center image-view area
@@ -324,8 +342,109 @@ Only tiles whose image-space rectangle intersects the current viewport are fetch
 - When a tile texture is uploaded and placed, log a `tile_placed` event with: level, tile coordinates (`tx`, `ty`), and canvas position (`x`, `y`, `width`, `height` in CSS pixels)
 - Purpose: diagnose tile jump/flicker bugs by correlating placement position with zoom/pan state at that moment
 
+### User Settings
+
+Certain UI preferences are persisted per user in the backend and restored on next login.
+
+**Persisted settings:**
+
+| Key                   | Values / type        | Description                        |
+|-----------------------|----------------------|------------------------------------|
+| `theme`               | `light` \| `dark`    | Active color theme                 |
+| `sidebar_left`        | `visible` \| `hidden`| Left sidebar collapsed/expanded    |
+| `sidebar_right`       | `visible` \| `hidden`| Right sidebar collapsed/expanded   |
+| `optics_gamma`        | float string         | Gamma correction slider value      |
+| `optics_brightness_mul` | float string       | Brightness multiply slider value   |
+| `optics_brightness_add` | float string       | Brightness additive slider value   |
+| `optics_rotate90cw`   | `0` \| `1`           | R transform toggle state           |
+| `optics_flip_h`       | `0` \| `1`           | H transform toggle state           |
+| `optics_flip_v`       | `0` \| `1`           | V transform toggle state           |
+| `sidebar_right_width` | integer string (px)  | Right sidebar width in CSS pixels  |
+
+**Storage:** `user_settings` SQLite table — one row per (user_id, key). Values stored as strings.
+
+**API:**
+- `GET /api/settings` — returns all settings for the authenticated user as a flat JSON object `{ key: value, ... }`.
+- `PUT /api/settings` — accepts a flat JSON object; upserts each key for the authenticated user.
+
+**Behavior:**
+- On login/page load, frontend fetches `GET /api/settings` and applies each setting before first render.
+- Each setting is written via `PUT /api/settings` immediately when it changes in the UI.
+- `theme` is no longer sourced from `nemo.toml`; the server-side default is `light` when no setting exists.
+
+### GUI Cleanup
+
+- Both sidebar headers (`sidebar--left` and `sidebar--right`) have no label text — the header retains only the toggle button.
+- `div.image-view__toolbar` is removed entirely from the layout.
+- The "Masks" panel in the right sidebar is removed.
+- Panels have no headers — `renderPanel` emits only a `panel__body`, no title bar.
+- The optics panel has a top margin (`36px`) to clear the right sidebar collapse/expand button, and a small "reset" button aligned to the bottom-right of the panel body.
+
+### Menu Bar
+
+The menu bar is restructured so that sidebar toggle buttons are always visible and the menu content is invisible and non-interactive when closed:
+
+- The left-sidebar toggle button and right-sidebar toggle button are **always visible**, fixed-positioned in the top corners (left and right respectively), independent of menu open state.
+- The hamburger button is **always visible**, fixed-positioned between the two sidebar toggles.
+- Only the menu items (Tasks, Views, Help) and the bar background/border toggle:
+  - **Closed**: invisible and `pointer-events: none` — mouse events pass through to the canvas below.
+  - **Open**: visible, fully interactive, with background and border.
+- No overlap between any of these controls.
+
+### Right Sidebar
+
+- Width is user-resizable via a drag handle on the left edge of the sidebar.
+- Default width: `320px`. Minimum width: `200px`. No maximum enforced.
+- Width is persisted in `user_settings` as `sidebar_right_width` (integer string, CSS pixels). Loaded on page load; written on drag end.
+- The layout uses a CSS variable `--sidebar-right-width` (default `320px`) in `grid-template-columns` instead of a hardcoded value.
+- A `<div class="sidebar__resize-handle">` as the first child of `.sidebar--right` acts as the drag target (`cursor: ew-resize`, `width: 4px`, absolutely positioned on the left edge).
+- On `pointerdown` on the handle, `pointermove` updates `--sidebar-right-width` = `document.body.clientWidth − event.clientX`, clamped to min `200px`; `pointerup` persists the value.
+- `.sidebar__content` has `flex: 1` and `overflow-y: auto` so panels scroll vertically and are never clipped.
+- Each `.panel` expands to its natural content height — no fixed or max height on `.panel` or `.panel__body`.
+
+### Masks
+
+A mask is a geometric figure placed on the image canvas. Currently only point masks are supported; rectangle and freehand are future extensions.
+
+- Masks are numbered sequentially (1, 2, 3, …) per image.
+- The image view cursor is a **crosshair** at all times.
+- **Left-click**: places a point mask at the cursor position.
+- **Shift+left-click**: removes the closest existing mask (if any within a reasonable hit radius).
+- Masks are rendered in the WebGL pass on top of image tiles — no overlay div.
+
+### Labels
+
+- A hierarchical system of categories, each identified by name.
+- The label tree is per-task (already modeled in `task_labels`).
+
+### Default Label
+
+The label panel in the right sidebar (read-only view) doubles as a label selector:
+
+- Exactly one label is selected at all times when the active task has labels. `appState.activeLabelSelectedId` is the source of truth.
+- On task activation: auto-select the first leaf label in the tree (depth-first). If the task has no labels, `activeLabelSelectedId` is `null`.
+- Clicking any `label-tree__row` in the sidebar sets that label as selected (`activeLabelSelectedId`) and re-renders the label panel to reflect the new selection.
+- The selected label is the default label auto-assigned to newly placed masks (replaces the `recentLabels[0]` fallback in `addMask`).
+- When a label is assigned to a mask via right-click context menu, `activeLabelSelectedId` is updated to that label and the label panel re-renders to reflect the new selection.
+
 ### Annotations
 
-- Drawn in the same WebGL render pass on top of image tiles — no overlay div
-- Click on canvas → convert to image coordinates → add annotation point → redraw
-- Removing a dot: update annotation list, redraw — no image reload
+An annotation is the assignment of a label to a mask.
+
+- **Right-click** within 10 CSS px of a mask opens a context menu:
+  - Lists recently used labels, most recent on top.
+  - Clicking a list item assigns that label to the mask.
+- The **last assigned label** is the default for the next placed mask (auto-assigned on placement).
+
+### Annotation Logging (temporary)
+
+Until persistence is implemented, the frontend logs the following events to the backend over WebSocket:
+
+| Event | Payload fields |
+|---|---|
+| `mask_created` | image hash, mask index, image-normalized `x`, `y` |
+| `mask_removed` | image hash, mask index |
+| `label_assigned` | image hash, mask index, label name |
+| `mouse_click` | button (`left`\|`right`), canvas `x`, `y`, image-normalized `x`, `y` |
+
+> Persistence of masks and annotations to `nemolab.json` or DB is out of scope for this task.

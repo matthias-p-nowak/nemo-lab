@@ -8,7 +8,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const currentSchemaVersion = 2
+const currentSchemaVersion = 3
 
 // Open opens the sqlite database and ensures schema is initialized/migrated.
 func Open(path string) (*sql.DB, error) {
@@ -97,6 +97,16 @@ func initialize(db *sql.DB) error {
 	`); err != nil {
 		return err
 	}
+	if _, err = tx.Exec(`
+		CREATE TABLE IF NOT EXISTS user_settings (
+			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			key     TEXT    NOT NULL,
+			value   TEXT    NOT NULL,
+			PRIMARY KEY (user_id, key)
+		);
+	`); err != nil {
+		return err
+	}
 
 	var version int
 	queryErr := tx.QueryRow("SELECT version FROM schema_version LIMIT 1").Scan(&version)
@@ -135,6 +145,21 @@ func migrate(tx *sql.Tx, from, to int) error {
 				return err
 			}
 			version = 2
+		case 2:
+			if _, err := tx.Exec(`
+				CREATE TABLE IF NOT EXISTS user_settings (
+					user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+					key     TEXT    NOT NULL,
+					value   TEXT    NOT NULL,
+					PRIMARY KEY (user_id, key)
+				);
+			`); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`UPDATE schema_version SET version = 3`); err != nil {
+				return err
+			}
+			version = 3
 		default:
 			return fmt.Errorf("no migration available from version %d", version)
 		}

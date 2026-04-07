@@ -11,7 +11,6 @@ const (
 	defaultCacheMB     = int64(512)
 	defaultCacheEvict  = "5m"
 	defaultTileWorkers = 4
-	defaultTheme       = "dark"
 )
 
 // Config contains runtime configuration loaded from TOML.
@@ -25,7 +24,6 @@ type Config struct {
 	CacheLimitMB       int64    `toml:"cache_limit_mb"`
 	CacheEvictInterval string   `toml:"cache_evict_interval"`
 	TileWorkers        int      `toml:"tile_workers"`
-	Theme              string   `toml:"theme"`
 }
 
 // Load reads a TOML config file and applies defaults.
@@ -40,7 +38,6 @@ func Load(path string) (*Config, error) {
 		CacheLimitMB:       defaultCacheMB,
 		CacheEvictInterval: defaultCacheEvict,
 		TileWorkers:        defaultTileWorkers,
-		Theme:              defaultTheme,
 	}
 
 	if _, err := toml.DecodeFile(path, cfg); err != nil {
@@ -73,9 +70,6 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.TileWorkers <= 0 {
 		cfg.TileWorkers = defaultTileWorkers
-	}
-	if cfg.Theme != "light" && cfg.Theme != "dark" {
-		cfg.Theme = defaultTheme
 	}
 
 	return cfg, nil

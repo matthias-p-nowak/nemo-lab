@@ -4,27 +4,32 @@ const config = {
   clickMaxDragPx: 10,
 };
 
-/** Applies a theme by setting data-theme on <html> and persisting to localStorage. */
+/** Applies a theme by setting data-theme on <html>. */
 function applyTheme(theme: string): void {
   document.documentElement.setAttribute("data-theme", theme);
-  localStorage.setItem("nemo_theme", theme);
 }
 
-// Initialise theme: localStorage preference takes priority, then server default.
-(async () => {
-  const stored = localStorage.getItem("nemo_theme");
-  if (stored === "light" || stored === "dark") {
-    applyTheme(stored);
-  } else {
-    try {
-      const res = await fetch("/api/config");
-      const data = (await res.json()) as { theme?: string };
-      applyTheme(data.theme === "light" ? "light" : "dark");
-    } catch {
-      applyTheme("dark");
-    }
+type SettingsMap = Record<string, string>;
+
+/** Persists one or more user settings for the current user. */
+async function persistSettingsPatch(patch: SettingsMap): Promise<void> {
+  const response = await fetch("/api/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  if (!response.ok) {
+    throw new Error(`PUT /api/settings failed: ${response.status}`);
   }
-})();
+}
+
+/** Persists one user setting in the background and logs failures. */
+function persistSettingLater(key: string, value: string): void {
+  void persistSettingsPatch({ [key]: value }).catch((err) => {
+    console.error("settings: persist failed", key, err);
+    logEvent("settings_error", { op: "put", key, error: String(err) });
+  });
+}
 
 /** WebSocket endpoint for backend events. */
 const ws = new WebSocket(`ws://${location.host}/ws`);
@@ -52,6 +57,39 @@ document.addEventListener("focusout", (e) =>
   logEvent("focus", { action: "out", target: (e.target as Element | null)?.tagName ?? "unknown" })
 );
 
+/** Global PageUp/PageDown handler guard for editable targets. */
+function isEditableKeyTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  const tag = target.tagName;
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target.isContentEditable;
+}
+
+/** Handles document-level optics transform cycling hotkeys. */
+function handleDocumentPageCycleKeydown(e: KeyboardEvent): void {
+  if (e.key !== "PageUp" && e.key !== "PageDown") return;
+  if (isEditableKeyTarget(e.target)) return;
+  e.preventDefault();
+  cycleOpticsTransform(e.key === "PageUp" ? 1 : -1);
+}
+
+/** Closes the floating mask label context menu. */
+function closeMaskContextMenu(): void {
+  appState.maskContextMenu.open = false;
+  appState.maskContextMenu.maskId = null;
+}
+
+/** Handles Escape for closing mask context menu (guarded, global listener). */
+function handleDocumentMaskMenuEscape(e: KeyboardEvent): void {
+  if (e.key !== "Escape") return;
+  if (!appState.maskContextMenu.open) return;
+  e.preventDefault();
+  closeMaskContextMenu();
+  render();
+}
+
+document.addEventListener("keydown", handleDocumentPageCycleKeydown);
+document.addEventListener("keydown", handleDocumentMaskMenuEscape);
+
 /** Mutable prototype application state. */
 const appState = {
   currentImageIndex: 0,
@@ -59,15 +97,21 @@ const appState = {
   currentImageHash: null as string | null,
   leftCollapsed: false,
   rightCollapsed: false,
-  panelCollapsed: {
-    optics: false,
-    masks: false,
-    labels: false,
-    annotations: false,
-    commentAnnotation: false,
-    commentPicture: false,
+  rightSidebarWidth: 320,
+  masks: [] as MaskPoint[],
+  /** Recently assigned labels, most recent first. */
+  recentLabels: [] as string[],
+  /** Context menu state for right-click label assignment on masks. */
+  maskContextMenu: {
+    open: false,
+    clientX: 0,
+    clientY: 0,
+    maskId: null as string | null,
   },
-  annotations: [] as AnnotationPoint[],
+  /** Label tree of the currently active task, shown in the right sidebar. */
+  activeLabels: [] as LabelNode[],
+  /** Selected label id in the active task's label tree. */
+  activeLabelSelectedId: null as string | null,
   /** Whether the top menu bar is visible. */
   menuOpen: false,
   /** Whether the Tasks modal is open. */
@@ -138,8 +182,104 @@ const appState = {
     multiply: 1.0,
     /** Additive brightness offset in [0,1] space (-100..100 maps to -100/255..100/255). */
     add: 0.0,
+    /** Rotate the view 90 degrees clockwise when true. */
+    rotate90cw: false,
+    /** Flip the view horizontally when true. */
+    flipH: false,
+    /** Flip the view vertically when true. */
+    flipV: false,
   },
 };
+
+/** Parses a persisted float string with fallback. */
+function parseSettingFloat(value: string | undefined, fallback: number): number {
+  if (value === undefined) return fallback;
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+/** Parses a persisted bool string with fallback. */
+function parseSettingBool(value: string | undefined, fallback: boolean): boolean {
+  if (value === undefined) return fallback;
+  return value === "true";
+}
+
+/** Parses a persisted integer string with fallback. */
+function parseSettingInt(value: string | undefined, fallback: number): number {
+  if (value === undefined) return fallback;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+/** Fetches settings and applies them to app state before first render. */
+async function loadSettingsOnStartup(): Promise<void> {
+  applyTheme("light");
+  try {
+    const response = await fetch("/api/settings");
+    if (!response.ok) {
+      throw new Error(`GET /api/settings failed: ${response.status}`);
+    }
+    const settings = (await response.json()) as Record<string, unknown>;
+    const get = (key: string): string | undefined => {
+      const value = settings[key];
+      return typeof value === "string" ? value : undefined;
+    };
+    applyTheme(get("theme") === "dark" ? "dark" : "light");
+    appState.leftCollapsed = get("sidebar_left") === "hidden";
+    appState.rightCollapsed = get("sidebar_right") === "hidden";
+    appState.rightSidebarWidth = Math.max(200, parseSettingInt(get("sidebar_right_width"), appState.rightSidebarWidth));
+    appState.optics.gamma = parseSettingFloat(get("optics_gamma"), appState.optics.gamma);
+    appState.optics.multiply = parseSettingFloat(get("optics_brightness_mul"), appState.optics.multiply);
+    appState.optics.add = parseSettingFloat(get("optics_brightness_add"), appState.optics.add);
+    appState.optics.rotate90cw = parseSettingBool(get("optics_rotate90cw"), appState.optics.rotate90cw);
+    appState.optics.flipH = parseSettingBool(get("optics_flip_h"), appState.optics.flipH);
+    appState.optics.flipV = parseSettingBool(get("optics_flip_v"), appState.optics.flipV);
+  } catch (err) {
+    console.error("settings: load failed", err);
+    logEvent("settings_error", { op: "get", error: String(err) });
+  }
+}
+
+/** Persists all optics-related settings in one request. */
+function persistOpticsSettingsLater(): void {
+  void persistSettingsPatch({
+    optics_gamma: String(appState.optics.gamma),
+    optics_brightness_mul: String(appState.optics.multiply),
+    optics_brightness_add: String(appState.optics.add),
+    optics_rotate90cw: String(appState.optics.rotate90cw),
+    optics_flip_h: String(appState.optics.flipH),
+    optics_flip_v: String(appState.optics.flipV),
+  }).catch((err) => {
+    console.error("settings: persist optics failed", err);
+    logEvent("settings_error", { op: "put", key: "optics", error: String(err) });
+  });
+}
+
+const OPTICS_TRANSFORM_SEQUENCE: Array<{
+  rotate90cw: boolean;
+  flipH: boolean;
+  flipV: boolean;
+}> = [
+  { rotate90cw: false, flipH: false, flipV: false }, // 000
+  { rotate90cw: true,  flipH: false, flipV: false }, // 100
+  { rotate90cw: false, flipH: true,  flipV: true  }, // 011
+  { rotate90cw: true,  flipH: true,  flipV: true  }, // 111
+  { rotate90cw: false, flipH: true,  flipV: false }, // 010
+  { rotate90cw: true,  flipH: true,  flipV: false }, // 110
+  { rotate90cw: false, flipH: false, flipV: true  }, // 001
+  { rotate90cw: true,  flipH: false, flipV: true  }, // 101
+];
+
+const PURE_TRANSFORM_MATRICES: ReadonlyArray<Float32Array> = [
+  new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]), // 000
+  new Float32Array([1, 0, 0, 0, -1, 0, 0, 0, 1]), // 001 V
+  new Float32Array([-1, 0, 0, 0, 1, 0, 0, 0, 1]), // 010 H
+  new Float32Array([-1, 0, 0, 0, -1, 0, 0, 0, 1]), // 011 H+V
+  new Float32Array([0, -1, 0, 1, 0, 0, 0, 0, 1]), // 100 R
+  new Float32Array([0, 1, 0, 1, 0, 0, 0, 0, 1]), // 101 R+V
+  new Float32Array([0, -1, 0, -1, 0, 0, 0, 0, 1]), // 110 R+H
+  new Float32Array([0, 1, 0, -1, 0, 0, 0, 0, 1]), // 111 R+H+V
+];
 
 /** Current path shown in the directory browser modal. */
 let dirBrowserPath = "/";
@@ -209,14 +349,18 @@ interface BackendMe {
   is_admin: boolean;
 }
 
-/** Minimal point annotation model for this prototype. */
-interface AnnotationPoint {
-  /** Stable annotation identifier. */
+/** Minimal point-mask model for the current image. */
+interface MaskPoint {
+  /** Stable mask identifier. */
   id: string;
+  /** Sequential mask index within the current image. */
+  index: number;
   /** X coordinate in normalized image space (0..1). */
   x: number;
   /** Y coordinate in normalized image space (0..1). */
   y: number;
+  /** Optional assigned label name. */
+  labelName: string | null;
 }
 
 /** Tile manifest produced by the tiling script. */
@@ -271,6 +415,28 @@ interface TilePlacementRect {
   height: number;
 }
 
+/** Canvas click payload used for mask interactions. */
+interface MaskCanvasClick {
+  /** Mouse button label. */
+  button: "left" | "right";
+  /** Canvas-local X coordinate in CSS pixels. */
+  canvasX: number;
+  /** Canvas-local Y coordinate in CSS pixels. */
+  canvasY: number;
+  /** Source image-normalized X coordinate. */
+  imageX: number;
+  /** Source image-normalized Y coordinate. */
+  imageY: number;
+  /** Whether Shift key was held. */
+  shiftKey: boolean;
+  /** Closest hit mask id when within hit radius. */
+  hitMaskId: string | null;
+  /** Client X for floating context menu positioning. */
+  clientX: number;
+  /** Client Y for floating context menu positioning. */
+  clientY: number;
+}
+
 /** Main app container. */
 // Non-null assertion is safe: the throw below ensures the app never proceeds without #app.
 // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
@@ -304,7 +470,7 @@ function sendPrefetch(images: { hash: string }[], fromIndex: number): void {
   ws.send(JSON.stringify({ type: "prefetch", hashes }));
 }
 
-/** Moves to previous image and resets annotation list. */
+/** Moves to previous image and resets mask state for the new image. */
 function goPreviousImage(): void {
   if (appState.imageList.length === 0) {
     return;
@@ -314,7 +480,8 @@ function goPreviousImage(): void {
   // Clear active hash so remount does not briefly reload the previous image
   // while waiting for the next image_ready event.
   appState.currentImageHash = null;
-  appState.annotations = [];
+  appState.masks = [];
+  appState.maskContextMenu.open = false;
   const current = getCurrentImageEntry();
   if (current) {
     logEvent("image_change", { filename: current.filename, hash: current.hash });
@@ -323,7 +490,7 @@ function goPreviousImage(): void {
   render();
 }
 
-/** Moves to next image and resets annotation list. */
+/** Moves to next image and resets mask state for the new image. */
 function goNextImage(): void {
   if (appState.imageList.length === 0) {
     return;
@@ -332,7 +499,8 @@ function goNextImage(): void {
   // Clear active hash so remount does not briefly reload the previous image
   // while waiting for the next image_ready event.
   appState.currentImageHash = null;
-  appState.annotations = [];
+  appState.masks = [];
+  appState.maskContextMenu.open = false;
   const current = getCurrentImageEntry();
   if (current) {
     logEvent("image_change", { filename: current.filename, hash: current.hash });
@@ -362,7 +530,8 @@ ws.addEventListener("message", (event) => {
     appState.imageList = images;
     appState.currentImageIndex = 0;
     appState.currentImageHash = null;
-    appState.annotations = [];
+    appState.masks = [];
+    appState.maskContextMenu.open = false;
     render();
     if (images.length > 0) {
       sendPrefetch(images, 0);
@@ -379,9 +548,10 @@ ws.addEventListener("message", (event) => {
     const totalLevels = typeof m["total_levels"] === "number" ? m["total_levels"] : 0;
     console.log(`ws image_ready hash=${hash.slice(0, 16)} level=${level}/${totalLevels}`);
     const isNewImage = appState.currentImageHash !== hash;
-    // Only reset annotations when the image changes.
+    // Only reset masks when the image changes.
     if (isNewImage) {
-      appState.annotations = [];
+      appState.masks = [];
+      appState.maskContextMenu.open = false;
     }
     appState.currentImageHash = hash;
     if (viewer) {
@@ -399,80 +569,242 @@ ws.addEventListener("message", (event) => {
 /** Toggles left sidebar visibility state. */
 function toggleLeftSidebar(): void {
   appState.leftCollapsed = !appState.leftCollapsed;
+  persistSettingLater("sidebar_left", appState.leftCollapsed ? "hidden" : "visible");
   render();
 }
 
 /** Toggles right sidebar visibility state. */
 function toggleRightSidebar(): void {
   appState.rightCollapsed = !appState.rightCollapsed;
+  persistSettingLater("sidebar_right", appState.rightCollapsed ? "hidden" : "visible");
   render();
 }
 
-/** Toggles a single right-side panel open/closed state. */
-function togglePanel(panelName: keyof typeof appState.panelCollapsed): void {
-  appState.panelCollapsed[panelName] = !appState.panelCollapsed[panelName];
-  render();
+/** Updates the current layout CSS variable for right sidebar width. */
+function applyRightSidebarWidth(widthPx: number): void {
+  appState.rightSidebarWidth = Math.max(200, Math.round(widthPx));
+  const layout = appRoot.querySelector<HTMLElement>(".layout");
+  layout?.style.setProperty("--sidebar-right-width", `${appState.rightSidebarWidth}px`);
 }
 
-/** Creates a compact unique ID for a new annotation. */
-function createAnnotationId(): string {
-  return `a-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+/** Wires right-sidebar resize-handle drag interactions. */
+function bindRightSidebarResizeHandle(): void {
+  const handle = appRoot.querySelector<HTMLElement>(".sidebar--right .sidebar__resize-handle");
+  if (!handle) return;
+
+  handle.addEventListener("pointerdown", (event) => {
+    if (appState.rightCollapsed) return;
+    event.preventDefault();
+    handle.setPointerCapture(event.pointerId);
+    const onPointerMove = (moveEvent: PointerEvent): void => {
+      const nextWidth = Math.max(200, document.body.clientWidth - moveEvent.clientX);
+      applyRightSidebarWidth(nextWidth);
+    };
+    const onPointerUp = (): void => {
+      handle.removeEventListener("pointermove", onPointerMove);
+      handle.removeEventListener("pointerup", onPointerUp);
+      handle.removeEventListener("pointercancel", onPointerUp);
+      persistSettingLater("sidebar_right_width", String(appState.rightSidebarWidth));
+    };
+    handle.addEventListener("pointermove", onPointerMove);
+    handle.addEventListener("pointerup", onPointerUp);
+    handle.addEventListener("pointercancel", onPointerUp);
+  });
 }
 
-/** Adds a point annotation and refreshes dependent UI elements only. */
-function addAnnotation(x: number, y: number): void {
-  appState.annotations.push({ id: createAnnotationId(), x, y });
-  updateAnnotationUI();
+
+/** Creates a compact unique ID for a new mask point. */
+function createMaskId(): string {
+  return `m-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
 }
 
-/** Removes a single point annotation by identifier. */
-function removeAnnotation(annotationId: string): void {
-  const next = appState.annotations.filter((a) => a.id !== annotationId);
-  if (next.length === appState.annotations.length) {
-    return;
+/** Returns first leaf label id in depth-first order, or null if tree is empty. */
+function firstLeafLabelId(nodes: LabelNode[]): string | null {
+  for (const node of nodes) {
+    if (node.children.length === 0) {
+      return node.id;
+    }
+    const childLeaf = firstLeafLabelId(node.children);
+    if (childLeaf) return childLeaf;
   }
-  appState.annotations = next;
+  return null;
+}
+
+/** Finds a label node by id in a hierarchical tree. */
+function findLabelNodeById(nodes: LabelNode[], id: string): LabelNode | null {
+  for (const node of nodes) {
+    if (node.id === id) return node;
+    const found = findLabelNodeById(node.children, id);
+    if (found) return found;
+  }
+  return null;
+}
+
+/** Finds first label node id by name in a hierarchical tree. */
+function findLabelNodeIdByName(nodes: LabelNode[], name: string): string | null {
+  for (const node of nodes) {
+    if (node.text === name) return node.id;
+    const found = findLabelNodeIdByName(node.children, name);
+    if (found) return found;
+  }
+  return null;
+}
+
+/** Returns currently selected default label name from active labels, or null. */
+function getSelectedLabelName(): string | null {
+  const selectedId = appState.activeLabelSelectedId;
+  if (!selectedId) return null;
+  return findLabelNodeById(appState.activeLabels, selectedId)?.text ?? null;
+}
+
+/** Returns all label names from a hierarchical label tree in pre-order. */
+function flattenLabelNames(nodes: LabelNode[]): string[] {
+  const out: string[] = [];
+  const walk = (items: LabelNode[]): void => {
+    items.forEach((node) => {
+      const name = node.text.trim();
+      if (name) out.push(name);
+      if (node.children.length > 0) walk(node.children);
+    });
+  };
+  walk(nodes);
+  return out;
+}
+
+/** Moves label to front of recent labels while preserving order and uniqueness. */
+function touchRecentLabel(labelName: string): void {
+  const next = [labelName, ...appState.recentLabels.filter((name) => name !== labelName)];
+  appState.recentLabels = next;
+}
+
+/** Returns context-menu labels: recents first, then remaining task labels. */
+function getMaskContextMenuLabels(): string[] {
+  const allLabels = flattenLabelNames(appState.activeLabels);
+  return [...appState.recentLabels, ...allLabels.filter((name) => !appState.recentLabels.includes(name))];
+}
+
+/** Applies a label to a mask and emits assignment logging. */
+function assignLabelToMask(maskId: string, labelName: string): void {
+  const mask = appState.masks.find((m) => m.id === maskId);
+  if (!mask) return;
+  mask.labelName = labelName;
+  touchRecentLabel(labelName);
+  const assignedId = findLabelNodeIdByName(appState.activeLabels, labelName);
+  if (assignedId) {
+    appState.activeLabelSelectedId = assignedId;
+    updateActiveLabelPanel();
+  }
+  if (appState.currentImageHash) {
+    logEvent("label_assigned", {
+      image_hash: appState.currentImageHash,
+      mask_index: mask.index,
+      label_name: labelName,
+    });
+  }
+}
+
+/** Adds a mask point and applies last-used label if available. */
+function addMask(x: number, y: number): void {
+  const nextIndex = appState.masks.reduce((max, mask) => Math.max(max, mask.index), 0) + 1;
+  const defaultLabel = getSelectedLabelName();
+  const mask: MaskPoint = {
+    id: createMaskId(),
+    index: nextIndex,
+    x,
+    y,
+    labelName: defaultLabel,
+  };
+  appState.masks.push(mask);
+  if (appState.currentImageHash) {
+    logEvent("mask_created", {
+      image_hash: appState.currentImageHash,
+      mask_index: mask.index,
+      x: mask.x,
+      y: mask.y,
+    });
+  }
+  if (mask.labelName) {
+    assignLabelToMask(mask.id, mask.labelName);
+  }
   updateAnnotationUI();
 }
 
-/** Clears all point annotations for current image. */
-function clearAnnotations(): void {
-  appState.annotations = [];
+/** Removes one mask by id and emits logging. */
+function removeMask(maskId: string): void {
+  const idx = appState.masks.findIndex((mask) => mask.id === maskId);
+  if (idx === -1) return;
+  const [removed] = appState.masks.splice(idx, 1);
+  if (appState.currentImageHash) {
+    logEvent("mask_removed", {
+      image_hash: appState.currentImageHash,
+      mask_index: removed.index,
+    });
+  }
+  if (appState.maskContextMenu.maskId === maskId) {
+    appState.maskContextMenu.open = false;
+    appState.maskContextMenu.maskId = null;
+  }
   updateAnnotationUI();
 }
 
-/** Produces markup for a collapsible panel in right sidebar. */
+/** Clears all masks for the current image. */
+function clearMasks(): void {
+  appState.masks = [];
+  appState.maskContextMenu.open = false;
+  appState.maskContextMenu.maskId = null;
+  updateAnnotationUI();
+}
+
+/** Produces markup for a panel in the right sidebar. */
 function renderPanel(
-  panelName: keyof typeof appState.panelCollapsed,
-  title: string,
+  panelName: string,
+  _title: string,
   contentHtml: string
 ): string {
-  const collapsed = appState.panelCollapsed[panelName];
-
   return `
-    <section class="panel ${collapsed ? "is-collapsed" : ""}" data-panel="${panelName}">
-      <button class="panel__header" type="button" data-action="toggle-panel" data-panel="${panelName}">
-        <span>${title}</span>
-        <span>${collapsed ? "+" : "-"}</span>
-      </button>
+    <section class="panel" data-panel="${panelName}">
       <div class="panel__body">${contentHtml}</div>
     </section>
   `;
 }
 
-/** Produces list markup for current annotation points. */
+/** Produces list markup for current masks and assigned labels. */
 function renderAnnotationList(): string {
-  if (appState.annotations.length === 0) {
-    return '<div class="muted">No annotations yet. Click on image to add.</div>';
+  if (appState.masks.length === 0) {
+    return '<div class="muted">No masks yet. Left-click to add, Shift+left-click to remove nearest.</div>';
   }
 
-  const items = appState.annotations
+  const items = appState.masks
     .map(
-      (a, idx) =>
-        `<li>#${idx + 1} (${Math.round(a.x * 100)}%, ${Math.round(a.y * 100)}%) <button type="button" data-action="remove-annotation" data-id="${a.id}">remove</button></li>`
+      (mask) =>
+        `<li>#${mask.index} <span class="mask-label-chip">${mask.labelName ? mask.labelName.replace(/</g, "&lt;") : "unlabeled"}</span>` +
+        ` <button type="button" class="task-pin__remove" data-action="remove-mask" data-id="${mask.id}" title="Remove mask">✕</button></li>`
     )
     .join("");
-  return `<ol class="annotation-list">${items}</ol>`;
+  return `<ul class="annotation-list">${items}</ul>`;
+}
+
+/** Renders the mask label-assignment context menu. */
+function renderMaskContextMenu(): string {
+  if (!appState.maskContextMenu.open || !appState.maskContextMenu.maskId) return "";
+  const labels = getMaskContextMenuLabels();
+  if (labels.length === 0) {
+    return `
+      <div class="mask-context-menu" style="left:${appState.maskContextMenu.clientX}px;top:${appState.maskContextMenu.clientY}px;">
+        <div class="mask-context-menu__empty">No labels</div>
+      </div>
+    `;
+  }
+  const items = labels
+    .map((label) =>
+      `<button type="button" class="mask-context-menu__item" data-action="assign-mask-label" data-label="${label.replace(/"/g, "&quot;")}">${label.replace(/</g, "&lt;")}</button>`
+    )
+    .join("");
+  return `
+    <div class="mask-context-menu" style="left:${appState.maskContextMenu.clientX}px;top:${appState.maskContextMenu.clientY}px;">
+      ${items}
+    </div>
+  `;
 }
 
 /** Re-renders annotation panel body and redraws WebGL annotations only. */
@@ -481,7 +813,7 @@ function updateAnnotationUI(): void {
     '[data-panel="annotations"] .panel__body'
   );
   if (annotationsPanelBody) {
-    annotationsPanelBody.innerHTML = `${renderAnnotationList()}<button type="button" data-action="clear-annotations">clear annotations</button>`;
+    annotationsPanelBody.innerHTML = renderAnnotationList();
     bindAnnotationPanelHandlers();
   }
   viewer?.draw();
@@ -489,23 +821,64 @@ function updateAnnotationUI(): void {
 
 /** Wires annotation list action buttons after panel-body updates. */
 function bindAnnotationPanelHandlers(): void {
-  const clearBtn = appRoot.querySelector<HTMLButtonElement>('button[data-action="clear-annotations"]');
-  clearBtn?.addEventListener("click", clearAnnotations);
 
-  const removeButtons = appRoot.querySelectorAll<HTMLButtonElement>('button[data-action="remove-annotation"]');
+  const removeButtons = appRoot.querySelectorAll<HTMLButtonElement>('button[data-action="remove-mask"]');
   removeButtons.forEach((btn) => {
     btn.addEventListener("click", () => {
       const id = btn.getAttribute("data-id");
       if (id) {
-        removeAnnotation(id);
+        removeMask(id);
       }
     });
   });
 }
 
-/** Produces the optics panel body HTML with three labeled sliders. */
+/** Binds handlers for the floating mask context menu. */
+function bindMaskContextMenuHandlers(): void {
+  appRoot.querySelectorAll<HTMLButtonElement>('button[data-action="assign-mask-label"]').forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const labelName = btn.getAttribute("data-label");
+      const maskId = appState.maskContextMenu.maskId;
+      if (!labelName || !maskId) return;
+      assignLabelToMask(maskId, labelName);
+      closeMaskContextMenu();
+      render();
+    });
+  });
+  if (!appState.maskContextMenu.open) return;
+  document.addEventListener("click", (event) => {
+    const target = event.target as Element | null;
+    if (target?.closest(".mask-context-menu")) return;
+    closeMaskContextMenu();
+    render();
+  }, { once: true });
+}
+
+/** Updates active-label panel body content without full app re-render. */
+function updateActiveLabelPanel(): void {
+  const panelBody = appRoot.querySelector<HTMLElement>('[data-panel="labels"] .panel__body');
+  if (!panelBody) return;
+  panelBody.innerHTML = renderLabelTree(appState.activeLabels, appState.activeLabelSelectedId, false);
+  bindActiveLabelPanelHandlers();
+}
+
+/** Binds read-only label selection in the sidebar labels panel. */
+function bindActiveLabelPanelHandlers(): void {
+  const panelBody = appRoot.querySelector<HTMLElement>('[data-panel="labels"] .panel__body');
+  if (!panelBody) return;
+  panelBody.querySelectorAll<HTMLElement>(".label-tree__row").forEach((row) => {
+    row.addEventListener("click", () => {
+      const nodeId = row.dataset["nodeId"];
+      if (!nodeId) return;
+      appState.activeLabelSelectedId = nodeId;
+      updateActiveLabelPanel();
+    });
+  });
+}
+
+/** Produces the optics panel body HTML with sliders and transform toggles. */
 function renderOpticsBody(): string {
-  const { gamma, multiply, add } = appState.optics;
+  const { gamma, multiply, add, rotate90cw, flipH, flipV } = appState.optics;
   return `
     <label class="optics-row">
       <span>gamma</span>
@@ -525,6 +898,24 @@ function renderOpticsBody(): string {
         min="-100" max="100" step="1" value="${add}">
       <span class="optics-val">${add.toFixed(0)}</span>
     </label>
+    <label class="optics-row">
+      <input type="checkbox" data-transform="rotate90cw" ${rotate90cw ? "checked" : ""}>
+      <span>Rotate 90 CW</span>
+      <span class="optics-val"></span>
+    </label>
+    <label class="optics-row">
+      <input type="checkbox" data-transform="flipH" ${flipH ? "checked" : ""}>
+      <span>Horizontal flip</span>
+      <span class="optics-val"></span>
+    </label>
+    <label class="optics-row">
+      <input type="checkbox" data-transform="flipV" ${flipV ? "checked" : ""}>
+      <span>Vertical flip</span>
+      <span class="optics-val"></span>
+    </label>
+    <div class="optics-reset-row">
+      <button type="button" class="ghost" data-action="reset-optics" title="Reset optics">↺</button>
+    </div>
   `;
 }
 
@@ -537,7 +928,7 @@ function bindOpticsPanelHandlers(): void {
 
   panel.querySelectorAll<HTMLInputElement>("input[data-optics]").forEach((slider) => {
     slider.addEventListener("input", () => {
-      const key = slider.getAttribute("data-optics") as keyof typeof appState.optics;
+      const key = slider.getAttribute("data-optics") as "gamma" | "multiply" | "add";
       const val = parseFloat(slider.value);
       appState.optics[key] = val;
 
@@ -547,26 +938,73 @@ function bindOpticsPanelHandlers(): void {
         valSpan.textContent = key === "add" ? val.toFixed(0) : val.toFixed(2);
       }
 
-      viewer?.setOptics(appState.optics.gamma, appState.optics.multiply, appState.optics.add);
+      applyOpticsToViewer();
+      const settingsKey = key === "gamma"
+        ? "optics_gamma"
+        : key === "multiply"
+          ? "optics_brightness_mul"
+          : "optics_brightness_add";
+      persistSettingLater(settingsKey, String(val));
     });
   });
 
-  // Clicking the panel header title span resets all optics to defaults.
-  // The header is a <button> (toggle); we detect clicks on its first <span> (title text).
-  const header = panel.querySelector<HTMLButtonElement>(".panel__header");
-  if (header) {
-    header.addEventListener("click", (e) => {
-      const target = e.target as HTMLElement;
-      // The toggle icon is the second <span>; the title is the first.
-      // Only reset when the title span itself was clicked.
-      if (target.tagName === "SPAN" && target === header.querySelector("span:first-child")) {
-        appState.optics = { gamma: 1.0, multiply: 1.0, add: 0.0 };
-        viewer?.setOptics(1.0, 1.0, 0.0);
-        // Re-render to update slider positions to reset values
-        render();
-      }
+  panel.querySelectorAll<HTMLInputElement>("input[data-transform]").forEach((checkbox) => {
+    checkbox.addEventListener("change", () => {
+      const key = checkbox.getAttribute("data-transform") as "rotate90cw" | "flipH" | "flipV";
+      appState.optics[key] = checkbox.checked;
+      applyOpticsToViewer();
+      const settingsKey = key === "rotate90cw"
+        ? "optics_rotate90cw"
+        : key === "flipH"
+          ? "optics_flip_h"
+          : "optics_flip_v";
+      persistSettingLater(settingsKey, String(checkbox.checked));
     });
-  }
+  });
+
+  panel.querySelector<HTMLButtonElement>('[data-action="reset-optics"]')
+    ?.addEventListener("click", () => {
+      appState.optics = {
+        gamma: 1.0,
+        multiply: 1.0,
+        add: 0.0,
+        rotate90cw: false,
+        flipH: false,
+        flipV: false,
+      };
+      applyOpticsToViewer();
+      persistOpticsSettingsLater();
+      render();
+    });
+}
+
+function applyOpticsToViewer(): void {
+  viewer?.setOptics(
+    appState.optics.gamma,
+    appState.optics.multiply,
+    appState.optics.add,
+    appState.optics.rotate90cw,
+    appState.optics.flipH,
+    appState.optics.flipV
+  );
+}
+
+function cycleOpticsTransform(step: 1 | -1): void {
+  const currentIndex = OPTICS_TRANSFORM_SEQUENCE.findIndex(
+    (state) =>
+      state.rotate90cw === appState.optics.rotate90cw &&
+      state.flipH === appState.optics.flipH &&
+      state.flipV === appState.optics.flipV
+  );
+  const base = currentIndex >= 0 ? currentIndex : 0;
+  const next = (base + step + OPTICS_TRANSFORM_SEQUENCE.length) % OPTICS_TRANSFORM_SEQUENCE.length;
+  const nextState = OPTICS_TRANSFORM_SEQUENCE[next];
+  appState.optics.rotate90cw = nextState.rotate90cw;
+  appState.optics.flipH = nextState.flipH;
+  appState.optics.flipV = nextState.flipV;
+  applyOpticsToViewer();
+  persistOpticsSettingsLater();
+  render();
 }
 
 /** Resolves level dimensions from the full-size manifest dimensions. */
@@ -588,16 +1026,16 @@ function loadImage(url: string): Promise<HTMLImageElement> {
   });
 }
 
-/** WebGL tile viewer that renders tiles and annotation points into one canvas. */
+/** WebGL tile viewer that renders tiles and mask points into one canvas. */
 class WebGLTileViewer {
   /** Drawing canvas. */
   private readonly canvas: HTMLCanvasElement;
   /** Current WebGL context. */
   private readonly gl: WebGLRenderingContext;
-  /** Access to current annotation array. */
-  private readonly getAnnotations: () => AnnotationPoint[];
-  /** Callback for click-to-annotation creation. */
-  private readonly onAddAnnotation: (x: number, y: number) => void;
+  /** Access to current mask array. */
+  private readonly getMasks: () => MaskPoint[];
+  /** Callback for primary/secondary mask interactions from canvas clicks. */
+  private readonly onMaskCanvasClick: (payload: MaskCanvasClick) => void;
 
   /** Manifest for current image. */
   private manifest: TileManifest | null = null;
@@ -605,6 +1043,8 @@ class WebGLTileViewer {
   private imageStem = "";
   /** Fit transform for current draw pass. */
   private transform: ViewTransform = { x: 0, y: 0, width: 0, height: 0 };
+  /** Unrotated source-geometry transform used before shader matrix is applied. */
+  private baseTransform: ViewTransform = { x: 0, y: 0, width: 0, height: 0 };
   /** Selected fit-level index. */
   private fitLevel = 0;
   /** Highest backend-ready level seen for the current image, if provided. */
@@ -636,6 +1076,8 @@ class WebGLTileViewer {
   private readonly tileMultiplyUniform: WebGLUniformLocation;
   /** Tile program additive uniform location. */
   private readonly tileAddUniform: WebGLUniformLocation;
+  /** Tile program transform matrix uniform location. */
+  private readonly tileTransformUniform: WebGLUniformLocation;
 
   /** Current optics: gamma exponent. */
   private opticsGamma = 1.0;
@@ -643,6 +1085,12 @@ class WebGLTileViewer {
   private opticsMultiply = 1.0;
   /** Current optics: additive brightness offset (normalized). */
   private opticsAdd = 0.0;
+  /** Current transform: rotate 90 degrees clockwise flag. */
+  private opticsRotate90cw = false;
+  /** Current transform: horizontal-flip flag. */
+  private opticsFlipH = false;
+  /** Current transform: vertical-flip flag. */
+  private opticsFlipV = false;
 
   /** Point shader program. */
   private readonly pointProgram: WebGLProgram;
@@ -652,6 +1100,8 @@ class WebGLTileViewer {
   private readonly pointColorUniform: WebGLUniformLocation;
   /** Point program size uniform location. */
   private readonly pointSizeUniform: WebGLUniformLocation;
+  /** Point program transform matrix uniform location. */
+  private readonly pointTransformUniform: WebGLUniformLocation;
 
   /** Shared buffer for quad positions and point positions. */
   private readonly positionBuffer: WebGLBuffer;
@@ -679,15 +1129,17 @@ class WebGLTileViewer {
   private dragLastY = 0;
 /** Accumulated pointer travel in CSS px since last pointerdown. */
   private dragTotalDistance = 0;
+  /** Current full R/H/V transform matrix in NDC (column-major mat3). */
+  private transformMatrix = new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]);
 
   constructor(
     canvas: HTMLCanvasElement,
-    getAnnotations: () => AnnotationPoint[],
-    onAddAnnotation: (x: number, y: number) => void
+    getMasks: () => MaskPoint[],
+    onMaskCanvasClick: (payload: MaskCanvasClick) => void
   ) {
     this.canvas = canvas;
-    this.getAnnotations = getAnnotations;
-    this.onAddAnnotation = onAddAnnotation;
+    this.getMasks = getMasks;
+    this.onMaskCanvasClick = onMaskCanvasClick;
 
     const gl = canvas.getContext("webgl", { alpha: false, antialias: true });
     if (!gl) {
@@ -700,9 +1152,11 @@ class WebGLTileViewer {
       attribute vec2 a_pos;
       attribute vec2 a_uv;
       varying vec2 v_uv;
+      uniform mat3 u_transform;
       void main() {
         v_uv = a_uv;
-        gl_Position = vec4(a_pos, 0.0, 1.0);
+        vec3 pos = u_transform * vec3(a_pos, 1.0);
+        gl_Position = vec4(pos.xy, 0.0, 1.0);
       }
       `,
       `
@@ -725,8 +1179,10 @@ class WebGLTileViewer {
       `
       attribute vec2 a_pos;
       uniform float u_size;
+      uniform mat3 u_transform;
       void main() {
-        gl_Position = vec4(a_pos, 0.0, 1.0);
+        vec3 pos = u_transform * vec3(a_pos, 1.0);
+        gl_Position = vec4(pos.xy, 0.0, 1.0);
         gl_PointSize = u_size;
       }
       `,
@@ -749,22 +1205,26 @@ class WebGLTileViewer {
     const tileGamma = gl.getUniformLocation(this.tileProgram, "u_gamma");
     const tileMultiply = gl.getUniformLocation(this.tileProgram, "u_multiply");
     const tileAdd = gl.getUniformLocation(this.tileProgram, "u_add");
-    if (!tileSampler || !tileGamma || !tileMultiply || !tileAdd) {
+    const tileTransform = gl.getUniformLocation(this.tileProgram, "u_transform");
+    if (!tileSampler || !tileGamma || !tileMultiply || !tileAdd || !tileTransform) {
       throw new Error("Tile uniforms missing");
     }
     this.tileSamplerUniform = tileSampler;
     this.tileGammaUniform = tileGamma;
     this.tileMultiplyUniform = tileMultiply;
     this.tileAddUniform = tileAdd;
+    this.tileTransformUniform = tileTransform;
 
     this.pointPosAttrib = gl.getAttribLocation(this.pointProgram, "a_pos");
     const pointColor = gl.getUniformLocation(this.pointProgram, "u_color");
     const pointSize = gl.getUniformLocation(this.pointProgram, "u_size");
-    if (!pointColor || !pointSize) {
+    const pointTransform = gl.getUniformLocation(this.pointProgram, "u_transform");
+    if (!pointColor || !pointSize || !pointTransform) {
       throw new Error("Point uniforms missing");
     }
     this.pointColorUniform = pointColor;
     this.pointSizeUniform = pointSize;
+    this.pointTransformUniform = pointTransform;
 
     const positionBuffer = gl.createBuffer();
     const uvBuffer = gl.createBuffer();
@@ -779,12 +1239,47 @@ class WebGLTileViewer {
   }
 
   /** Updates optics adjustment values and redraws. */
-  setOptics(gamma: number, multiply: number, add: number): void {
+  setOptics(
+    gamma: number,
+    multiply: number,
+    add: number,
+    rotate90cw: boolean,
+    flipH: boolean,
+    flipV: boolean
+  ): void {
+    const rotationChanged = this.opticsRotate90cw !== rotate90cw;
+    const transformChanged =
+      rotationChanged ||
+      this.opticsFlipH !== flipH ||
+      this.opticsFlipV !== flipV;
     this.opticsGamma = gamma;
     this.opticsMultiply = multiply;
     /** Add value is stored as a normalized offset (divide by 255 so the shader
      *  operates in [0,1] color space regardless of the slider's -100..100 range). */
     this.opticsAdd = add / 255;
+    this.opticsRotate90cw = rotate90cw;
+    this.opticsFlipH = flipH;
+    this.opticsFlipV = flipV;
+
+    if (transformChanged) {
+      if (rotationChanged && this.manifest) {
+        const displayed = this.getDisplayedImageDimensions();
+        const fitScale = this.fitScaleForDimensions(displayed.width, displayed.height);
+        this.zoom = fitScale;
+        this.offsetX = (this.canvas.clientWidth - fitScale * displayed.width) / 2;
+        this.offsetY = (this.canvas.clientHeight - fitScale * displayed.height) / 2;
+      } else {
+        this.clampPanZoom();
+      }
+      this.draw();
+      const previousLevel = this.fitLevel;
+      this.maybeChangeFitLevel();
+      if (this.fitLevel === previousLevel) {
+        this.loadFitLevelTiles(this.generation);
+      }
+      return;
+    }
+
     this.draw();
   }
 
@@ -800,6 +1295,7 @@ class WebGLTileViewer {
       this.windowResizeHandler = null;
     }
     this.canvas.removeEventListener("click", this.handleCanvasClick);
+    this.canvas.removeEventListener("contextmenu", this.handleCanvasContextMenu);
     this.canvas.removeEventListener("wheel", this.handleWheel);
     this.canvas.removeEventListener("pointerdown", this.handlePointerDown);
     this.canvas.removeEventListener("pointermove", this.handlePointerMove);
@@ -846,10 +1342,11 @@ class WebGLTileViewer {
     }
 
     this.manifest = manifest;
-    const fitScale = this.fitScaleForDimensions(manifest.width, manifest.height);
+    const displayed = this.getDisplayedImageDimensions();
+    const fitScale = this.fitScaleForDimensions(displayed.width, displayed.height);
     this.zoom = fitScale;
-    this.offsetX = (this.canvas.clientWidth - fitScale * manifest.width) / 2;
-    this.offsetY = (this.canvas.clientHeight - fitScale * manifest.height) / 2;
+    this.offsetX = (this.canvas.clientWidth - fitScale * displayed.width) / 2;
+    this.offsetY = (this.canvas.clientHeight - fitScale * displayed.height) / 2;
     this.fitLevel = this.pickFitLevel();
     this.updateCanvasZoomLevelClass();
 
@@ -889,6 +1386,7 @@ class WebGLTileViewer {
     }
 
     this.computeTransform();
+    this.updateTransformMatrix();
 
     if (this.level0Tile) {
       const dims = getLevelDimensions(this.manifest, 0);
@@ -915,6 +1413,12 @@ class WebGLTileViewer {
     if (this.canvas.width !== width || this.canvas.height !== height) {
       this.canvas.width = width;
       this.canvas.height = height;
+      this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+      if (this.manifest) {
+        this.clampPanZoom();
+        this.draw();
+      }
+      return;
     }
 
     this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
@@ -1003,24 +1507,39 @@ class WebGLTileViewer {
       return false;
     }
 
-    const vpImageX0 = (0 - this.offsetX) / this.zoom;
-    const vpImageY0 = (0 - this.offsetY) / this.zoom;
-    const vpImageX1 = (this.canvas.clientWidth - this.offsetX) / this.zoom;
-    const vpImageY1 = (this.canvas.clientHeight - this.offsetY) / this.zoom;
+    const drawW = this.transform.width;
+    const drawH = this.transform.height;
+    if (drawW <= 0 || drawH <= 0) {
+      return false;
+    }
 
-    const scaleX = levelWidth / this.manifest.width;
-    const scaleY = levelHeight / this.manifest.height;
-    const vpX0 = vpImageX0 * scaleX;
-    const vpY0 = vpImageY0 * scaleY;
-    const vpX1 = vpImageX1 * scaleX;
-    const vpY1 = vpImageY1 * scaleY;
+    const vpX0 = (0 - this.offsetX) / drawW;
+    const vpY0 = (0 - this.offsetY) / drawH;
+    const vpX1 = (this.canvas.clientWidth - this.offsetX) / drawW;
+    const vpY1 = (this.canvas.clientHeight - this.offsetY) / drawH;
 
-    const tileX0 = tx * tileSize;
-    const tileY0 = ty * tileSize;
-    const tileX1 = Math.min((tx + 1) * tileSize, levelWidth);
-    const tileY1 = Math.min((ty + 1) * tileSize, levelHeight);
+    const vpCorners = [
+      this.applyInverseTransformToNormalizedPoint(vpX0, vpY0),
+      this.applyInverseTransformToNormalizedPoint(vpX1, vpY0),
+      this.applyInverseTransformToNormalizedPoint(vpX0, vpY1),
+      this.applyInverseTransformToNormalizedPoint(vpX1, vpY1),
+    ];
+    const sourceMinX = Math.min(vpCorners[0].x, vpCorners[1].x, vpCorners[2].x, vpCorners[3].x);
+    const sourceMaxX = Math.max(vpCorners[0].x, vpCorners[1].x, vpCorners[2].x, vpCorners[3].x);
+    const sourceMinY = Math.min(vpCorners[0].y, vpCorners[1].y, vpCorners[2].y, vpCorners[3].y);
+    const sourceMaxY = Math.max(vpCorners[0].y, vpCorners[1].y, vpCorners[2].y, vpCorners[3].y);
 
-    return tileX0 < vpX1 && tileX1 > vpX0 && tileY0 < vpY1 && tileY1 > vpY0;
+    const nx0 = (tx * tileSize) / levelWidth;
+    const ny0 = (ty * tileSize) / levelHeight;
+    const nx1 = Math.min(nx0 + (tileSize / levelWidth), 1);
+    const ny1 = Math.min(ny0 + (tileSize / levelHeight), 1);
+
+    return (
+      nx0 < sourceMaxX &&
+      nx1 > sourceMinX &&
+      ny0 < sourceMaxY &&
+      ny1 > sourceMinY
+    );
   }
 
   /** Picks the first level whose resolution exceeds canvas pixels*dpr target. */
@@ -1030,8 +1549,9 @@ class WebGLTileViewer {
     }
 
     const dpr = window.devicePixelRatio || 1;
-    const targetW = this.zoom * this.manifest.width * dpr;
-    const targetH = this.zoom * this.manifest.height * dpr;
+    const displayed = this.getDisplayedImageDimensions();
+    const targetW = this.zoom * displayed.width * dpr;
+    const targetH = this.zoom * displayed.height * dpr;
 
     for (let level = 0; level < this.manifest.levels; level += 1) {
       const dims = getLevelDimensions(this.manifest, level);
@@ -1048,11 +1568,22 @@ class WebGLTileViewer {
     if (!this.manifest) {
       return;
     }
+    const displayed = this.getDisplayedImageDimensions();
     this.transform = {
       x: this.offsetX,
       y: this.offsetY,
-      width: this.zoom * this.manifest.width,
-      height: this.zoom * this.manifest.height,
+      width: this.zoom * displayed.width,
+      height: this.zoom * displayed.height,
+    };
+    const centerX = this.transform.x + this.transform.width / 2;
+    const centerY = this.transform.y + this.transform.height / 2;
+    const baseWidth = this.zoom * this.manifest.width;
+    const baseHeight = this.zoom * this.manifest.height;
+    this.baseTransform = {
+      x: centerX - baseWidth / 2,
+      y: centerY - baseHeight / 2,
+      width: baseWidth,
+      height: baseHeight,
     };
   }
 
@@ -1069,18 +1600,19 @@ class WebGLTileViewer {
     const cw = this.canvas.clientWidth;
     const ch = this.canvas.clientHeight;
     const pad = 20;
+    const displayed = this.getDisplayedImageDimensions();
 
     const minZoom = Math.max(
       Math.min(
-        (cw - 2 * pad) / this.manifest.width,
-        (ch - 2 * pad) / this.manifest.height
+        (cw - 2 * pad) / displayed.width,
+        (ch - 2 * pad) / displayed.height
       ),
       1e-6
     );
     this.zoom = Math.max(minZoom, Math.min(2, this.zoom));
 
-    const imgW = this.zoom * this.manifest.width;
-    const imgH = this.zoom * this.manifest.height;
+    const imgW = this.zoom * displayed.width;
+    const imgH = this.zoom * displayed.height;
 
     const xA = -pad;
     const xB = cw + pad - imgW;
@@ -1155,6 +1687,7 @@ class WebGLTileViewer {
     gl.uniform1f(this.tileGammaUniform, this.opticsGamma);
     gl.uniform1f(this.tileMultiplyUniform, this.opticsMultiply);
     gl.uniform1f(this.tileAddUniform, this.opticsAdd);
+    gl.uniformMatrix3fv(this.tileTransformUniform, false, this.transformMatrix);
 
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
@@ -1166,26 +1699,28 @@ class WebGLTileViewer {
     levelHeight: number
   ): TilePlacementRect {
     const tileSize = this.manifest?.tile_size ?? 256;
-    const x = this.transform.x + ((tile.tx * tileSize) / levelWidth) * this.transform.width;
-    const y = this.transform.y + ((tile.ty * tileSize) / levelHeight) * this.transform.height;
-    const width = (tile.width / levelWidth) * this.transform.width;
-    const height = (tile.height / levelHeight) * this.transform.height;
+    const nx0 = (tile.tx * tileSize) / levelWidth;
+    const ny0 = (tile.ty * tileSize) / levelHeight;
+    const x = this.baseTransform.x + nx0 * this.baseTransform.width;
+    const y = this.baseTransform.y + ny0 * this.baseTransform.height;
+    const width = (tile.width / levelWidth) * this.baseTransform.width;
+    const height = (tile.height / levelHeight) * this.baseTransform.height;
     return { x, y, width, height };
   }
 
-/** Draws normalized annotation points over image content. */
+/** Draws normalized mask points over image content. */
   private drawAnnotations(): void {
-    const annotations = this.getAnnotations();
-    if (annotations.length === 0) {
+    const masks = this.getMasks();
+    if (masks.length === 0) {
       return;
     }
 
     const gl = this.gl;
-    const points = new Float32Array(annotations.length * 2);
+    const points = new Float32Array(masks.length * 2);
 
-    annotations.forEach((annotation, index) => {
-      const x = this.transform.x + annotation.x * this.transform.width;
-      const y = this.transform.y + annotation.y * this.transform.height;
+    masks.forEach((mask, index) => {
+      const x = this.baseTransform.x + mask.x * this.baseTransform.width;
+      const y = this.baseTransform.y + mask.y * this.baseTransform.height;
       points[index * 2] = (x / this.canvas.clientWidth) * 2 - 1;
       points[index * 2 + 1] = 1 - (y / this.canvas.clientHeight) * 2;
     });
@@ -1198,10 +1733,11 @@ class WebGLTileViewer {
     gl.bufferData(gl.ARRAY_BUFFER, points, gl.STREAM_DRAW);
     gl.enableVertexAttribArray(this.pointPosAttrib);
     gl.vertexAttribPointer(this.pointPosAttrib, 2, gl.FLOAT, false, 0, 0);
+    gl.uniformMatrix3fv(this.pointTransformUniform, false, this.transformMatrix);
     gl.uniform4f(this.pointColorUniform, 1, 0.44, 0.38, 1);
     gl.uniform1f(this.pointSizeUniform, 10);
 
-    gl.drawArrays(gl.POINTS, 0, annotations.length);
+    gl.drawArrays(gl.POINTS, 0, masks.length);
 
     gl.disable(gl.BLEND);
   }
@@ -1305,11 +1841,29 @@ class WebGLTileViewer {
     return new Float32Array([left, bottom, right, bottom, left, top, right, top]);
   }
 
-  /** Handles canvas click by mapping into normalized image coordinates. */
+  /** Finds the closest mask to a canvas-space point within a CSS-pixel radius. */
+  private findClosestMaskId(px: number, py: number, radiusPx: number): string | null {
+    const maxDistSq = radiusPx * radiusPx;
+    let best: { id: string; distSq: number } | null = null;
+    this.getMasks().forEach((mask) => {
+      const display = this.applyForwardTransformToNormalizedPoint(mask.x, mask.y);
+      const mx = this.transform.x + display.x * this.transform.width;
+      const my = this.transform.y + display.y * this.transform.height;
+      const dx = mx - px;
+      const dy = my - py;
+      const distSq = dx * dx + dy * dy;
+      if (distSq > maxDistSq) return;
+      if (!best || distSq < best.distSq) {
+        best = { id: mask.id, distSq };
+      }
+    });
+    return best?.id ?? null;
+  }
+
+  /** Handles primary-button click by mapping into normalized image coordinates. */
   private readonly handleCanvasClick = (event: MouseEvent): void => {
-    if (this.dragTotalDistance > config.clickMaxDragPx) {
-      return;
-    }
+    if (event.button !== 0) return;
+    if (this.dragTotalDistance > config.clickMaxDragPx) return;
     const bounds = this.canvas.getBoundingClientRect();
     const px = event.clientX - bounds.left;
     const py = event.clientY - bounds.top;
@@ -1323,10 +1877,121 @@ class WebGLTileViewer {
       return;
     }
 
-    const x = (px - this.transform.x) / this.transform.width;
-    const y = (py - this.transform.y) / this.transform.height;
-    this.onAddAnnotation(x, y);
+    const displayX = (px - this.transform.x) / this.transform.width;
+    const displayY = (py - this.transform.y) / this.transform.height;
+    const source = this.applyInverseTransformToNormalizedPoint(displayX, displayY);
+    this.onMaskCanvasClick({
+      button: "left",
+      canvasX: px,
+      canvasY: py,
+      imageX: source.x,
+      imageY: source.y,
+      shiftKey: event.shiftKey,
+      hitMaskId: this.findClosestMaskId(px, py, 10),
+      clientX: event.clientX,
+      clientY: event.clientY,
+    });
   };
+
+  /** Handles right-click by mapping into normalized image coordinates and nearest mask hit. */
+  private readonly handleCanvasContextMenu = (event: MouseEvent): void => {
+    event.preventDefault();
+    if (this.dragTotalDistance > config.clickMaxDragPx) return;
+    const bounds = this.canvas.getBoundingClientRect();
+    const px = event.clientX - bounds.left;
+    const py = event.clientY - bounds.top;
+
+    if (
+      px < this.transform.x ||
+      py < this.transform.y ||
+      px > this.transform.x + this.transform.width ||
+      py > this.transform.y + this.transform.height
+    ) {
+      return;
+    }
+
+    const displayX = (px - this.transform.x) / this.transform.width;
+    const displayY = (py - this.transform.y) / this.transform.height;
+    const source = this.applyInverseTransformToNormalizedPoint(displayX, displayY);
+    this.onMaskCanvasClick({
+      button: "right",
+      canvasX: px,
+      canvasY: py,
+      imageX: source.x,
+      imageY: source.y,
+      shiftKey: event.shiftKey,
+      hitMaskId: this.findClosestMaskId(px, py, 10),
+      clientX: event.clientX,
+      clientY: event.clientY,
+    });
+  };
+
+  /** Returns the effective displayed image dimensions after rotation toggle. */
+  private getDisplayedImageDimensions(): { width: number; height: number } {
+    if (!this.manifest) {
+      return { width: 1, height: 1 };
+    }
+    if (!this.opticsRotate90cw) {
+      return { width: this.manifest.width, height: this.manifest.height };
+    }
+    return { width: this.manifest.height, height: this.manifest.width };
+  }
+
+  /** Applies inverse active transform to map display-normalized point to source-normalized point. */
+  private applyInverseTransformToNormalizedPoint(x: number, y: number): { x: number; y: number } {
+    let tx = x;
+    let ty = y;
+    if (this.opticsFlipV) {
+      ty = 1 - ty;
+    }
+    if (this.opticsFlipH) {
+      tx = 1 - tx;
+    }
+    if (this.opticsRotate90cw) {
+      const nextX = ty;
+      const nextY = 1 - tx;
+      tx = nextX;
+      ty = nextY;
+    }
+    return { x: tx, y: ty };
+  }
+
+  /** Applies active transform to map source-normalized point to display-normalized point. */
+  private applyForwardTransformToNormalizedPoint(x: number, y: number): { x: number; y: number } {
+    let tx = x;
+    let ty = y;
+    if (this.opticsRotate90cw) {
+      const nextX = 1 - ty;
+      const nextY = tx;
+      tx = nextX;
+      ty = nextY;
+    }
+    if (this.opticsFlipH) {
+      tx = 1 - tx;
+    }
+    if (this.opticsFlipV) {
+      ty = 1 - ty;
+    }
+    return { x: tx, y: ty };
+  }
+
+  /** Recomputes the full image transform matrix in NDC for current optics + pan/zoom. */
+  private updateTransformMatrix(): void {
+    const idx = (this.opticsRotate90cw ? 4 : 0) | (this.opticsFlipH ? 2 : 0) | (this.opticsFlipV ? 1 : 0);
+    const pure = PURE_TRANSFORM_MATRICES[idx];
+    const cw = Math.max(1, this.canvas.clientWidth);
+    const ch = Math.max(1, this.canvas.clientHeight);
+    // Compensate NDC anisotropy so 90-degree rotations are correct in pixel space.
+    const m00 = pure[0];
+    const m01 = pure[1] * (cw / ch);
+    const m10 = pure[3] * (ch / cw);
+    const m11 = pure[4];
+    const cx = ((this.transform.x + this.transform.width / 2) / this.canvas.clientWidth) * 2 - 1;
+    const cy = 1 - ((this.transform.y + this.transform.height / 2) / this.canvas.clientHeight) * 2;
+    const tx = cx - (m00 * cx + m10 * cy);
+    const ty = cy - (m01 * cx + m11 * cy);
+    this.transformMatrix = new Float32Array([m00, m01, 0, m10, m11, 0, tx, ty, 1]);
+  }
 
   /** Handles wheel-based pan/zoom gestures centered at cursor. */
   private readonly handleWheel = (event: WheelEvent): void => {
@@ -1375,6 +2040,7 @@ class WebGLTileViewer {
     if (event.button !== 0) {
       return;
     }
+    this.canvas.focus();
     this.isDragging = true;
     this.dragLastX = event.clientX;
     this.dragLastY = event.clientY;
@@ -1419,6 +2085,7 @@ class WebGLTileViewer {
   /** Sets up listeners for click and resize-driven level refit. */
   private setupCanvasListeners(): void {
     this.canvas.addEventListener("click", this.handleCanvasClick);
+    this.canvas.addEventListener("contextmenu", this.handleCanvasContextMenu);
     this.canvas.addEventListener("wheel", this.handleWheel, { passive: false });
     this.canvas.addEventListener("pointerdown", this.handlePointerDown);
     this.canvas.addEventListener("pointermove", this.handlePointerMove);
@@ -1472,17 +2139,46 @@ function mountViewer(): void {
   viewer?.destroy();
   viewer = new WebGLTileViewer(
     canvas,
-    () => appState.annotations,
-    (x, y) => addAnnotation(x, y)
+    () => appState.masks,
+    (payload) => {
+      if (!appState.currentImageHash) return;
+      logEvent("mouse_click", {
+        button: payload.button,
+        canvas_x: payload.canvasX,
+        canvas_y: payload.canvasY,
+        image_x: payload.imageX,
+        image_y: payload.imageY,
+      });
+      if (payload.button === "left") {
+        closeMaskContextMenu();
+        if (payload.shiftKey) {
+          if (payload.hitMaskId) {
+            removeMask(payload.hitMaskId);
+          }
+          return;
+        }
+        addMask(payload.imageX, payload.imageY);
+        return;
+      }
+      if (payload.hitMaskId) {
+        appState.maskContextMenu.open = true;
+        appState.maskContextMenu.clientX = payload.clientX;
+        appState.maskContextMenu.clientY = payload.clientY;
+        appState.maskContextMenu.maskId = payload.hitMaskId;
+      } else {
+        closeMaskContextMenu();
+      }
+      render();
+    }
   );
 
-  const { gamma, multiply, add } = appState.optics;
-  viewer.setOptics(gamma, multiply, add);
+  applyOpticsToViewer();
   const waitingForImageReady = appState.imageList.length > 0 && appState.currentImageHash === null;
   canvas.classList.toggle("image-view__canvas--zoom-loading", waitingForImageReady);
   if (appState.currentImageHash) {
     void viewer.setImage(appState.currentImageHash);
   }
+
 }
 
 // ── Menu bar ─────────────────────────────────────────────────────────────────
@@ -1825,44 +2521,46 @@ function bindDirBrowserHandlers(): void {
 function renderMenuBar(): string {
   const open = appState.menuOpen;
   return `
-    <button class="hamburger" type="button" aria-label="Toggle menu" aria-expanded="${open}"
-            data-action="toggle-menu">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-        <line x1="3" y1="6"  x2="21" y2="6"/>
-        <line x1="3" y1="12" x2="21" y2="12"/>
-        <line x1="3" y1="18" x2="21" y2="18"/>
-      </svg>
-    </button>
-    <nav class="menu-bar ${open ? "menu-bar--open" : ""}" aria-hidden="${!open}">
-      <div class="menu-bar__item" data-menu="tasks">
-        <button type="button" class="menu-bar__btn" data-action="open-tasks">Tasks</button>
-      </div>
-      <div class="menu-bar__item" data-menu="views">
-        <button type="button" class="menu-bar__btn" data-action="toggle-menu-dropdown">Views</button>
-        <div class="menu-bar__dropdown">
-          <button type="button" class="menu-bar__dropdown-btn" data-action="toggle-left-sidebar"
-                  aria-checked="${!appState.leftCollapsed}">
-            <span class="menu-bar__check">✓</span><span>Left sidebar</span>
-          </button>
-          <button type="button" class="menu-bar__dropdown-btn" data-action="toggle-right-sidebar"
-                  aria-checked="${!appState.rightCollapsed}">
-            <span class="menu-bar__check">✓</span><span>Right sidebar</span>
-          </button>
-          <hr class="menu-bar__separator">
-          <button type="button" class="menu-bar__dropdown-btn" data-action="set-theme" data-theme="light"
-                  aria-checked="${document.documentElement.getAttribute('data-theme') === 'light'}">
-            <span class="menu-bar__check">✓</span><span>Light theme</span>
-          </button>
-          <button type="button" class="menu-bar__dropdown-btn" data-action="set-theme" data-theme="dark"
-                  aria-checked="${document.documentElement.getAttribute('data-theme') === 'dark'}">
-            <span class="menu-bar__check">✓</span><span>Dark theme</span>
-          </button>
+    <div class="menu-bar ${open ? "menu-bar--open" : ""}">
+      <button class="hamburger" type="button" aria-label="Toggle menu" aria-expanded="${open}"
+              data-action="toggle-menu">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <line x1="3" y1="6"  x2="21" y2="6"/>
+          <line x1="3" y1="12" x2="21" y2="12"/>
+          <line x1="3" y1="18" x2="21" y2="18"/>
+        </svg>
+      </button>
+      <nav class="menu-bar__items" aria-hidden="${!open}">
+        <div class="menu-bar__item" data-menu="tasks">
+          <button type="button" class="menu-bar__btn" data-action="open-tasks">Tasks</button>
         </div>
-      </div>
-      <div class="menu-bar__item menu-bar__item--right" data-menu="help">
-        <button type="button" class="menu-bar__btn">Help</button>
-      </div>
-    </nav>
+        <div class="menu-bar__item" data-menu="views">
+          <button type="button" class="menu-bar__btn" data-action="toggle-menu-dropdown">Views</button>
+          <div class="menu-bar__dropdown">
+            <button type="button" class="menu-bar__dropdown-btn" data-action="toggle-left-sidebar"
+                    aria-checked="${!appState.leftCollapsed}">
+              <span class="menu-bar__check">✓</span><span>Left sidebar</span>
+            </button>
+            <button type="button" class="menu-bar__dropdown-btn" data-action="toggle-right-sidebar"
+                    aria-checked="${!appState.rightCollapsed}">
+              <span class="menu-bar__check">✓</span><span>Right sidebar</span>
+            </button>
+            <hr class="menu-bar__separator">
+            <button type="button" class="menu-bar__dropdown-btn" data-action="set-theme" data-theme="light"
+                    aria-checked="${document.documentElement.getAttribute('data-theme') === 'light'}">
+              <span class="menu-bar__check">✓</span><span>Light theme</span>
+            </button>
+            <button type="button" class="menu-bar__dropdown-btn" data-action="set-theme" data-theme="dark"
+                    aria-checked="${document.documentElement.getAttribute('data-theme') === 'dark'}">
+              <span class="menu-bar__check">✓</span><span>Dark theme</span>
+            </button>
+          </div>
+        </div>
+        <div class="menu-bar__item" data-menu="help">
+          <button type="button" class="menu-bar__btn">Help</button>
+        </div>
+      </nav>
+    </div>
   `;
 }
 
@@ -1895,8 +2593,9 @@ function bindMenuHandlers(): void {
 
   root.querySelectorAll<HTMLButtonElement>('[data-action="set-theme"]').forEach((btn) => {
     btn.addEventListener("click", () => {
-      const theme = btn.getAttribute("data-theme") ?? "dark";
+      const theme = btn.getAttribute("data-theme") === "dark" ? "dark" : "light";
       applyTheme(theme);
+      persistSettingLater("theme", theme);
       root.querySelectorAll<HTMLButtonElement>('[data-action="set-theme"]').forEach((b) =>
         b.setAttribute("aria-checked", String(b.getAttribute("data-theme") === theme))
       );
@@ -2554,10 +3253,14 @@ function bindTasksDialogHandlers(): void {
 
       logEvent("set_active_task", { task_id: id });
 
+      appState.activeLabels = task.labels;
+      appState.activeLabelSelectedId = firstLeafLabelId(task.labels);
+      appState.recentLabels = [];
       appState.imageList = [];
       appState.currentImageIndex = 0;
       appState.currentImageHash = null;
-      appState.annotations = [];
+      appState.masks = [];
+      closeMaskContextMenu();
 
       appState.tasksDialogOpen = false;
       render();
@@ -2641,17 +3344,11 @@ function updateTaskSummaryDesc(card: HTMLElement, task: Task): void {
 
 /** Renders the prototype UI and rebinds event handlers. */
 function render(): void {
-  appRoot.innerHTML = `
+      appRoot.innerHTML = `
     <div class="layout ${appState.leftCollapsed ? "left-collapsed" : ""} ${
       appState.rightCollapsed ? "right-collapsed" : ""
-    }">
+    }" style="--sidebar-right-width: ${appState.rightSidebarWidth}px;">
       <aside class="sidebar sidebar--left">
-        <div class="sidebar__header">
-          <strong>Navigator</strong>
-          <button type="button" class="ghost" data-action="toggle-left">${
-            appState.leftCollapsed ? ">" : "<"
-          }</button>
-        </div>
         <div class="sidebar__content">
           <button type="button" data-action="previous">previous</button>
           <button type="button" data-action="next">next</button>
@@ -2660,30 +3357,20 @@ function render(): void {
       </aside>
 
       <main class="image-view">
-        <div class="image-view__toolbar">
-          <strong>Image View</strong>
-          <span>Click canvas to add point annotation</span>
-        </div>
         <div class="image-view__canvas-wrap">
-          <canvas class="image-view__canvas" aria-label="Tile image viewer"></canvas>
+          <canvas class="image-view__canvas" aria-label="Tile image viewer" tabindex="0"></canvas>
         </div>
       </main>
 
       <aside class="sidebar sidebar--right">
-        <div class="sidebar__header">
-          <button type="button" class="ghost" data-action="toggle-right">${
-            appState.rightCollapsed ? "<" : ">"
-          }</button>
-          <strong>Controls</strong>
-        </div>
+        <div class="sidebar__resize-handle" role="separator" aria-orientation="vertical" aria-label="Resize right sidebar"></div>
         <div class="sidebar__content panels">
           ${renderPanel("optics", "optics", renderOpticsBody())}
-          ${renderPanel("masks", "masks", '<div class="muted">Prototype placeholder</div>')}
-          ${renderPanel("labels", "labels", '<div class="muted">Prototype placeholder</div>')}
+          ${renderPanel("labels", "labels", renderLabelTree(appState.activeLabels, appState.activeLabelSelectedId, false))}
           ${renderPanel(
             "annotations",
             "annotations",
-            `${renderAnnotationList()}<button type="button" data-action="clear-annotations">clear annotations</button>`
+            renderAnnotationList()
           )}
           ${renderPanel(
             "commentAnnotation",
@@ -2698,7 +3385,14 @@ function render(): void {
         </div>
       </aside>
     </div>
+    <button type="button" class="sidebar-toggle sidebar-toggle--left" data-action="toggle-left" aria-label="Toggle left sidebar">
+      ${appState.leftCollapsed ? ">" : "<"}
+    </button>
     ${renderMenuBar()}
+    <button type="button" class="sidebar-toggle sidebar-toggle--right" data-action="toggle-right" aria-label="Toggle right sidebar">
+      ${appState.rightCollapsed ? "<" : ">"}
+    </button>
+    ${renderMaskContextMenu()}
     ${renderTasksDialog()}
     ${renderDirBrowserOverlay()}
   `;
@@ -2707,26 +3401,23 @@ function render(): void {
   const nextBtn = appRoot.querySelector<HTMLButtonElement>('button[data-action="next"]');
   const toggleLeftBtn = appRoot.querySelector<HTMLButtonElement>('button[data-action="toggle-left"]');
   const toggleRightBtn = appRoot.querySelector<HTMLButtonElement>('button[data-action="toggle-right"]');
-  const panelToggles = appRoot.querySelectorAll<HTMLButtonElement>('button[data-action="toggle-panel"]');
-
   previousBtn?.addEventListener("click", goPreviousImage);
   nextBtn?.addEventListener("click", goNextImage);
   toggleLeftBtn?.addEventListener("click", toggleLeftSidebar);
   toggleRightBtn?.addEventListener("click", toggleRightSidebar);
 
-  panelToggles.forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const panelName = btn.getAttribute("data-panel") as keyof typeof appState.panelCollapsed;
-      togglePanel(panelName);
-    });
-  });
-
   bindAnnotationPanelHandlers();
   bindOpticsPanelHandlers();
   bindMenuHandlers();
+  bindActiveLabelPanelHandlers();
+  bindMaskContextMenuHandlers();
   bindTasksDialogHandlers();
   bindDirBrowserHandlers();
+  bindRightSidebarResizeHandle();
   mountViewer();
 }
 
-render();
+void (async () => {
+  await loadSettingsOnStartup();
+  render();
+})();
