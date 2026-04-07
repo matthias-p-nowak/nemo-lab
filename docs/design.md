@@ -377,8 +377,8 @@ Certain UI preferences are persisted per user in the backend and restored on nex
 - Both sidebar headers (`sidebar--left` and `sidebar--right`) have no label text — the header retains only the toggle button.
 - `div.image-view__toolbar` is removed entirely from the layout.
 - The "Masks" panel in the right sidebar is removed.
-- Panels are no longer collapsible — `panel__header` is a plain `<div>`, no toggle button. The optics panel header retains a click-to-reset behavior on its title span.
-- The optics panel has a top margin (`36px`) to clear the right sidebar collapse/expand button.
+- Panels have no headers — `renderPanel` emits only a `panel__body`, no title bar.
+- The optics panel has a top margin (`36px`) to clear the right sidebar collapse/expand button, and a small "reset" button aligned to the bottom-right of the panel body.
 
 ### Menu Bar
 
@@ -416,6 +416,16 @@ A mask is a geometric figure placed on the image canvas. Currently only point ma
 
 - A hierarchical system of categories, each identified by name.
 - The label tree is per-task (already modeled in `task_labels`).
+
+### Default Label
+
+The label panel in the right sidebar (read-only view) doubles as a label selector:
+
+- Exactly one label is selected at all times when the active task has labels. `appState.activeLabelSelectedId` is the source of truth.
+- On task activation: auto-select the first leaf label in the tree (depth-first). If the task has no labels, `activeLabelSelectedId` is `null`.
+- Clicking any `label-tree__row` in the sidebar sets that label as selected (`activeLabelSelectedId`) and re-renders the label panel to reflect the new selection.
+- The selected label is the default label auto-assigned to newly placed masks (replaces the `recentLabels[0]` fallback in `addMask`).
+- When a label is assigned to a mask via right-click context menu, `activeLabelSelectedId` is updated to that label and the label panel re-renders to reflect the new selection.
 
 ### Annotations
 

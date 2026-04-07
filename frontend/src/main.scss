@@ -196,15 +196,6 @@ button:hover {
   background: var(--bg-panel);
 }
 
-.panel__header {
-  border-bottom: 1px solid var(--line);
-  padding: 8px 10px;
-  text-transform: lowercase;
-  font-weight: 600;
-  background: var(--bg-toolbar);
-  cursor: default;
-}
-
 .panel__body {
   padding: 10px;
   display: flex;
@@ -214,6 +205,11 @@ button:hover {
 
 .panel[data-panel="optics"] {
   margin-top: 36px;
+}
+
+.optics-reset-row {
+  display: flex;
+  justify-content: flex-end;
 }
 
 .optics-row {
@@ -240,7 +236,8 @@ button:hover {
 
 .annotation-list {
   margin: 0;
-  padding-left: 22px;
+  padding: 0;
+  list-style: none;
   max-height: 120px;
   overflow: auto;
 }

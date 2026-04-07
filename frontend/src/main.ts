@@ -618,6 +618,45 @@ function createMaskId(): string {
   return `m-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
 }
 
+/** Returns first leaf label id in depth-first order, or null if tree is empty. */
+function firstLeafLabelId(nodes: LabelNode[]): string | null {
+  for (const node of nodes) {
+    if (node.children.length === 0) {
+      return node.id;
+    }
+    const childLeaf = firstLeafLabelId(node.children);
+    if (childLeaf) return childLeaf;
+  }
+  return null;
+}
+
+/** Finds a label node by id in a hierarchical tree. */
+function findLabelNodeById(nodes: LabelNode[], id: string): LabelNode | null {
+  for (const node of nodes) {
+    if (node.id === id) return node;
+    const found = findLabelNodeById(node.children, id);
+    if (found) return found;
+  }
+  return null;
+}
+
+/** Finds first label node id by name in a hierarchical tree. */
+function findLabelNodeIdByName(nodes: LabelNode[], name: string): string | null {
+  for (const node of nodes) {
+    if (node.text === name) return node.id;
+    const found = findLabelNodeIdByName(node.children, name);
+    if (found) return found;
+  }
+  return null;
+}
+
+/** Returns currently selected default label name from active labels, or null. */
+function getSelectedLabelName(): string | null {
+  const selectedId = appState.activeLabelSelectedId;
+  if (!selectedId) return null;
+  return findLabelNodeById(appState.activeLabels, selectedId)?.text ?? null;
+}
+
 /** Returns all label names from a hierarchical label tree in pre-order. */
 function flattenLabelNames(nodes: LabelNode[]): string[] {
   const out: string[] = [];
@@ -650,6 +689,11 @@ function assignLabelToMask(maskId: string, labelName: string): void {
   if (!mask) return;
   mask.labelName = labelName;
   touchRecentLabel(labelName);
+  const assignedId = findLabelNodeIdByName(appState.activeLabels, labelName);
+  if (assignedId) {
+    appState.activeLabelSelectedId = assignedId;
+    updateActiveLabelPanel();
+  }
   if (appState.currentImageHash) {
     logEvent("label_assigned", {
       image_hash: appState.currentImageHash,
@@ -662,12 +706,13 @@ function assignLabelToMask(maskId: string, labelName: string): void {
 /** Adds a mask point and applies last-used label if available. */
 function addMask(x: number, y: number): void {
   const nextIndex = appState.masks.reduce((max, mask) => Math.max(max, mask.index), 0) + 1;
+  const defaultLabel = getSelectedLabelName();
   const mask: MaskPoint = {
     id: createMaskId(),
     index: nextIndex,
     x,
     y,
-    labelName: appState.recentLabels[0] ?? null,
+    labelName: defaultLabel,
   };
   appState.masks.push(mask);
   if (appState.currentImageHash) {
@@ -713,14 +758,11 @@ function clearMasks(): void {
 /** Produces markup for a panel in the right sidebar. */
 function renderPanel(
   panelName: string,
-  title: string,
+  _title: string,
   contentHtml: string
 ): string {
   return `
     <section class="panel" data-panel="${panelName}">
-      <div class="panel__header">
-        <span>${title}</span>
-      </div>
       <div class="panel__body">${contentHtml}</div>
     </section>
   `;
@@ -735,12 +777,11 @@ function renderAnnotationList(): string {
   const items = appState.masks
     .map(
       (mask) =>
-        `<li>#${mask.index} (${Math.round(mask.x * 100)}%, ${Math.round(mask.y * 100)}%)` +
-        ` <span class="mask-label-chip">${mask.labelName ? mask.labelName.replace(/</g, "&lt;") : "unlabeled"}</span>` +
-        ` <button type="button" data-action="remove-mask" data-id="${mask.id}">remove</button></li>`
+        `<li>#${mask.index} <span class="mask-label-chip">${mask.labelName ? mask.labelName.replace(/</g, "&lt;") : "unlabeled"}</span>` +
+        ` <button type="button" class="task-pin__remove" data-action="remove-mask" data-id="${mask.id}" title="Remove mask">✕</button></li>`
     )
     .join("");
-  return `<ol class="annotation-list">${items}</ol>`;
+  return `<ul class="annotation-list">${items}</ul>`;
 }
 
 /** Renders the mask label-assignment context menu. */
@@ -772,7 +813,7 @@ function updateAnnotationUI(): void {
     '[data-panel="annotations"] .panel__body'
   );
   if (annotationsPanelBody) {
-    annotationsPanelBody.innerHTML = `${renderAnnotationList()}<button type="button" data-action="clear-annotations">clear masks</button>`;
+    annotationsPanelBody.innerHTML = renderAnnotationList();
     bindAnnotationPanelHandlers();
   }
   viewer?.draw();
@@ -780,8 +821,6 @@ function updateAnnotationUI(): void {
 
 /** Wires annotation list action buttons after panel-body updates. */
 function bindAnnotationPanelHandlers(): void {
-  const clearBtn = appRoot.querySelector<HTMLButtonElement>('button[data-action="clear-annotations"]');
-  clearBtn?.addEventListener("click", clearMasks);
 
   const removeButtons = appRoot.querySelectorAll<HTMLButtonElement>('button[data-action="remove-mask"]');
   removeButtons.forEach((btn) => {
@@ -813,6 +852,28 @@ function bindMaskContextMenuHandlers(): void {
     closeMaskContextMenu();
     render();
   }, { once: true });
+}
+
+/** Updates active-label panel body content without full app re-render. */
+function updateActiveLabelPanel(): void {
+  const panelBody = appRoot.querySelector<HTMLElement>('[data-panel="labels"] .panel__body');
+  if (!panelBody) return;
+  panelBody.innerHTML = renderLabelTree(appState.activeLabels, appState.activeLabelSelectedId, false);
+  bindActiveLabelPanelHandlers();
+}
+
+/** Binds read-only label selection in the sidebar labels panel. */
+function bindActiveLabelPanelHandlers(): void {
+  const panelBody = appRoot.querySelector<HTMLElement>('[data-panel="labels"] .panel__body');
+  if (!panelBody) return;
+  panelBody.querySelectorAll<HTMLElement>(".label-tree__row").forEach((row) => {
+    row.addEventListener("click", () => {
+      const nodeId = row.dataset["nodeId"];
+      if (!nodeId) return;
+      appState.activeLabelSelectedId = nodeId;
+      updateActiveLabelPanel();
+    });
+  });
 }
 
 /** Produces the optics panel body HTML with sliders and transform toggles. */
@@ -852,6 +913,9 @@ function renderOpticsBody(): string {
       <span>Vertical flip</span>
       <span class="optics-val"></span>
     </label>
+    <div class="optics-reset-row">
+      <button type="button" class="ghost" data-action="reset-optics" title="Reset optics">↺</button>
+    </div>
   `;
 }
 
@@ -898,27 +962,20 @@ function bindOpticsPanelHandlers(): void {
     });
   });
 
-  // Clicking the panel header title resets all optics to defaults.
-  const header = panel.querySelector<HTMLElement>(".panel__header");
-  if (header) {
-    header.addEventListener("click", (e) => {
-      const target = e.target as HTMLElement;
-      if (target.tagName === "SPAN" && target === header.querySelector("span:first-child")) {
-        appState.optics = {
-          gamma: 1.0,
-          multiply: 1.0,
-          add: 0.0,
-          rotate90cw: false,
-          flipH: false,
-          flipV: false,
-        };
-        applyOpticsToViewer();
-        persistOpticsSettingsLater();
-        // Re-render to update slider positions to reset values
-        render();
-      }
+  panel.querySelector<HTMLButtonElement>('[data-action="reset-optics"]')
+    ?.addEventListener("click", () => {
+      appState.optics = {
+        gamma: 1.0,
+        multiply: 1.0,
+        add: 0.0,
+        rotate90cw: false,
+        flipH: false,
+        flipV: false,
+      };
+      applyOpticsToViewer();
+      persistOpticsSettingsLater();
+      render();
     });
-  }
 }
 
 function applyOpticsToViewer(): void {
@@ -3197,8 +3254,8 @@ function bindTasksDialogHandlers(): void {
       logEvent("set_active_task", { task_id: id });
 
       appState.activeLabels = task.labels;
+      appState.activeLabelSelectedId = firstLeafLabelId(task.labels);
       appState.recentLabels = [];
-      appState.activeLabelSelectedId = task.selectedLabelId;
       appState.imageList = [];
       appState.currentImageIndex = 0;
       appState.currentImageHash = null;
@@ -3313,7 +3370,7 @@ function render(): void {
           ${renderPanel(
             "annotations",
             "annotations",
-            `${renderAnnotationList()}<button type="button" data-action="clear-annotations">clear masks</button>`
+            renderAnnotationList()
           )}
           ${renderPanel(
             "commentAnnotation",
@@ -3352,6 +3409,7 @@ function render(): void {
   bindAnnotationPanelHandlers();
   bindOpticsPanelHandlers();
   bindMenuHandlers();
+  bindActiveLabelPanelHandlers();
   bindMaskContextMenuHandlers();
   bindTasksDialogHandlers();
   bindDirBrowserHandlers();
