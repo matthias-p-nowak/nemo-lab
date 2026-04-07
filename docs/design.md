@@ -187,7 +187,7 @@ CREATE TABLE users (
 
 - Left collapsible sidebar: previous / next image buttons
 - Center image view: single WebGL canvas fills the area
-- Right collapsible sidebar: collapsible panels — [Optics](#optics-panel), masks, labels, annotations, comment/annotation, comment/picture
+- Right collapsible sidebar: collapsible panels — [Optics](#optics-panel), masks, labels, annotations, comment/annotation, comment/picture. Width is user-resizable (drag left edge); see [Right Sidebar](#right-sidebar).
 
 ### Menu Bar
 
@@ -289,7 +289,7 @@ Three checkmark controls below the sliders, laid out in the same column grid (ch
 
 - Each control is an independent toggle.
 - Transforms are applied in fixed order: R first, then H, then V. The 3-bit state `(R, H, V)` fully describes the active transform (e.g. `100` = rotate only, `010` = H-flip only, `011` = H+V = rotate 180).
-- When Main Area has focus, `PageUp`/`PageDown` cycles this exact sequence:
+- `PageUp`/`PageDown` cycles this exact sequence from a document-level handler (except when focus is in `input`/`textarea`/`select`):
   - normal (`000`) → rotate 90 CW (`100`) → rotate 180 (`011`) → rotate 270 (`111`) → horizontal flip (`010`) → horizontal flip + rotate 90 (`110`) → horizontal flip + rotate 180 (`001`) → horizontal flip + rotate 270 (`101`).
 - Cycling wraps at both ends.
 - Keyboard cycling updates the R/H/V checkmarks to match the active state.
@@ -341,6 +341,47 @@ Only tiles whose image-space rectangle intersects the current viewport are fetch
 
 - When a tile texture is uploaded and placed, log a `tile_placed` event with: level, tile coordinates (`tx`, `ty`), and canvas position (`x`, `y`, `width`, `height` in CSS pixels)
 - Purpose: diagnose tile jump/flicker bugs by correlating placement position with zoom/pan state at that moment
+
+### User Settings
+
+Certain UI preferences are persisted per user in the backend and restored on next login.
+
+**Persisted settings:**
+
+| Key                   | Values / type        | Description                        |
+|-----------------------|----------------------|------------------------------------|
+| `theme`               | `light` \| `dark`    | Active color theme                 |
+| `sidebar_left`        | `visible` \| `hidden`| Left sidebar collapsed/expanded    |
+| `sidebar_right`       | `visible` \| `hidden`| Right sidebar collapsed/expanded   |
+| `optics_gamma`        | float string         | Gamma correction slider value      |
+| `optics_brightness_mul` | float string       | Brightness multiply slider value   |
+| `optics_brightness_add` | float string       | Brightness additive slider value   |
+| `optics_rotate90cw`   | `0` \| `1`           | R transform toggle state           |
+| `optics_flip_h`       | `0` \| `1`           | H transform toggle state           |
+| `optics_flip_v`       | `0` \| `1`           | V transform toggle state           |
+| `sidebar_right_width` | integer string (px)  | Right sidebar width in CSS pixels  |
+
+**Storage:** `user_settings` SQLite table — one row per (user_id, key). Values stored as strings.
+
+**API:**
+- `GET /api/settings` — returns all settings for the authenticated user as a flat JSON object `{ key: value, ... }`.
+- `PUT /api/settings` — accepts a flat JSON object; upserts each key for the authenticated user.
+
+**Behavior:**
+- On login/page load, frontend fetches `GET /api/settings` and applies each setting before first render.
+- Each setting is written via `PUT /api/settings` immediately when it changes in the UI.
+- `theme` is no longer sourced from `nemo.toml`; the server-side default is `light` when no setting exists.
+
+### Right Sidebar
+
+- Width is user-resizable via a drag handle on the left edge of the sidebar.
+- Default width: `320px`. Minimum width: `200px`. No maximum enforced.
+- Width is persisted in `user_settings` as `sidebar_right_width` (integer string, CSS pixels). Loaded on page load; written on drag end.
+- The layout uses a CSS variable `--sidebar-right-width` (default `320px`) in `grid-template-columns` instead of a hardcoded value.
+- A `<div class="sidebar__resize-handle">` as the first child of `.sidebar--right` acts as the drag target (`cursor: ew-resize`, `width: 4px`, absolutely positioned on the left edge).
+- On `pointerdown` on the handle, `pointermove` updates `--sidebar-right-width` = `document.body.clientWidth − event.clientX`, clamped to min `200px`; `pointerup` persists the value.
+- `.sidebar__content` has `flex: 1` and `overflow-y: auto` so panels scroll vertically and are never clipped.
+- Each `.panel` expands to its natural content height — no fixed or max height on `.panel` or `.panel__body`.
 
 ### Annotations
 

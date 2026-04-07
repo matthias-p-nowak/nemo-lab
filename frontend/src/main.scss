@@ -52,14 +52,15 @@ body {
 }
 
 .layout {
+  --sidebar-right-width: 320px;
   display: grid;
-  grid-template-columns: 240px minmax(0, 1fr) 320px;
+  grid-template-columns: 240px minmax(0, 1fr) var(--sidebar-right-width);
   width: 100%;
   height: 100%;
 }
 
 .layout.left-collapsed {
-  grid-template-columns: 48px minmax(0, 1fr) 320px;
+  grid-template-columns: 48px minmax(0, 1fr) var(--sidebar-right-width);
 }
 
 .layout.right-collapsed {
@@ -79,9 +80,24 @@ body {
 }
 
 .sidebar--right {
+  position: relative;
   border-right: none;
   border-left: 1px solid var(--line);
   background: var(--bg-panel-alt);
+}
+
+.sidebar__resize-handle {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  cursor: ew-resize;
+  z-index: 3;
+}
+
+.layout.right-collapsed .sidebar--right .sidebar__resize-handle {
+  display: none;
 }
 
 .sidebar__header {
@@ -97,9 +113,10 @@ body {
 .sidebar__content {
   display: flex;
   flex-direction: column;
+  flex: 1;
   gap: 8px;
   padding: 10px;
-  overflow: auto;
+  overflow-y: auto;
 }
 
 .layout.left-collapsed .sidebar--left .sidebar__content,
@@ -220,7 +237,6 @@ button.ghost {
 .panel {
   border: 1px solid var(--line);
   border-radius: 8px;
-  overflow: hidden;
   background: var(--bg-panel);
 }
 
@@ -1025,11 +1041,11 @@ textarea {
 
 @media (max-width: 960px) {
   .layout {
-    grid-template-columns: 180px minmax(0, 1fr) 220px;
+    grid-template-columns: 180px minmax(0, 1fr) var(--sidebar-right-width);
   }
 
   .layout.left-collapsed {
-    grid-template-columns: 40px minmax(0, 1fr) 220px;
+    grid-template-columns: 40px minmax(0, 1fr) var(--sidebar-right-width);
   }
 
   .layout.right-collapsed {

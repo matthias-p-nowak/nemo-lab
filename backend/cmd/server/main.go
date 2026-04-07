@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/matthias-p-nowak/nemo-lab/auth"
 	"github.com/matthias-p-nowak/nemo-lab/config"
@@ -38,8 +39,9 @@ func main() {
 	tiles.Configure(cfg.CacheDir, cfg.CacheLimitMB, cfg.CacheEvictInterval, cfg.TileWorkers)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/config", makeConfigHandler(cfg))
 	mux.HandleFunc("GET /api/me", makeMeHandler(sqlDB))
+	mux.HandleFunc("GET /api/settings", makeSettingsGetHandler(sqlDB))
+	mux.HandleFunc("PUT /api/settings", makeSettingsPutHandler(sqlDB))
 	mux.HandleFunc("GET /api/tasks", makeTasksListHandler(sqlDB))
 	mux.HandleFunc("PUT /api/tasks/{id}", makeTaskUpsertHandler(sqlDB))
 	mux.HandleFunc("DELETE /api/tasks/{id}", makeTaskDeleteHandler(sqlDB))
@@ -57,16 +59,6 @@ func main() {
 	}
 }
 
-func makeConfigHandler(cfg *config.Config) http.HandlerFunc {
-	type configResponse struct {
-		Theme string `json:"theme"`
-	}
-	resp := configResponse{Theme: cfg.Theme}
-	return func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, resp)
-	}
-}
-
 func makeMeHandler(db *sql.DB) http.HandlerFunc {
 	type meResponse struct {
 		Username string `json:"username"`
@@ -79,6 +71,103 @@ func makeMeHandler(db *sql.DB) http.HandlerFunc {
 			IsAdmin:  isAdmin(db, r),
 		})
 		taskAPILog(db, r, "get_me:ok")
+	}
+}
+
+func makeSettingsGetHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		settingsAPILog(db, r, "get:start")
+		userID, err := userIDFromRequest(db, r)
+		if err != nil {
+			settingsAPILog(db, r, fmt.Sprintf("get:error user=%v", err))
+			http.Error(w, "user lookup failed", http.StatusInternalServerError)
+			return
+		}
+
+		rows, err := db.Query("SELECT key, value FROM user_settings WHERE user_id = ?", userID)
+		if err != nil {
+			settingsAPILog(db, r, fmt.Sprintf("get:error query=%v", err))
+			http.Error(w, "load settings failed", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		out := map[string]string{}
+		for rows.Next() {
+			var key string
+			var value string
+			if err := rows.Scan(&key, &value); err != nil {
+				settingsAPILog(db, r, fmt.Sprintf("get:error scan=%v", err))
+				http.Error(w, "load settings failed", http.StatusInternalServerError)
+				return
+			}
+			out[key] = value
+		}
+		if err := rows.Err(); err != nil {
+			settingsAPILog(db, r, fmt.Sprintf("get:error rows=%v", err))
+			http.Error(w, "load settings failed", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+		settingsAPILog(db, r, fmt.Sprintf("get:ok count=%d", len(out)))
+	}
+}
+
+func makeSettingsPutHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		settingsAPILog(db, r, "put:start")
+		userID, err := userIDFromRequest(db, r)
+		if err != nil {
+			settingsAPILog(db, r, fmt.Sprintf("put:error user=%v", err))
+			http.Error(w, "user lookup failed", http.StatusInternalServerError)
+			return
+		}
+
+		body := map[string]string{}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			settingsAPILog(db, r, fmt.Sprintf("put:error decode=%v", err))
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+
+		tx, err := db.Begin()
+		if err != nil {
+			settingsAPILog(db, r, fmt.Sprintf("put:error begin=%v", err))
+			http.Error(w, "save settings failed", http.StatusInternalServerError)
+			return
+		}
+		committed := false
+		defer func() {
+			if !committed {
+				_ = tx.Rollback()
+			}
+		}()
+
+		for key, value := range body {
+			key = strings.TrimSpace(key)
+			if key == "" {
+				settingsAPILog(db, r, "put:error empty_key")
+				http.Error(w, "invalid setting key", http.StatusBadRequest)
+				return
+			}
+			if _, err := tx.Exec(`
+				INSERT INTO user_settings(user_id, key, value) VALUES (?, ?, ?)
+				ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value
+			`, userID, key, value); err != nil {
+				settingsAPILog(db, r, fmt.Sprintf("put:error upsert key=%s err=%v", key, err))
+				http.Error(w, "save settings failed", http.StatusInternalServerError)
+				return
+			}
+		}
+
+		if err := tx.Commit(); err != nil {
+			settingsAPILog(db, r, fmt.Sprintf("put:error commit=%v", err))
+			http.Error(w, "save settings failed", http.StatusInternalServerError)
+			return
+		}
+		committed = true
+		w.WriteHeader(http.StatusOK)
+		settingsAPILog(db, r, fmt.Sprintf("put:ok count=%d", len(body)))
 	}
 }
 
@@ -303,6 +392,29 @@ func taskAPILog(db *sql.DB, r *http.Request, msg string) {
 		auth.UsernameFromRequest(r),
 		isAdmin(db, r),
 	)
+}
+
+func settingsAPILog(db *sql.DB, r *http.Request, msg string) {
+	log.Printf(
+		"settings_api %s method=%s path=%s user=%s admin=%t",
+		msg,
+		r.Method,
+		r.URL.Path,
+		auth.UsernameFromRequest(r),
+		isAdmin(db, r),
+	)
+}
+
+func userIDFromRequest(db *sql.DB, r *http.Request) (int64, error) {
+	username := auth.UsernameFromRequest(r)
+	if username == "" {
+		return 0, errors.New("missing username in request context")
+	}
+	var userID int64
+	if err := db.QueryRow("SELECT id FROM users WHERE username = ?", username).Scan(&userID); err != nil {
+		return 0, err
+	}
+	return userID, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

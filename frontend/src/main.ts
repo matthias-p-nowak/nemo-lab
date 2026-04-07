@@ -4,27 +4,32 @@ const config = {
   clickMaxDragPx: 10,
 };
 
-/** Applies a theme by setting data-theme on <html> and persisting to localStorage. */
+/** Applies a theme by setting data-theme on <html>. */
 function applyTheme(theme: string): void {
   document.documentElement.setAttribute("data-theme", theme);
-  localStorage.setItem("nemo_theme", theme);
 }
 
-// Initialise theme: localStorage preference takes priority, then server default.
-(async () => {
-  const stored = localStorage.getItem("nemo_theme");
-  if (stored === "light" || stored === "dark") {
-    applyTheme(stored);
-  } else {
-    try {
-      const res = await fetch("/api/config");
-      const data = (await res.json()) as { theme?: string };
-      applyTheme(data.theme === "light" ? "light" : "dark");
-    } catch {
-      applyTheme("dark");
-    }
+type SettingsMap = Record<string, string>;
+
+/** Persists one or more user settings for the current user. */
+async function persistSettingsPatch(patch: SettingsMap): Promise<void> {
+  const response = await fetch("/api/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  if (!response.ok) {
+    throw new Error(`PUT /api/settings failed: ${response.status}`);
   }
-})();
+}
+
+/** Persists one user setting in the background and logs failures. */
+function persistSettingLater(key: string, value: string): void {
+  void persistSettingsPatch({ [key]: value }).catch((err) => {
+    console.error("settings: persist failed", key, err);
+    logEvent("settings_error", { op: "put", key, error: String(err) });
+  });
+}
 
 /** WebSocket endpoint for backend events. */
 const ws = new WebSocket(`ws://${location.host}/ws`);
@@ -52,6 +57,23 @@ document.addEventListener("focusout", (e) =>
   logEvent("focus", { action: "out", target: (e.target as Element | null)?.tagName ?? "unknown" })
 );
 
+/** Global PageUp/PageDown handler guard for editable targets. */
+function isEditableKeyTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  const tag = target.tagName;
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target.isContentEditable;
+}
+
+/** Handles document-level optics transform cycling hotkeys. */
+function handleDocumentPageCycleKeydown(e: KeyboardEvent): void {
+  if (e.key !== "PageUp" && e.key !== "PageDown") return;
+  if (isEditableKeyTarget(e.target)) return;
+  e.preventDefault();
+  cycleOpticsTransform(e.key === "PageUp" ? 1 : -1);
+}
+
+document.addEventListener("keydown", handleDocumentPageCycleKeydown);
+
 /** Mutable prototype application state. */
 const appState = {
   currentImageIndex: 0,
@@ -59,6 +81,7 @@ const appState = {
   currentImageHash: null as string | null,
   leftCollapsed: false,
   rightCollapsed: false,
+  rightSidebarWidth: 320,
   panelCollapsed: {
     optics: false,
     masks: false,
@@ -150,6 +173,70 @@ const appState = {
     flipV: false,
   },
 };
+
+/** Parses a persisted float string with fallback. */
+function parseSettingFloat(value: string | undefined, fallback: number): number {
+  if (value === undefined) return fallback;
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+/** Parses a persisted bool string with fallback. */
+function parseSettingBool(value: string | undefined, fallback: boolean): boolean {
+  if (value === undefined) return fallback;
+  return value === "true";
+}
+
+/** Parses a persisted integer string with fallback. */
+function parseSettingInt(value: string | undefined, fallback: number): number {
+  if (value === undefined) return fallback;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+/** Fetches settings and applies them to app state before first render. */
+async function loadSettingsOnStartup(): Promise<void> {
+  applyTheme("light");
+  try {
+    const response = await fetch("/api/settings");
+    if (!response.ok) {
+      throw new Error(`GET /api/settings failed: ${response.status}`);
+    }
+    const settings = (await response.json()) as Record<string, unknown>;
+    const get = (key: string): string | undefined => {
+      const value = settings[key];
+      return typeof value === "string" ? value : undefined;
+    };
+    applyTheme(get("theme") === "dark" ? "dark" : "light");
+    appState.leftCollapsed = get("sidebar_left") === "hidden";
+    appState.rightCollapsed = get("sidebar_right") === "hidden";
+    appState.rightSidebarWidth = Math.max(200, parseSettingInt(get("sidebar_right_width"), appState.rightSidebarWidth));
+    appState.optics.gamma = parseSettingFloat(get("optics_gamma"), appState.optics.gamma);
+    appState.optics.multiply = parseSettingFloat(get("optics_brightness_mul"), appState.optics.multiply);
+    appState.optics.add = parseSettingFloat(get("optics_brightness_add"), appState.optics.add);
+    appState.optics.rotate90cw = parseSettingBool(get("optics_rotate90cw"), appState.optics.rotate90cw);
+    appState.optics.flipH = parseSettingBool(get("optics_flip_h"), appState.optics.flipH);
+    appState.optics.flipV = parseSettingBool(get("optics_flip_v"), appState.optics.flipV);
+  } catch (err) {
+    console.error("settings: load failed", err);
+    logEvent("settings_error", { op: "get", error: String(err) });
+  }
+}
+
+/** Persists all optics-related settings in one request. */
+function persistOpticsSettingsLater(): void {
+  void persistSettingsPatch({
+    optics_gamma: String(appState.optics.gamma),
+    optics_brightness_mul: String(appState.optics.multiply),
+    optics_brightness_add: String(appState.optics.add),
+    optics_rotate90cw: String(appState.optics.rotate90cw),
+    optics_flip_h: String(appState.optics.flipH),
+    optics_flip_v: String(appState.optics.flipV),
+  }).catch((err) => {
+    console.error("settings: persist optics failed", err);
+    logEvent("settings_error", { op: "put", key: "optics", error: String(err) });
+  });
+}
 
 const OPTICS_TRANSFORM_SEQUENCE: Array<{
   rotate90cw: boolean;
@@ -435,13 +522,47 @@ ws.addEventListener("message", (event) => {
 /** Toggles left sidebar visibility state. */
 function toggleLeftSidebar(): void {
   appState.leftCollapsed = !appState.leftCollapsed;
+  persistSettingLater("sidebar_left", appState.leftCollapsed ? "hidden" : "visible");
   render();
 }
 
 /** Toggles right sidebar visibility state. */
 function toggleRightSidebar(): void {
   appState.rightCollapsed = !appState.rightCollapsed;
+  persistSettingLater("sidebar_right", appState.rightCollapsed ? "hidden" : "visible");
   render();
+}
+
+/** Updates the current layout CSS variable for right sidebar width. */
+function applyRightSidebarWidth(widthPx: number): void {
+  appState.rightSidebarWidth = Math.max(200, Math.round(widthPx));
+  const layout = appRoot.querySelector<HTMLElement>(".layout");
+  layout?.style.setProperty("--sidebar-right-width", `${appState.rightSidebarWidth}px`);
+}
+
+/** Wires right-sidebar resize-handle drag interactions. */
+function bindRightSidebarResizeHandle(): void {
+  const handle = appRoot.querySelector<HTMLElement>(".sidebar--right .sidebar__resize-handle");
+  if (!handle) return;
+
+  handle.addEventListener("pointerdown", (event) => {
+    if (appState.rightCollapsed) return;
+    event.preventDefault();
+    handle.setPointerCapture(event.pointerId);
+    const onPointerMove = (moveEvent: PointerEvent): void => {
+      const nextWidth = Math.max(200, document.body.clientWidth - moveEvent.clientX);
+      applyRightSidebarWidth(nextWidth);
+    };
+    const onPointerUp = (): void => {
+      handle.removeEventListener("pointermove", onPointerMove);
+      handle.removeEventListener("pointerup", onPointerUp);
+      handle.removeEventListener("pointercancel", onPointerUp);
+      persistSettingLater("sidebar_right_width", String(appState.rightSidebarWidth));
+    };
+    handle.addEventListener("pointermove", onPointerMove);
+    handle.addEventListener("pointerup", onPointerUp);
+    handle.addEventListener("pointercancel", onPointerUp);
+  });
 }
 
 /** Toggles a single right-side panel open/closed state. */
@@ -599,6 +720,12 @@ function bindOpticsPanelHandlers(): void {
       }
 
       applyOpticsToViewer();
+      const settingsKey = key === "gamma"
+        ? "optics_gamma"
+        : key === "multiply"
+          ? "optics_brightness_mul"
+          : "optics_brightness_add";
+      persistSettingLater(settingsKey, String(val));
     });
   });
 
@@ -607,6 +734,12 @@ function bindOpticsPanelHandlers(): void {
       const key = checkbox.getAttribute("data-transform") as "rotate90cw" | "flipH" | "flipV";
       appState.optics[key] = checkbox.checked;
       applyOpticsToViewer();
+      const settingsKey = key === "rotate90cw"
+        ? "optics_rotate90cw"
+        : key === "flipH"
+          ? "optics_flip_h"
+          : "optics_flip_v";
+      persistSettingLater(settingsKey, String(checkbox.checked));
     });
   });
 
@@ -628,6 +761,7 @@ function bindOpticsPanelHandlers(): void {
           flipV: false,
         };
         applyOpticsToViewer();
+        persistOpticsSettingsLater();
         // Re-render to update slider positions to reset values
         render();
       }
@@ -660,6 +794,7 @@ function cycleOpticsTransform(step: 1 | -1): void {
   appState.optics.flipH = nextState.flipH;
   appState.optics.flipV = nextState.flipV;
   applyOpticsToViewer();
+  persistOpticsSettingsLater();
   render();
 }
 
@@ -1724,17 +1859,6 @@ function mountViewer(): void {
     void viewer.setImage(appState.currentImageHash);
   }
 
-  canvas.addEventListener("keydown", (e) => {
-    if (e.key === "PageUp") {
-      e.preventDefault();
-      cycleOpticsTransform(1);
-      return;
-    }
-    if (e.key === "PageDown") {
-      e.preventDefault();
-      cycleOpticsTransform(-1);
-    }
-  });
 }
 
 // ── Menu bar ─────────────────────────────────────────────────────────────────
@@ -2147,8 +2271,9 @@ function bindMenuHandlers(): void {
 
   root.querySelectorAll<HTMLButtonElement>('[data-action="set-theme"]').forEach((btn) => {
     btn.addEventListener("click", () => {
-      const theme = btn.getAttribute("data-theme") ?? "dark";
+      const theme = btn.getAttribute("data-theme") === "dark" ? "dark" : "light";
       applyTheme(theme);
+      persistSettingLater("theme", theme);
       root.querySelectorAll<HTMLButtonElement>('[data-action="set-theme"]').forEach((b) =>
         b.setAttribute("aria-checked", String(b.getAttribute("data-theme") === theme))
       );
@@ -2898,7 +3023,7 @@ function render(): void {
   appRoot.innerHTML = `
     <div class="layout ${appState.leftCollapsed ? "left-collapsed" : ""} ${
       appState.rightCollapsed ? "right-collapsed" : ""
-    }">
+    }" style="--sidebar-right-width: ${appState.rightSidebarWidth}px;">
       <aside class="sidebar sidebar--left">
         <div class="sidebar__header">
           <strong>Navigator</strong>
@@ -2924,6 +3049,7 @@ function render(): void {
       </main>
 
       <aside class="sidebar sidebar--right">
+        <div class="sidebar__resize-handle" role="separator" aria-orientation="vertical" aria-label="Resize right sidebar"></div>
         <div class="sidebar__header">
           <button type="button" class="ghost" data-action="toggle-right">${
             appState.rightCollapsed ? "<" : ">"
@@ -2980,7 +3106,11 @@ function render(): void {
   bindMenuHandlers();
   bindTasksDialogHandlers();
   bindDirBrowserHandlers();
+  bindRightSidebarResizeHandle();
   mountViewer();
 }
 
-render();
+void (async () => {
+  await loadSettingsOnStartup();
+  render();
+})();
