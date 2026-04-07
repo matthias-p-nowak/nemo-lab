@@ -372,6 +372,22 @@ Certain UI preferences are persisted per user in the backend and restored on nex
 - Each setting is written via `PUT /api/settings` immediately when it changes in the UI.
 - `theme` is no longer sourced from `nemo.toml`; the server-side default is `light` when no setting exists.
 
+### GUI Cleanup
+
+- Both sidebar headers (`sidebar--left` and `sidebar--right`) have no label text — remove `<strong>` from `.sidebar__header` in both sidebars. The header retains only the toggle button.
+- `div.image-view__toolbar` (containing the "Image View" caption and "Click canvas to add point annotation" hint) is removed entirely from the layout.
+
+### Menu Bar
+
+The menu bar is restructured so that sidebar toggle buttons are always visible and the menu content is invisible and non-interactive when closed:
+
+- The left-sidebar toggle button and right-sidebar toggle button are **always visible**, fixed-positioned in the top corners (left and right respectively), independent of menu open state.
+- The hamburger button is **always visible**, fixed-positioned between the two sidebar toggles.
+- Only the menu items (Tasks, Views, Help) and the bar background/border toggle:
+  - **Closed**: invisible and `pointer-events: none` — mouse events pass through to the canvas below.
+  - **Open**: visible, fully interactive, with background and border.
+- No overlap between any of these controls.
+
 ### Right Sidebar
 
 - Width is user-resizable via a drag handle on the left edge of the sidebar.

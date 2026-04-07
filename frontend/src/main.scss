@@ -120,9 +120,7 @@ body {
 }
 
 .layout.left-collapsed .sidebar--left .sidebar__content,
-.layout.right-collapsed .sidebar--right .sidebar__content,
-.layout.left-collapsed .sidebar--left .sidebar__header strong,
-.layout.right-collapsed .sidebar--right .sidebar__header strong {
+.layout.right-collapsed .sidebar--right .sidebar__content {
   display: none;
 }
 
@@ -144,12 +142,6 @@ button:hover {
   background: var(--button-bg-hover);
 }
 
-button.ghost {
-  width: 28px;
-  height: 28px;
-  padding: 0;
-}
-
 .meta,
 .muted {
   color: var(--text-muted);
@@ -162,21 +154,6 @@ button.ghost {
   min-width: 0;
   min-height: 0;
   background: var(--bg);
-}
-
-.image-view__toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 10px 14px;
-  border-bottom: 1px solid var(--line);
-  background: var(--bg-toolbar);
-}
-
-.image-view__toolbar span {
-  color: var(--text-muted);
-  font-size: 0.9rem;
 }
 
 .image-view__canvas-wrap {
@@ -307,10 +284,8 @@ textarea {
 // ── Hamburger ────────────────────────────────────────────────────────────────
 
 .hamburger {
-  position: fixed;
-  top: 10px;
-  left: 10px;
-  z-index: 200;
+  position: static;
+  pointer-events: auto;
   background: none;
   border: none;
   cursor: pointer;
@@ -329,29 +304,39 @@ textarea {
 
 .menu-bar {
   position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 44px;
-  background: var(--bg-toolbar);
-  border-bottom: 1px solid var(--line);
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  pointer-events: none;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  z-index: 200;
+
+  &.menu-bar--open {
+    pointer-events: auto;
+    background: var(--bg-toolbar);
+    border-color: var(--line);
+    padding: 2px 8px;
+  }
+}
+
+.menu-bar__items {
   display: none;
   align-items: center;
   gap: 4px;
-  padding: 0 8px 0 48px;
-  z-index: 100;
+}
 
-  &.menu-bar--open {
-    display: flex;
-  }
+.menu-bar.menu-bar--open .menu-bar__items {
+  display: flex;
 }
 
 .menu-bar__item {
   position: relative;
-
-  &--right {
-    margin-left: auto;
-  }
 
   &--active .menu-bar__dropdown {
     display: block;
@@ -420,6 +405,23 @@ textarea {
 
 .menu-bar__dropdown-btn[aria-checked="true"] .menu-bar__check {
   visibility: visible;
+}
+
+.sidebar-toggle {
+  position: fixed;
+  top: 10px;
+  z-index: 220;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+}
+
+.sidebar-toggle--left {
+  left: 10px;
+}
+
+.sidebar-toggle--right {
+  right: 10px;
 }
 
 // ── Tasks dialog ─────────────────────────────────────────────────────────────

@@ -2201,44 +2201,46 @@ function bindDirBrowserHandlers(): void {
 function renderMenuBar(): string {
   const open = appState.menuOpen;
   return `
-    <button class="hamburger" type="button" aria-label="Toggle menu" aria-expanded="${open}"
-            data-action="toggle-menu">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-        <line x1="3" y1="6"  x2="21" y2="6"/>
-        <line x1="3" y1="12" x2="21" y2="12"/>
-        <line x1="3" y1="18" x2="21" y2="18"/>
-      </svg>
-    </button>
-    <nav class="menu-bar ${open ? "menu-bar--open" : ""}" aria-hidden="${!open}">
-      <div class="menu-bar__item" data-menu="tasks">
-        <button type="button" class="menu-bar__btn" data-action="open-tasks">Tasks</button>
-      </div>
-      <div class="menu-bar__item" data-menu="views">
-        <button type="button" class="menu-bar__btn" data-action="toggle-menu-dropdown">Views</button>
-        <div class="menu-bar__dropdown">
-          <button type="button" class="menu-bar__dropdown-btn" data-action="toggle-left-sidebar"
-                  aria-checked="${!appState.leftCollapsed}">
-            <span class="menu-bar__check">✓</span><span>Left sidebar</span>
-          </button>
-          <button type="button" class="menu-bar__dropdown-btn" data-action="toggle-right-sidebar"
-                  aria-checked="${!appState.rightCollapsed}">
-            <span class="menu-bar__check">✓</span><span>Right sidebar</span>
-          </button>
-          <hr class="menu-bar__separator">
-          <button type="button" class="menu-bar__dropdown-btn" data-action="set-theme" data-theme="light"
-                  aria-checked="${document.documentElement.getAttribute('data-theme') === 'light'}">
-            <span class="menu-bar__check">✓</span><span>Light theme</span>
-          </button>
-          <button type="button" class="menu-bar__dropdown-btn" data-action="set-theme" data-theme="dark"
-                  aria-checked="${document.documentElement.getAttribute('data-theme') === 'dark'}">
-            <span class="menu-bar__check">✓</span><span>Dark theme</span>
-          </button>
+    <div class="menu-bar ${open ? "menu-bar--open" : ""}">
+      <button class="hamburger" type="button" aria-label="Toggle menu" aria-expanded="${open}"
+              data-action="toggle-menu">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <line x1="3" y1="6"  x2="21" y2="6"/>
+          <line x1="3" y1="12" x2="21" y2="12"/>
+          <line x1="3" y1="18" x2="21" y2="18"/>
+        </svg>
+      </button>
+      <nav class="menu-bar__items" aria-hidden="${!open}">
+        <div class="menu-bar__item" data-menu="tasks">
+          <button type="button" class="menu-bar__btn" data-action="open-tasks">Tasks</button>
         </div>
-      </div>
-      <div class="menu-bar__item menu-bar__item--right" data-menu="help">
-        <button type="button" class="menu-bar__btn">Help</button>
-      </div>
-    </nav>
+        <div class="menu-bar__item" data-menu="views">
+          <button type="button" class="menu-bar__btn" data-action="toggle-menu-dropdown">Views</button>
+          <div class="menu-bar__dropdown">
+            <button type="button" class="menu-bar__dropdown-btn" data-action="toggle-left-sidebar"
+                    aria-checked="${!appState.leftCollapsed}">
+              <span class="menu-bar__check">✓</span><span>Left sidebar</span>
+            </button>
+            <button type="button" class="menu-bar__dropdown-btn" data-action="toggle-right-sidebar"
+                    aria-checked="${!appState.rightCollapsed}">
+              <span class="menu-bar__check">✓</span><span>Right sidebar</span>
+            </button>
+            <hr class="menu-bar__separator">
+            <button type="button" class="menu-bar__dropdown-btn" data-action="set-theme" data-theme="light"
+                    aria-checked="${document.documentElement.getAttribute('data-theme') === 'light'}">
+              <span class="menu-bar__check">✓</span><span>Light theme</span>
+            </button>
+            <button type="button" class="menu-bar__dropdown-btn" data-action="set-theme" data-theme="dark"
+                    aria-checked="${document.documentElement.getAttribute('data-theme') === 'dark'}">
+              <span class="menu-bar__check">✓</span><span>Dark theme</span>
+            </button>
+          </div>
+        </div>
+        <div class="menu-bar__item" data-menu="help">
+          <button type="button" class="menu-bar__btn">Help</button>
+        </div>
+      </nav>
+    </div>
   `;
 }
 
@@ -3020,17 +3022,11 @@ function updateTaskSummaryDesc(card: HTMLElement, task: Task): void {
 
 /** Renders the prototype UI and rebinds event handlers. */
 function render(): void {
-  appRoot.innerHTML = `
+      appRoot.innerHTML = `
     <div class="layout ${appState.leftCollapsed ? "left-collapsed" : ""} ${
       appState.rightCollapsed ? "right-collapsed" : ""
     }" style="--sidebar-right-width: ${appState.rightSidebarWidth}px;">
       <aside class="sidebar sidebar--left">
-        <div class="sidebar__header">
-          <strong>Navigator</strong>
-          <button type="button" class="ghost" data-action="toggle-left">${
-            appState.leftCollapsed ? ">" : "<"
-          }</button>
-        </div>
         <div class="sidebar__content">
           <button type="button" data-action="previous">previous</button>
           <button type="button" data-action="next">next</button>
@@ -3039,10 +3035,6 @@ function render(): void {
       </aside>
 
       <main class="image-view">
-        <div class="image-view__toolbar">
-          <strong>Image View</strong>
-          <span>Click canvas to add point annotation</span>
-        </div>
         <div class="image-view__canvas-wrap">
           <canvas class="image-view__canvas" aria-label="Tile image viewer" tabindex="0"></canvas>
         </div>
@@ -3050,12 +3042,6 @@ function render(): void {
 
       <aside class="sidebar sidebar--right">
         <div class="sidebar__resize-handle" role="separator" aria-orientation="vertical" aria-label="Resize right sidebar"></div>
-        <div class="sidebar__header">
-          <button type="button" class="ghost" data-action="toggle-right">${
-            appState.rightCollapsed ? "<" : ">"
-          }</button>
-          <strong>Controls</strong>
-        </div>
         <div class="sidebar__content panels">
           ${renderPanel("optics", "optics", renderOpticsBody())}
           ${renderPanel("masks", "masks", '<div class="muted">Prototype placeholder</div>')}
@@ -3078,7 +3064,13 @@ function render(): void {
         </div>
       </aside>
     </div>
+    <button type="button" class="sidebar-toggle sidebar-toggle--left" data-action="toggle-left" aria-label="Toggle left sidebar">
+      ${appState.leftCollapsed ? ">" : "<"}
+    </button>
     ${renderMenuBar()}
+    <button type="button" class="sidebar-toggle sidebar-toggle--right" data-action="toggle-right" aria-label="Toggle right sidebar">
+      ${appState.rightCollapsed ? "<" : ">"}
+    </button>
     ${renderTasksDialog()}
     ${renderDirBrowserOverlay()}
   `;
