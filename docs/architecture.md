@@ -3,6 +3,7 @@
 ## Backend runtime wiring
 
 - `backend/cmd/server/main.go` loads config from `nemo.toml`, opens SQLite, syncs `users.is_admin` from config admins, configures tile cache service, registers routes, wraps all routes with auth middleware, and starts the HTTP server.
+- Shared JSON response writes use `writeJSON`; JSON encode failures are logged (`log.Printf`) instead of being silently ignored.
 - Routes:
   - `/api/me` handled by `backend/cmd/server/main.go` and returns `username` + `is_admin` for the authenticated user.
   - `/api/settings` handled by `backend/cmd/server/main.go` for per-user UI settings load/save.
@@ -70,6 +71,7 @@
   - looks up `tasks.images` path for task id
   - recursively scans image files
   - canonicalizes absolute paths and computes `tiles.HashForPath`
+  - if path canonicalization fails (`EvalSymlinks` error), image-list build fails and the handler logs the error and returns an empty `image_list`
   - stores session hash→path map
   - pushes `{ "type": "image_list", "images": [{ "filename", "hash" }, ...] }`.
 - `prefetch` handling:
@@ -79,6 +81,17 @@
   - processes `hashes[0]` first and emits `{ "type": "image_ready", "hash": ..., "level": ..., "total_levels": ... }` progress events
   - suppresses stale `image_ready` events from older superseded prefetch requests using a per-connection sequence number
   - tiles remaining hashes asynchronously without additional ready events, but only for the latest prefetch sequence.
+- Annotation mode/source metadata remains per token in `connState`:
+  - `annotationsDir`, `singleFile`, and currently viewed `activeAnnotationPath`/`activeAnnotationHash`.
+- Shared annotation content state is package-global and keyed by annotation file path (`annotationStore[path]`), not per connection.
+- `set_active_task` loads `tasks.annotations` + `tasks.checkmark` and resets per-token active annotation selection state.
+- Additional WS message types:
+  - `load_annotations` (`hash`) → resolve hash to image path, choose annotation file path (`nemolab.json` for single-file mode, `<image>.json` otherwise), read through `backend/annotations.ReadAnnotations` on first access, cache globally by path, return `annotations_data`.
+  - `save_annotations` (`hash`, `annotations`) → resolve file path, merge incoming data into the shared path entry, mark path dirty, and reset a per-path 10s debounce timer.
+- Save merge policy is last-write-wins per annotation id for the targeted image id; missing ids from incoming payload for that image are removed from the shared state.
+- On save, WS broadcasts updated `annotations_data` to other active connections whose `activeAnnotationPath` matches the same file path.
+- Debounce flush callback writes that dirty path via `backend/annotations.WriteAnnotations` and clears the dirty flag.
+- On disconnect, if the token has an active annotation path and that path is dirty, WS flushes it immediately and cancels its timer.
 - During prefetch generation, WS forwards structured tile-generation events from `backend/tiles` into the per-session JSONL logger (`tile_generation_start`, `tile_generation_decoded`, `tile_generation_mipmap_done`, `tile_generation_level_done`, `tile_generation_complete`, `tile_generation_cache_hit`).
 - Logging messages continue to be appended from `{ "type": "log", "entry": { ... } }` payloads; `set_active_task` can arrive either top-level or as a logged event entry.
 
@@ -99,6 +112,16 @@
   - `PUT /api/tasks/{id}/tags`: authenticated users can replace tags.
   - `PUT /api/tasks/{id}/labels`: admin-only label-tree replacement.
 - Task API handlers emit debug logs (`tasks_api ...`) for start/success/error paths including method, URL path, username, and admin flag.
+
+## Annotation IO
+
+- Implemented in `backend/annotations`:
+  - `ReadAnnotations(path)` reads JSON, auto-detects LabelMe via top-level `shapes`, otherwise treats input as COCO/extended COCO.
+  - Reader is lenient for missing `images`, `annotations`, `categories` arrays (normalized to empty slices).
+  - Reader normalizes polygon segmentations (LabelMe polygon shapes and COCO polygon segmentations) to COCO-RLE with uncompressed column-major counts (`[]int`).
+  - Reader preserves extended-COCO sidecar payloads (`nemolab_labels`, `nemolab_comments`, `nemolab_authors`) as `json.RawMessage`.
+  - `WriteAnnotations(path, af)` always writes extended COCO and includes sidecar keys only when present.
+  - Writer uses atomic file replacement (`path.tmp` + `os.Rename`) and ensures parent directories exist.
 
 ## Frontend tasks dialog
 
@@ -162,4 +185,14 @@
 - `PageUp`/`PageDown` optics transform cycling is bound once at module init on `document` keydown so it works independent of canvas focus across rerenders; handler ignores editable targets (`INPUT`, `TEXTAREA`, `SELECT`, contenteditable) and calls `preventDefault()` to suppress browser page scroll.
 - Logged frontend events include `image_change`, document `focus` (`focusin`/`focusout`), and temporary mask interaction events (`mouse_click`, `mask_created`, `mask_removed`, `label_assigned`).
 - Canvas left-click adds a mask point only if total pointer travel since `pointerdown` is ≤ `config.clickMaxDragPx` (default 10 CSS px); longer drags are treated as pan gestures and suppressed. `Shift+left-click` removes nearest mask within 10 CSS px. Right-click near a mask opens a floating label assignment menu.
+- On `image_ready` for a newly selected hash, frontend sends `load_annotations` for that hash.
+- Frontend applies `annotations_data` only when `hash === appState.currentImageHash`, updates stored image dimensions, and reconstructs point masks from keypoint annotations (`num_keypoints > 0`) with category-id label lookup.
+- Frontend sends `save_annotations` after mask create/remove/label-assign by rebuilding a COCO-like payload from current masks, using current image filename and last-known image width/height.
+- Mask selection state is stored in `appState.selectedMaskId`: `dblclick` near a mask selects it; `Escape` clears selection; `ArrowUp`/`ArrowDown` cycle through masks in index order with a `null` (none selected) state and wrap-around behavior.
+- While a mask is selected, standard left-click placement is suppressed (temporary restriction); shift-remove and right-click label assignment remain available.
+- Mask point colors are rendered per-point in WebGL:
+  - fill color = `labelColor(maskSequentialIndex0Based)` (bit-reversed hue, S=0.75, V=0.90)
+  - outline color = `labelColor(labelDepthFirstIndex)` for labeled masks, else `#888888`
+  - with no selected mask: all masks draw outline + fill
+  - with a selected mask: selected mask draws outline + fill; non-selected masks draw outline only.
 - The canvas border color indicates viewer readiness/zoom resolution: yellow while the selected image is not yet ready in the viewer, green when `fitLevel < manifest.levels - 1` (below max tile resolution), and brown when at the finest level. Updated via CSS classes toggled on the canvas element. The yellow debug box-shadow is removed.

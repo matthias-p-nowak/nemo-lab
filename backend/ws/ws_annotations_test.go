@@ -1,0 +1,216 @@
+package ws
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"reflect"
+	"testing"
+
+	"github.com/matthias-p-nowak/nemo-lab/annotations"
+)
+
+func TestMergeAnnotationFiles_AddNewMask(t *testing.T) {
+	existing := &annotations.AnnotationFile{
+		Images:      []annotations.CocoImage{{ID: 1}},
+		Annotations: []annotations.CocoAnnotation{{ID: 1, ImageID: 1, Keypoints: []float64{1, 1, 2}, NumKeypoints: 1}},
+	}
+	incoming := &annotations.AnnotationFile{
+		Images:      []annotations.CocoImage{{ID: 1}},
+		Annotations: []annotations.CocoAnnotation{{ID: 1, ImageID: 1, Keypoints: []float64{1, 1, 2}, NumKeypoints: 1}, {ID: 2, ImageID: 1, Keypoints: []float64{2, 2, 2}, NumKeypoints: 1}},
+	}
+	got := mergeAnnotationFiles(existing, incoming)
+	if len(got.Annotations) != 2 {
+		t.Fatalf("expected two annotations, got %#v", got.Annotations)
+	}
+}
+
+func TestMergeAnnotationFiles_UpdateExistingMask(t *testing.T) {
+	existing := &annotations.AnnotationFile{
+		Images:      []annotations.CocoImage{{ID: 1}},
+		Annotations: []annotations.CocoAnnotation{{ID: 1, ImageID: 1, Keypoints: []float64{1, 1, 2}, NumKeypoints: 1}},
+	}
+	incoming := &annotations.AnnotationFile{
+		Images:      []annotations.CocoImage{{ID: 1}},
+		Annotations: []annotations.CocoAnnotation{{ID: 1, ImageID: 1, Keypoints: []float64{9, 9, 2}, NumKeypoints: 1}},
+	}
+	got := mergeAnnotationFiles(existing, incoming)
+	if len(got.Annotations) != 1 {
+		t.Fatalf("expected one annotation, got %#v", got.Annotations)
+	}
+	if !reflect.DeepEqual(got.Annotations[0].Keypoints, []float64{9, 9, 2}) {
+		t.Fatalf("expected updated keypoint, got %#v", got.Annotations[0].Keypoints)
+	}
+}
+
+func TestMergeAnnotationFiles_RemoveMask(t *testing.T) {
+	existing := &annotations.AnnotationFile{
+		Images: []annotations.CocoImage{{ID: 1}},
+		Annotations: []annotations.CocoAnnotation{
+			{ID: 1, ImageID: 1, Keypoints: []float64{1, 1, 2}, NumKeypoints: 1},
+			{ID: 2, ImageID: 1, Keypoints: []float64{2, 2, 2}, NumKeypoints: 1},
+		},
+	}
+	incoming := &annotations.AnnotationFile{
+		Images:      []annotations.CocoImage{{ID: 1}},
+		Annotations: []annotations.CocoAnnotation{{ID: 1, ImageID: 1, Keypoints: []float64{1, 1, 2}, NumKeypoints: 1}},
+	}
+	got := mergeAnnotationFiles(existing, incoming)
+	if len(got.Annotations) != 1 || got.Annotations[0].ID != 1 {
+		t.Fatalf("expected only id=1 to remain, got %#v", got.Annotations)
+	}
+}
+
+func TestMergeAnnotationFiles_PreservesOtherImageAnnotations(t *testing.T) {
+	existing := &annotations.AnnotationFile{
+		Images: []annotations.CocoImage{{ID: 1}, {ID: 2}},
+		Annotations: []annotations.CocoAnnotation{
+			{ID: 1, ImageID: 1, Keypoints: []float64{1, 1, 2}, NumKeypoints: 1},
+			{ID: 9, ImageID: 2, Keypoints: []float64{3, 3, 2}, NumKeypoints: 1},
+		},
+	}
+	incoming := &annotations.AnnotationFile{
+		Images:      []annotations.CocoImage{{ID: 1}},
+		Annotations: []annotations.CocoAnnotation{{ID: 1, ImageID: 1, Keypoints: []float64{5, 5, 2}, NumKeypoints: 1}},
+	}
+	got := mergeAnnotationFiles(existing, incoming)
+	if len(got.Annotations) != 2 {
+		t.Fatalf("expected two annotations, got %#v", got.Annotations)
+	}
+	foundImage2 := false
+	for _, ann := range got.Annotations {
+		if ann.ImageID == 2 && ann.ID == 9 {
+			foundImage2 = true
+		}
+	}
+	if !foundImage2 {
+		t.Fatalf("expected image_id=2 annotation to survive, got %#v", got.Annotations)
+	}
+}
+
+func TestMergeAnnotationFiles_CategoryMergeSorted(t *testing.T) {
+	existing := &annotations.AnnotationFile{
+		Images:      []annotations.CocoImage{{ID: 1}},
+		Categories:  []annotations.CocoCategory{{ID: 1, Name: "A"}},
+		Annotations: []annotations.CocoAnnotation{},
+	}
+	incoming := &annotations.AnnotationFile{
+		Images:      []annotations.CocoImage{{ID: 1}},
+		Categories:  []annotations.CocoCategory{{ID: 2, Name: "B"}},
+		Annotations: []annotations.CocoAnnotation{},
+	}
+	got := mergeAnnotationFiles(existing, incoming)
+	if len(got.Categories) != 2 {
+		t.Fatalf("expected two categories, got %#v", got.Categories)
+	}
+	if got.Categories[0].ID != 1 || got.Categories[1].ID != 2 {
+		t.Fatalf("expected categories sorted by id, got %#v", got.Categories)
+	}
+}
+
+func TestMergeAnnotationFiles_SidecarUpdate(t *testing.T) {
+	existing := &annotations.AnnotationFile{
+		NemolabLabels: json.RawMessage(`{"old":1}`),
+	}
+	incoming := &annotations.AnnotationFile{
+		NemolabLabels: json.RawMessage(`{"new":2}`),
+	}
+	got := mergeAnnotationFiles(existing, incoming)
+	if string(got.NemolabLabels) != `{"new":2}` {
+		t.Fatalf("expected incoming sidecar to win, got %s", string(got.NemolabLabels))
+	}
+}
+
+func TestMergeAnnotationFiles_SidecarPreservedWhenIncomingNil(t *testing.T) {
+	existing := &annotations.AnnotationFile{
+		NemolabLabels: json.RawMessage(`{"old":1}`),
+	}
+	incoming := &annotations.AnnotationFile{}
+	got := mergeAnnotationFiles(existing, incoming)
+	if string(got.NemolabLabels) != `{"old":1}` {
+		t.Fatalf("expected existing sidecar to be preserved, got %s", string(got.NemolabLabels))
+	}
+}
+
+func TestMigrateAnnotationFileIfNeeded_NoOpWhenTargetExists(t *testing.T) {
+	dir := t.TempDir()
+	imagePath := filepath.Join(dir, "img.png")
+	target := filepath.Join(dir, "nemolab.json")
+	other := filepath.Join(dir, "img.json")
+	writeAnnotationFixture(t, target, "target.png")
+	writeAnnotationFixture(t, other, "other.png")
+
+	if err := migrateAnnotationFileIfNeeded("test-token", target, dir, true, imagePath); err != nil {
+		t.Fatalf("migrate failed: %v", err)
+	}
+	af, err := annotations.ReadAnnotations(target)
+	if err != nil {
+		t.Fatalf("read target failed: %v", err)
+	}
+	if len(af.Images) == 0 || af.Images[0].FileName != "target.png" {
+		t.Fatalf("expected target to stay unchanged, got %#v", af.Images)
+	}
+}
+
+func TestMigrateAnnotationFileIfNeeded_NoOpWhenNeitherExists(t *testing.T) {
+	dir := t.TempDir()
+	imagePath := filepath.Join(dir, "img.png")
+	target := filepath.Join(dir, "nemolab.json")
+	if err := migrateAnnotationFileIfNeeded("test-token", target, dir, true, imagePath); err != nil {
+		t.Fatalf("migrate failed: %v", err)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("expected no target file created, stat err=%v", err)
+	}
+}
+
+func TestMigrateAnnotationFileIfNeeded_PerImageToSingleFile(t *testing.T) {
+	dir := t.TempDir()
+	imagePath := filepath.Join(dir, "img.png")
+	perImage := filepath.Join(dir, "img.json")
+	target := filepath.Join(dir, "nemolab.json")
+	writeAnnotationFixture(t, perImage, "migrate.png")
+
+	if err := migrateAnnotationFileIfNeeded("test-token", target, dir, true, imagePath); err != nil {
+		t.Fatalf("migrate failed: %v", err)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("expected target to exist: %v", err)
+	}
+	if _, err := os.Stat(perImage); !os.IsNotExist(err) {
+		t.Fatalf("expected old per-image file removed, stat err=%v", err)
+	}
+}
+
+func TestMigrateAnnotationFileIfNeeded_SingleFileToPerImage(t *testing.T) {
+	dir := t.TempDir()
+	imagePath := filepath.Join(dir, "img.png")
+	single := filepath.Join(dir, "nemolab.json")
+	target := filepath.Join(dir, "img.json")
+	writeAnnotationFixture(t, single, "migrate2.png")
+
+	if err := migrateAnnotationFileIfNeeded("test-token", target, dir, false, imagePath); err != nil {
+		t.Fatalf("migrate failed: %v", err)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("expected per-image target to exist: %v", err)
+	}
+	if _, err := os.Stat(single); !os.IsNotExist(err) {
+		t.Fatalf("expected old single-file removed, stat err=%v", err)
+	}
+}
+
+func writeAnnotationFixture(t *testing.T, path, fileName string) {
+	t.Helper()
+	af := &annotations.AnnotationFile{
+		Images: []annotations.CocoImage{{ID: 1, FileName: fileName, Width: 10, Height: 10}},
+		Annotations: []annotations.CocoAnnotation{
+			{ID: 1, ImageID: 1, Keypoints: []float64{1, 2, 2}, NumKeypoints: 1},
+		},
+		Categories: []annotations.CocoCategory{{ID: 1, Name: "A"}},
+	}
+	if err := annotations.WriteAnnotations(path, af); err != nil {
+		t.Fatalf("write fixture failed: %v", err)
+	}
+}
+

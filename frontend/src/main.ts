@@ -31,8 +31,57 @@ function persistSettingLater(key: string, value: string): void {
   });
 }
 
+/** Debounce timers keyed by setting key for batched setting writes while dragging sliders. */
+const settingPersistDebounceTimers = new Map<string, number>();
+
+/** Persists one user setting after a debounce delay, resetting per-key on repeated calls. */
+function persistSettingDebouncedLater(key: string, value: string, delayMs = 300): void {
+  const activeTimer = settingPersistDebounceTimers.get(key);
+  if (activeTimer !== undefined) {
+    window.clearTimeout(activeTimer);
+  }
+  const timer = window.setTimeout(() => {
+    settingPersistDebounceTimers.delete(key);
+    persistSettingLater(key, value);
+  }, delayMs);
+  settingPersistDebounceTimers.set(key, timer);
+}
+
+/** Converts HSV color to CSS hex string. */
+function hsvToRgbCss(h: number, s: number, v: number): string {
+  const i = Math.floor(h * 6);
+  const f = h * 6 - i;
+  const p = v * (1 - s);
+  const q = v * (1 - f * s);
+  const t = v * (1 - (1 - f) * s);
+  const [r, g, b] = ([[v, t, p], [q, v, p], [p, v, t], [p, q, v], [t, p, v], [v, p, q]] as [number, number, number][])[i % 6];
+  const hex = (x: number) => Math.round(x * 255).toString(16).padStart(2, "0");
+  return `#${hex(r)}${hex(g)}${hex(b)}`;
+}
+
+/** Returns a CSS hex color for index n using bit-reversed hue (S=0.75, V=0.90). */
+function labelColor(n: number): string {
+  const BITS = 8;
+  const idx = Math.max(0, Math.floor(n));
+  let reversed = 0;
+  for (let i = 0; i < BITS; i++) reversed = (reversed << 1) | ((idx >> i) & 1);
+  return hsvToRgbCss(reversed / (1 << BITS), 0.75, 0.90);
+}
+
+/** Parses #rrggbb into normalized RGB components in [0,1]. */
+function cssHexToRgb01(color: string): [number, number, number] {
+  const match = /^#([0-9a-fA-F]{6})$/.exec(color);
+  if (!match) return [1, 1, 1];
+  const value = match[1];
+  const r = Number.parseInt(value.slice(0, 2), 16) / 255;
+  const g = Number.parseInt(value.slice(2, 4), 16) / 255;
+  const b = Number.parseInt(value.slice(4, 6), 16) / 255;
+  return [r, g, b];
+}
+
 /** WebSocket endpoint for backend events. */
-const ws = new WebSocket(`ws://${location.host}/ws`);
+const wsProtocol = location.protocol === "https:" ? "wss" : "ws";
+const ws = new WebSocket(`${wsProtocol}://${location.host}/ws`);
 
 ws.addEventListener("open", () => {
   console.log("ws: connected");
@@ -81,24 +130,59 @@ function closeMaskContextMenu(): void {
 /** Handles Escape for closing mask context menu (guarded, global listener). */
 function handleDocumentMaskMenuEscape(e: KeyboardEvent): void {
   if (e.key !== "Escape") return;
+  if (appState.selectedMaskId !== null) {
+    e.preventDefault();
+    appState.selectedMaskId = null;
+    closeMaskContextMenu();
+    render();
+    return;
+  }
   if (!appState.maskContextMenu.open) return;
   e.preventDefault();
   closeMaskContextMenu();
   render();
 }
 
+/** Cycles selected mask through index order, including the "none selected" state. */
+function cycleSelectedMask(step: 1 | -1): void {
+  const orderedMaskIds = appState.masks
+    .slice()
+    .sort((a, b) => a.index - b.index)
+    .map((mask) => mask.id);
+  if (orderedMaskIds.length === 0) return;
+  const cycle = [null, ...orderedMaskIds];
+  const currentPos = Math.max(0, cycle.indexOf(appState.selectedMaskId));
+  const nextPos = (currentPos + step + cycle.length) % cycle.length;
+  appState.selectedMaskId = cycle[nextPos];
+  render();
+}
+
+/** Handles global ArrowUp/ArrowDown for mask selection cycling. */
+function handleDocumentMaskSelectionCycleKeydown(e: KeyboardEvent): void {
+  if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+  if (isEditableKeyTarget(e.target)) return;
+  if (appState.masks.length === 0) return;
+  e.preventDefault();
+  cycleSelectedMask(e.key === "ArrowDown" ? 1 : -1);
+}
+
 document.addEventListener("keydown", handleDocumentPageCycleKeydown);
 document.addEventListener("keydown", handleDocumentMaskMenuEscape);
+document.addEventListener("keydown", handleDocumentMaskSelectionCycleKeydown);
 
 /** Mutable prototype application state. */
 const appState = {
   currentImageIndex: 0,
   imageList: [] as { filename: string; hash: string }[],
   currentImageHash: null as string | null,
+  annotationImageWidth: 1,
+  annotationImageHeight: 1,
   leftCollapsed: false,
   rightCollapsed: false,
   rightSidebarWidth: 320,
   masks: [] as MaskPoint[],
+  /** Currently selected mask id, or null when no mask is selected. */
+  selectedMaskId: null as string | null,
   /** Recently assigned labels, most recent first. */
   recentLabels: [] as string[],
   /** Context menu state for right-click label assignment on masks. */
@@ -461,6 +545,90 @@ function getCurrentImageLabel(): string {
   return getCurrentImageEntry()?.filename ?? "(none)";
 }
 
+interface WsAnnotationImage {
+  id: number;
+  file_name?: string;
+  width?: number;
+  height?: number;
+}
+
+interface WsAnnotationCategory {
+  id: number;
+  name: string;
+}
+
+interface WsAnnotationRow {
+  id: number;
+  image_id: number;
+  category_id?: number;
+  keypoints?: number[];
+  num_keypoints?: number;
+}
+
+interface WsAnnotationFile {
+  images?: WsAnnotationImage[];
+  annotations?: WsAnnotationRow[];
+  categories?: WsAnnotationCategory[];
+}
+
+/** Converts arbitrary WS payload to a typed annotation file with array defaults. */
+function normalizeWsAnnotationFile(raw: unknown): Required<WsAnnotationFile> {
+  if (!raw || typeof raw !== "object") {
+    return { images: [], annotations: [], categories: [] };
+  }
+  const src = raw as Record<string, unknown>;
+  const images = Array.isArray(src["images"]) ? src["images"] as WsAnnotationImage[] : [];
+  const annotations = Array.isArray(src["annotations"]) ? src["annotations"] as WsAnnotationRow[] : [];
+  const categories = Array.isArray(src["categories"]) ? src["categories"] as WsAnnotationCategory[] : [];
+  return { images, annotations, categories };
+}
+
+/** Builds and sends save_annotations payload from current in-memory mask state. */
+function sendSaveAnnotations(): void {
+  if (ws.readyState !== WebSocket.OPEN) return;
+  const hash = appState.currentImageHash;
+  if (!hash) return;
+
+  const width = Math.max(1, Math.round(appState.annotationImageWidth));
+  const height = Math.max(1, Math.round(appState.annotationImageHeight));
+  const fileName = getCurrentImageEntry()?.filename ?? "";
+  const currentImageID = appState.currentImageIndex + 1;
+
+  const masks = appState.masks.slice().sort((a, b) => a.index - b.index);
+  const categories: WsAnnotationCategory[] = [];
+  const categoryIdByName = new Map<string, number>();
+  masks.forEach((mask) => {
+    const name = mask.labelName?.trim();
+    if (!name || categoryIdByName.has(name)) return;
+    const id = categories.length + 1;
+    categoryIdByName.set(name, id);
+    categories.push({ id, name });
+  });
+
+  const toNumericID = (mask: MaskPoint): number => {
+    const parsed = Number.parseInt(mask.id, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : mask.index;
+  };
+
+  const annotations: WsAnnotationRow[] = masks.map((mask) => ({
+    id: toNumericID(mask),
+    image_id: currentImageID,
+    category_id: mask.labelName ? categoryIdByName.get(mask.labelName.trim()) : undefined,
+    keypoints: [mask.x * width, mask.y * height, 2],
+    num_keypoints: 1,
+  }));
+
+  ws.send(JSON.stringify({
+    type: "save_annotations",
+    hash,
+    annotations: {
+      images: [{ id: currentImageID, file_name: fileName, width, height }],
+      annotations,
+      categories,
+    },
+  }));
+}
+
 /** Sends prefetch request for current and next nearby images. */
 function sendPrefetch(images: { hash: string }[], fromIndex: number): void {
   const hashes = images.slice(fromIndex, fromIndex + 9).map((img) => img.hash);
@@ -480,7 +648,10 @@ function goPreviousImage(): void {
   // Clear active hash so remount does not briefly reload the previous image
   // while waiting for the next image_ready event.
   appState.currentImageHash = null;
+  appState.annotationImageWidth = 1;
+  appState.annotationImageHeight = 1;
   appState.masks = [];
+  appState.selectedMaskId = null;
   appState.maskContextMenu.open = false;
   const current = getCurrentImageEntry();
   if (current) {
@@ -499,7 +670,10 @@ function goNextImage(): void {
   // Clear active hash so remount does not briefly reload the previous image
   // while waiting for the next image_ready event.
   appState.currentImageHash = null;
+  appState.annotationImageWidth = 1;
+  appState.annotationImageHeight = 1;
   appState.masks = [];
+  appState.selectedMaskId = null;
   appState.maskContextMenu.open = false;
   const current = getCurrentImageEntry();
   if (current) {
@@ -530,7 +704,10 @@ ws.addEventListener("message", (event) => {
     appState.imageList = images;
     appState.currentImageIndex = 0;
     appState.currentImageHash = null;
+    appState.annotationImageWidth = 1;
+    appState.annotationImageHeight = 1;
     appState.masks = [];
+    appState.selectedMaskId = null;
     appState.maskContextMenu.open = false;
     render();
     if (images.length > 0) {
@@ -550,8 +727,14 @@ ws.addEventListener("message", (event) => {
     const isNewImage = appState.currentImageHash !== hash;
     // Only reset masks when the image changes.
     if (isNewImage) {
+      appState.annotationImageWidth = 1;
+      appState.annotationImageHeight = 1;
       appState.masks = [];
+      appState.selectedMaskId = null;
       appState.maskContextMenu.open = false;
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "load_annotations", hash }));
+      }
     }
     appState.currentImageHash = hash;
     if (viewer) {
@@ -563,6 +746,54 @@ ws.addEventListener("message", (event) => {
         viewer.refreshTiles(level);
       }
     }
+    return;
+  }
+
+  if (m["type"] === "annotations_data") {
+    const hash = typeof m["hash"] === "string" ? m["hash"] : "";
+    if (!hash || hash !== appState.currentImageHash) {
+      return;
+    }
+    const payload = normalizeWsAnnotationFile(m["annotations"]);
+    const currentImageID = appState.currentImageIndex + 1;
+    const image = payload.images.find((img) => typeof img?.id === "number" && img.id === currentImageID);
+    const width = Math.max(1, Math.round(typeof image?.width === "number" ? image.width : appState.annotationImageWidth));
+    const height = Math.max(1, Math.round(typeof image?.height === "number" ? image.height : appState.annotationImageHeight));
+    appState.annotationImageWidth = width;
+    appState.annotationImageHeight = height;
+
+    const categoryNameByID = new Map<number, string>();
+    payload.categories.forEach((cat) => {
+      if (typeof cat?.id !== "number" || typeof cat?.name !== "string") return;
+      categoryNameByID.set(cat.id, cat.name);
+    });
+
+    const masks: MaskPoint[] = [];
+    payload.annotations.forEach((ann) => {
+      if (!ann || typeof ann !== "object") return;
+      if (ann.image_id !== currentImageID) return;
+      const numKeypoints = typeof ann.num_keypoints === "number" ? ann.num_keypoints : 0;
+      const keypoints = Array.isArray(ann.keypoints) ? ann.keypoints : [];
+      if (numKeypoints <= 0 || keypoints.length < 2) return;
+      const px = typeof keypoints[0] === "number" ? keypoints[0] : NaN;
+      const py = typeof keypoints[1] === "number" ? keypoints[1] : NaN;
+      if (!Number.isFinite(px) || !Number.isFinite(py)) return;
+      const x = px / width;
+      const y = py / height;
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+      masks.push({
+        id: String(ann.id),
+        index: masks.length + 1,
+        x,
+        y,
+        labelName: typeof ann.category_id === "number" ? (categoryNameByID.get(ann.category_id) ?? null) : null,
+      });
+    });
+    appState.masks = masks;
+    appState.selectedMaskId = null;
+    closeMaskContextMenu();
+    updateAnnotationUI();
+    return;
   }
 });
 
@@ -671,6 +902,23 @@ function flattenLabelNames(nodes: LabelNode[]): string[] {
   return out;
 }
 
+/** Builds depth-first label-name index map for active label color lookup. */
+function buildLabelDepthFirstIndexMap(nodes: LabelNode[]): Map<string, number> {
+  const out = new Map<string, number>();
+  let nextIndex = 0;
+  const walk = (items: LabelNode[]): void => {
+    items.forEach((node) => {
+      if (!out.has(node.text)) {
+        out.set(node.text, nextIndex);
+      }
+      nextIndex += 1;
+      if (node.children.length > 0) walk(node.children);
+    });
+  };
+  walk(nodes);
+  return out;
+}
+
 /** Moves label to front of recent labels while preserving order and uniqueness. */
 function touchRecentLabel(labelName: string): void {
   const next = [labelName, ...appState.recentLabels.filter((name) => name !== labelName)];
@@ -700,6 +948,7 @@ function assignLabelToMask(maskId: string, labelName: string): void {
       mask_index: mask.index,
       label_name: labelName,
     });
+    sendSaveAnnotations();
   }
 }
 
@@ -722,6 +971,7 @@ function addMask(x: number, y: number): void {
       x: mask.x,
       y: mask.y,
     });
+    sendSaveAnnotations();
   }
   if (mask.labelName) {
     assignLabelToMask(mask.id, mask.labelName);
@@ -739,10 +989,14 @@ function removeMask(maskId: string): void {
       image_hash: appState.currentImageHash,
       mask_index: removed.index,
     });
+    sendSaveAnnotations();
   }
   if (appState.maskContextMenu.maskId === maskId) {
     appState.maskContextMenu.open = false;
     appState.maskContextMenu.maskId = null;
+  }
+  if (appState.selectedMaskId === maskId) {
+    appState.selectedMaskId = null;
   }
   updateAnnotationUI();
 }
@@ -750,6 +1004,7 @@ function removeMask(maskId: string): void {
 /** Clears all masks for the current image. */
 function clearMasks(): void {
   appState.masks = [];
+  appState.selectedMaskId = null;
   appState.maskContextMenu.open = false;
   appState.maskContextMenu.maskId = null;
   updateAnnotationUI();
@@ -944,7 +1199,7 @@ function bindOpticsPanelHandlers(): void {
         : key === "multiply"
           ? "optics_brightness_mul"
           : "optics_brightness_add";
-      persistSettingLater(settingsKey, String(val));
+      persistSettingDebouncedLater(settingsKey, String(val));
     });
   });
 
@@ -1036,6 +1291,8 @@ class WebGLTileViewer {
   private readonly getMasks: () => MaskPoint[];
   /** Callback for primary/secondary mask interactions from canvas clicks. */
   private readonly onMaskCanvasClick: (payload: MaskCanvasClick) => void;
+  /** Callback for selecting a mask by double-click hit-testing. */
+  private readonly onMaskCanvasDoubleClick: (maskId: string) => void;
 
   /** Manifest for current image. */
   private manifest: TileManifest | null = null;
@@ -1135,11 +1392,13 @@ class WebGLTileViewer {
   constructor(
     canvas: HTMLCanvasElement,
     getMasks: () => MaskPoint[],
-    onMaskCanvasClick: (payload: MaskCanvasClick) => void
+    onMaskCanvasClick: (payload: MaskCanvasClick) => void,
+    onMaskCanvasDoubleClick: (maskId: string) => void
   ) {
     this.canvas = canvas;
     this.getMasks = getMasks;
     this.onMaskCanvasClick = onMaskCanvasClick;
+    this.onMaskCanvasDoubleClick = onMaskCanvasDoubleClick;
 
     const gl = canvas.getContext("webgl", { alpha: false, antialias: true });
     if (!gl) {
@@ -1296,6 +1555,7 @@ class WebGLTileViewer {
     }
     this.canvas.removeEventListener("click", this.handleCanvasClick);
     this.canvas.removeEventListener("contextmenu", this.handleCanvasContextMenu);
+    this.canvas.removeEventListener("dblclick", this.handleCanvasDoubleClick);
     this.canvas.removeEventListener("wheel", this.handleWheel);
     this.canvas.removeEventListener("pointerdown", this.handlePointerDown);
     this.canvas.removeEventListener("pointermove", this.handlePointerMove);
@@ -1710,34 +1970,51 @@ class WebGLTileViewer {
 
 /** Draws normalized mask points over image content. */
   private drawAnnotations(): void {
-    const masks = this.getMasks();
+    const masks = this.getMasks().slice().sort((a, b) => a.index - b.index);
     if (masks.length === 0) {
       return;
     }
 
     const gl = this.gl;
-    const points = new Float32Array(masks.length * 2);
-
-    masks.forEach((mask, index) => {
-      const x = this.baseTransform.x + mask.x * this.baseTransform.width;
-      const y = this.baseTransform.y + mask.y * this.baseTransform.height;
-      points[index * 2] = (x / this.canvas.clientWidth) * 2 - 1;
-      points[index * 2 + 1] = 1 - (y / this.canvas.clientHeight) * 2;
-    });
+    const selectedMaskId = appState.selectedMaskId;
+    const hasSelectedMask = selectedMaskId !== null && masks.some((mask) => mask.id === selectedMaskId);
+    const labelDepthFirstIndex = buildLabelDepthFirstIndexMap(appState.activeLabels);
+    const point = new Float32Array(2);
+    const outlineSize = 14;
+    const fillSize = 9;
 
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
     gl.useProgram(this.pointProgram);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.positionBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, points, gl.STREAM_DRAW);
     gl.enableVertexAttribArray(this.pointPosAttrib);
     gl.vertexAttribPointer(this.pointPosAttrib, 2, gl.FLOAT, false, 0, 0);
     gl.uniformMatrix3fv(this.pointTransformUniform, false, this.transformMatrix);
-    gl.uniform4f(this.pointColorUniform, 1, 0.44, 0.38, 1);
-    gl.uniform1f(this.pointSizeUniform, 10);
 
-    gl.drawArrays(gl.POINTS, 0, masks.length);
+    masks.forEach((mask, index) => {
+      const x = this.baseTransform.x + mask.x * this.baseTransform.width;
+      const y = this.baseTransform.y + mask.y * this.baseTransform.height;
+      point[0] = (x / this.canvas.clientWidth) * 2 - 1;
+      point[1] = 1 - (y / this.canvas.clientHeight) * 2;
+      gl.bufferData(gl.ARRAY_BUFFER, point, gl.STREAM_DRAW);
+
+      const fillHex = labelColor(index);
+      const labelIndex = mask.labelName ? (labelDepthFirstIndex.get(mask.labelName) ?? null) : null;
+      const outlineHex = labelIndex === null ? "#888888" : labelColor(labelIndex);
+      const [outlineR, outlineG, outlineB] = cssHexToRgb01(outlineHex);
+      gl.uniform4f(this.pointColorUniform, outlineR, outlineG, outlineB, 1);
+      gl.uniform1f(this.pointSizeUniform, outlineSize);
+      gl.drawArrays(gl.POINTS, 0, 1);
+
+      const shouldFill = !hasSelectedMask || mask.id === selectedMaskId;
+      if (shouldFill) {
+        const [fillR, fillG, fillB] = cssHexToRgb01(fillHex);
+        gl.uniform4f(this.pointColorUniform, fillR, fillG, fillB, 1);
+        gl.uniform1f(this.pointSizeUniform, fillSize);
+        gl.drawArrays(gl.POINTS, 0, 1);
+      }
+    });
 
     gl.disable(gl.BLEND);
   }
@@ -1926,6 +2203,27 @@ class WebGLTileViewer {
     });
   };
 
+  /** Handles double-click hit-testing for mask selection. */
+  private readonly handleCanvasDoubleClick = (event: MouseEvent): void => {
+    if (event.button !== 0) return;
+    if (this.dragTotalDistance > config.clickMaxDragPx) return;
+    const bounds = this.canvas.getBoundingClientRect();
+    const px = event.clientX - bounds.left;
+    const py = event.clientY - bounds.top;
+    if (
+      px < this.transform.x ||
+      py < this.transform.y ||
+      px > this.transform.x + this.transform.width ||
+      py > this.transform.y + this.transform.height
+    ) {
+      return;
+    }
+    const hitMaskId = this.findClosestMaskId(px, py, 10);
+    if (hitMaskId) {
+      this.onMaskCanvasDoubleClick(hitMaskId);
+    }
+  };
+
   /** Returns the effective displayed image dimensions after rotation toggle. */
   private getDisplayedImageDimensions(): { width: number; height: number } {
     if (!this.manifest) {
@@ -2086,6 +2384,7 @@ class WebGLTileViewer {
   private setupCanvasListeners(): void {
     this.canvas.addEventListener("click", this.handleCanvasClick);
     this.canvas.addEventListener("contextmenu", this.handleCanvasContextMenu);
+    this.canvas.addEventListener("dblclick", this.handleCanvasDoubleClick);
     this.canvas.addEventListener("wheel", this.handleWheel, { passive: false });
     this.canvas.addEventListener("pointerdown", this.handlePointerDown);
     this.canvas.addEventListener("pointermove", this.handlePointerMove);
@@ -2157,6 +2456,9 @@ function mountViewer(): void {
           }
           return;
         }
+        if (appState.selectedMaskId !== null) {
+          return;
+        }
         addMask(payload.imageX, payload.imageY);
         return;
       }
@@ -2168,6 +2470,11 @@ function mountViewer(): void {
       } else {
         closeMaskContextMenu();
       }
+      render();
+    },
+    (maskId) => {
+      appState.selectedMaskId = maskId;
+      closeMaskContextMenu();
       render();
     }
   );

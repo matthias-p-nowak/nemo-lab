@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/matthias-p-nowak/nemo-lab/annotations"
 	"github.com/matthias-p-nowak/nemo-lab/auth"
 	"github.com/matthias-p-nowak/nemo-lab/logger"
 	"github.com/matthias-p-nowak/nemo-lab/tiles"
@@ -20,15 +22,32 @@ import (
 )
 
 type connState struct {
-	count        int
-	activeTaskID string
-	hashToPath   map[string]string
-	prefetchSeq  uint64
+	count                int
+	activeTaskID         string
+	hashToPath           map[string]string
+	prefetchSeq          uint64
+	annotationsDir       string
+	singleFile           bool
+	activeAnnotationPath string
+	activeAnnotationHash string
+}
+
+type fileAnnotations struct {
+	af    *annotations.AnnotationFile
+	dirty bool
+	timer *time.Timer
 }
 
 var (
-	connectionsMu sync.Mutex
-	connections   = map[string]*connState{}
+	connectionsMu     sync.Mutex
+	connections       = map[string]*connState{}
+	annotationStoreMu sync.Mutex
+	annotationStore   = map[string]*fileAnnotations{}
+	liveConnsMu       sync.Mutex
+	liveConns         = map[*websocket.Conn]struct {
+		token   string
+		writeMu *sync.Mutex
+	}{}
 )
 
 // NewHandler builds the /ws handler and validates session cookies before upgrade.
@@ -66,9 +85,12 @@ func NewHandler(db *sql.DB, logsDir string) http.HandlerFunc {
 			connections[cookie.Value].count++
 			active := connections[cookie.Value].count
 			connectionsMu.Unlock()
+			registerLiveConn(cookie.Value, conn, writeMu)
 			log.Printf("ws connect token=%s active=%d", cookie.Value, active)
 
 			defer func() {
+				flushActiveAnnotationOnDisconnect(cookie.Value, lgr)
+				unregisterLiveConn(conn)
 				connectionsMu.Lock()
 				if s := connections[cookie.Value]; s != nil && s.count > 1 {
 					s.count--
@@ -119,6 +141,28 @@ func NewHandler(db *sql.DB, logsDir string) http.HandlerFunc {
 					hashes := prefetchHashes(msg, entry)
 					seq := nextPrefetchSeq(cookie.Value)
 					go handlePrefetch(cookie.Value, conn, writeMu, lgr, hashes, seq)
+				case "load_annotations":
+					hash, _ := msg["hash"].(string)
+					if hash == "" {
+						hash, _ = entry["hash"].(string)
+					}
+					if hash == "" {
+						continue
+					}
+					handleLoadAnnotations(cookie.Value, conn, writeMu, lgr, hash)
+				case "save_annotations":
+					hash, _ := msg["hash"].(string)
+					if hash == "" {
+						hash, _ = entry["hash"].(string)
+					}
+					if hash == "" {
+						continue
+					}
+					payload := msg["annotations"]
+					if payload == nil {
+						payload = entry["annotations"]
+					}
+					handleSaveAnnotations(cookie.Value, conn, lgr, hash, payload)
 				default:
 					if msgType == "" {
 						continue
@@ -137,11 +181,13 @@ func handleSetActiveTask(
 	lgr *logger.Logger,
 	taskID string,
 ) {
-	connectionsMu.Lock()
-	if s := connections[token]; s != nil {
-		s.activeTaskID = taskID
+	annotationsDir, singleFile, cfgErr := taskAnnotationsConfig(db, taskID)
+	if cfgErr != nil {
+		log.Printf("ws set_active_task annotations config lookup failed: task_id=%s err=%v", taskID, cfgErr)
+		annotationsDir = ""
+		singleFile = false
 	}
-	connectionsMu.Unlock()
+	resetTaskAnnotationState(token, taskID, annotationsDir, singleFile)
 
 	imagesRoot, err := taskImagesPath(db, taskID)
 	if err != nil {
@@ -259,6 +305,459 @@ func handlePrefetch(
 	}
 }
 
+func handleLoadAnnotations(
+	token string,
+	conn *websocket.Conn,
+	writeMu *sync.Mutex,
+	lgr *logger.Logger,
+	hash string,
+) {
+	ctx, ok := loadAnnotationContext(token, hash)
+	if !ok {
+		sendAnnotationsData(conn, writeMu, hash, emptyAnnotationFile())
+		return
+	}
+	path := annotationFilePath(ctx.annotationsDir, ctx.singleFile, ctx.imagePath)
+	if err := migrateAnnotationFileIfNeeded(token, path, ctx.annotationsDir, ctx.singleFile, ctx.imagePath); err != nil {
+		log.Printf("ws load_annotations migration failed token=%s hash=%.16s path=%s err=%v", tokenPrefix(token), hash, path, err)
+	}
+	setActiveAnnotationPath(token, path, hash)
+	af := getOrLoadSharedAnnotations(path, token, hash, lgr)
+	sendAnnotationsData(conn, writeMu, hash, af)
+}
+
+func handleSaveAnnotations(token string, conn *websocket.Conn, lgr *logger.Logger, hash string, payload any) {
+	if payload == nil {
+		return
+	}
+	ctx, ok := loadAnnotationContext(token, hash)
+	if !ok {
+		return
+	}
+	path := annotationFilePath(ctx.annotationsDir, ctx.singleFile, ctx.imagePath)
+	setActiveAnnotationPath(token, path, hash)
+
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("ws save_annotations marshal failed token=%s hash=%.16s err=%v", tokenPrefix(token), hash, err)
+		return
+	}
+	var af annotations.AnnotationFile
+	if err := json.Unmarshal(raw, &af); err != nil {
+		log.Printf("ws save_annotations decode failed token=%s hash=%.16s err=%v", tokenPrefix(token), hash, err)
+		return
+	}
+	if af.Images == nil {
+		af.Images = []annotations.CocoImage{}
+	}
+	if af.Annotations == nil {
+		af.Annotations = []annotations.CocoAnnotation{}
+	}
+	if af.Categories == nil {
+		af.Categories = []annotations.CocoCategory{}
+	}
+	merged := mergeAndStoreSharedAnnotations(path, &af, lgr)
+	broadcastAnnotationsData(path, hash, merged, conn)
+}
+
+type annotationContext struct {
+	annotationsDir string
+	singleFile     bool
+	imagePath      string
+}
+
+func loadAnnotationContext(token, hash string) (annotationContext, bool) {
+	connectionsMu.Lock()
+	defer connectionsMu.Unlock()
+	s := connections[token]
+	if s == nil {
+		return annotationContext{}, false
+	}
+	imagePath, ok := s.hashToPath[hash]
+	if !ok {
+		return annotationContext{}, false
+	}
+	return annotationContext{
+		annotationsDir: s.annotationsDir,
+		singleFile:     s.singleFile,
+		imagePath:      imagePath,
+	}, true
+}
+
+func sendAnnotationsData(conn *websocket.Conn, writeMu *sync.Mutex, hash string, af *annotations.AnnotationFile) {
+	_ = wsSendJSON(conn, writeMu, map[string]any{
+		"type":        "annotations_data",
+		"hash":        hash,
+		"annotations": af,
+	})
+}
+
+func emptyAnnotationFile() *annotations.AnnotationFile {
+	return &annotations.AnnotationFile{
+		Images:      []annotations.CocoImage{},
+		Annotations: []annotations.CocoAnnotation{},
+		Categories:  []annotations.CocoCategory{},
+	}
+}
+
+func annotationFilePath(annotationsDir string, singleFile bool, imagePath string) string {
+	if singleFile {
+		return filepath.Join(annotationsDir, "nemolab.json")
+	}
+	base := filepath.Base(imagePath)
+	stem := strings.TrimSuffix(base, filepath.Ext(base))
+	return filepath.Join(annotationsDir, stem+".json")
+}
+
+func migrateAnnotationFileIfNeeded(token, path, annotationsDir string, singleFile bool, imagePath string) error {
+	if fileExists(path) {
+		return nil
+	}
+
+	otherPath := annotationFilePath(annotationsDir, !singleFile, imagePath)
+	if !fileExists(otherPath) {
+		return nil
+	}
+
+	af, err := annotations.ReadAnnotations(otherPath)
+	if err != nil {
+		return fmt.Errorf("read old-mode annotation file %q: %w", otherPath, err)
+	}
+	if err := annotations.WriteAnnotations(path, af); err != nil {
+		return fmt.Errorf("write migrated annotation file %q: %w", path, err)
+	}
+	if err := os.Remove(otherPath); err != nil {
+		return fmt.Errorf("remove old-mode annotation file %q: %w", otherPath, err)
+	}
+	log.Printf("ws annotations migrated token=%s old=%s new=%s", tokenPrefix(token), otherPath, path)
+	return nil
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func resetTaskAnnotationState(token, taskID, annotationsDir string, singleFile bool) {
+	connectionsMu.Lock()
+	defer connectionsMu.Unlock()
+	if s := connections[token]; s != nil {
+		s.activeTaskID = taskID
+		s.annotationsDir = annotationsDir
+		s.singleFile = singleFile
+		s.activeAnnotationPath = ""
+		s.activeAnnotationHash = ""
+	}
+}
+
+func getOrLoadSharedAnnotations(path, token, hash string, lgr *logger.Logger) *annotations.AnnotationFile {
+	annotationStoreMu.Lock()
+	if entry := annotationStore[path]; entry != nil && entry.af != nil {
+		cached := cloneAnnotationFile(entry.af)
+		annotationStoreMu.Unlock()
+		return cached
+	}
+	annotationStoreMu.Unlock()
+
+	loaded, err := annotations.ReadAnnotations(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			loaded = emptyAnnotationFile()
+		} else {
+			log.Printf("ws load_annotations failed token=%s hash=%.16s path=%s err=%v", tokenPrefix(token), hash, path, err)
+			logAppend(lgr, map[string]any{
+				"type":  "annotations_error",
+				"ts":    time.Now().Format(time.RFC3339),
+				"hash":  hash,
+				"path":  path,
+				"error": err.Error(),
+			})
+			loaded = emptyAnnotationFile()
+		}
+	}
+
+	annotationStoreMu.Lock()
+	defer annotationStoreMu.Unlock()
+	entry := annotationStore[path]
+	if entry == nil {
+		entry = &fileAnnotations{}
+		annotationStore[path] = entry
+	}
+	if entry.af == nil {
+		entry.af = cloneAnnotationFile(loaded)
+	}
+	return cloneAnnotationFile(entry.af)
+}
+
+func mergeAndStoreSharedAnnotations(path string, incoming *annotations.AnnotationFile, lgr *logger.Logger) *annotations.AnnotationFile {
+	annotationStoreMu.Lock()
+	defer annotationStoreMu.Unlock()
+
+	entry := annotationStore[path]
+	if entry == nil {
+		entry = &fileAnnotations{af: emptyAnnotationFile()}
+		annotationStore[path] = entry
+	}
+	if entry.af == nil {
+		entry.af = emptyAnnotationFile()
+	}
+	entry.af = mergeAnnotationFiles(entry.af, incoming)
+	entry.dirty = true
+	if entry.timer != nil {
+		entry.timer.Stop()
+	}
+	entry.timer = time.AfterFunc(10*time.Second, func() {
+		flushAnnotationPath(path, lgr)
+	})
+	return cloneAnnotationFile(entry.af)
+}
+
+func mergeAnnotationFiles(existing, incoming *annotations.AnnotationFile) *annotations.AnnotationFile {
+	base := cloneAnnotationFile(existing)
+	inc := cloneAnnotationFile(incoming)
+	if base == nil {
+		base = emptyAnnotationFile()
+	}
+	if inc == nil {
+		return base
+	}
+
+	targetImageID := 1
+	if len(inc.Images) > 0 && inc.Images[0].ID != 0 {
+		targetImageID = inc.Images[0].ID
+	}
+
+	imageOut := make([]annotations.CocoImage, 0, len(base.Images)+len(inc.Images))
+	for _, img := range base.Images {
+		if img.ID != targetImageID {
+			imageOut = append(imageOut, img)
+		}
+	}
+	for _, img := range inc.Images {
+		if img.ID == targetImageID {
+			imageOut = append(imageOut, img)
+		}
+	}
+	base.Images = imageOut
+
+	catByID := map[int]annotations.CocoCategory{}
+	for _, cat := range base.Categories {
+		catByID[cat.ID] = cat
+	}
+	for _, cat := range inc.Categories {
+		catByID[cat.ID] = cat
+	}
+	catIDs := make([]int, 0, len(catByID))
+	for id := range catByID {
+		catIDs = append(catIDs, id)
+	}
+	sort.Ints(catIDs)
+	base.Categories = make([]annotations.CocoCategory, 0, len(catIDs))
+	for _, id := range catIDs {
+		base.Categories = append(base.Categories, catByID[id])
+	}
+
+	nextAnnotations := make([]annotations.CocoAnnotation, 0, len(base.Annotations)+len(inc.Annotations))
+	for _, ann := range base.Annotations {
+		if ann.ImageID != targetImageID {
+			nextAnnotations = append(nextAnnotations, ann)
+		}
+	}
+	incForTarget := make([]annotations.CocoAnnotation, 0, len(inc.Annotations))
+	for _, ann := range inc.Annotations {
+		if ann.ImageID == targetImageID {
+			incForTarget = append(incForTarget, ann)
+		}
+	}
+	sort.Slice(incForTarget, func(i, j int) bool { return incForTarget[i].ID < incForTarget[j].ID })
+	nextAnnotations = append(nextAnnotations, incForTarget...)
+	base.Annotations = nextAnnotations
+
+	if len(inc.NemolabLabels) > 0 {
+		base.NemolabLabels = append([]byte(nil), inc.NemolabLabels...)
+	}
+	if len(inc.NemolabComments) > 0 {
+		base.NemolabComments = append([]byte(nil), inc.NemolabComments...)
+	}
+	if len(inc.NemolabAuthors) > 0 {
+		base.NemolabAuthors = append([]byte(nil), inc.NemolabAuthors...)
+	}
+
+	return base
+}
+
+func cloneAnnotationFile(src *annotations.AnnotationFile) *annotations.AnnotationFile {
+	if src == nil {
+		return nil
+	}
+	out := &annotations.AnnotationFile{
+		Images:          append([]annotations.CocoImage{}, src.Images...),
+		Annotations:     append([]annotations.CocoAnnotation{}, src.Annotations...),
+		Categories:      append([]annotations.CocoCategory{}, src.Categories...),
+		NemolabLabels:   append([]byte(nil), src.NemolabLabels...),
+		NemolabComments: append([]byte(nil), src.NemolabComments...),
+		NemolabAuthors:  append([]byte(nil), src.NemolabAuthors...),
+	}
+	for i := range out.Annotations {
+		out.Annotations[i].BBox = append([]float64{}, out.Annotations[i].BBox...)
+		out.Annotations[i].Keypoints = append([]float64{}, out.Annotations[i].Keypoints...)
+	}
+	return out
+}
+
+func flushAnnotationPath(path string, lgr *logger.Logger) {
+	annotationStoreMu.Lock()
+	entry := annotationStore[path]
+	if entry == nil {
+		annotationStoreMu.Unlock()
+		return
+	}
+	if !entry.dirty || entry.af == nil {
+		entry.timer = nil
+		annotationStoreMu.Unlock()
+		return
+	}
+	snapshot := cloneAnnotationFile(entry.af)
+	entry.dirty = false
+	entry.timer = nil
+	annotationStoreMu.Unlock()
+
+	if err := annotations.WriteAnnotations(path, snapshot); err != nil {
+		log.Printf("ws save_annotations flush failed path=%s err=%v", path, err)
+		logAppend(lgr, map[string]any{
+			"type":  "annotations_error",
+			"ts":    time.Now().Format(time.RFC3339),
+			"path":  path,
+			"error": err.Error(),
+		})
+		annotationStoreMu.Lock()
+		if e := annotationStore[path]; e != nil {
+			e.dirty = true
+		}
+		annotationStoreMu.Unlock()
+		return
+	}
+	logAppend(lgr, map[string]any{
+		"type": "annotations_saved",
+		"ts":   time.Now().Format(time.RFC3339),
+		"path": path,
+	})
+}
+
+func flushAnnotationPathNow(path string, lgr *logger.Logger) {
+	annotationStoreMu.Lock()
+	entry := annotationStore[path]
+	if entry == nil || !entry.dirty || entry.af == nil {
+		annotationStoreMu.Unlock()
+		return
+	}
+	if entry.timer != nil {
+		entry.timer.Stop()
+		entry.timer = nil
+	}
+	snapshot := cloneAnnotationFile(entry.af)
+	entry.dirty = false
+	annotationStoreMu.Unlock()
+
+	if err := annotations.WriteAnnotations(path, snapshot); err != nil {
+		log.Printf("ws save_annotations immediate flush failed path=%s err=%v", path, err)
+		logAppend(lgr, map[string]any{
+			"type":  "annotations_error",
+			"ts":    time.Now().Format(time.RFC3339),
+			"path":  path,
+			"error": err.Error(),
+		})
+		annotationStoreMu.Lock()
+		if e := annotationStore[path]; e != nil {
+			e.dirty = true
+		}
+		annotationStoreMu.Unlock()
+	}
+}
+
+func setActiveAnnotationPath(token, path, hash string) {
+	connectionsMu.Lock()
+	defer connectionsMu.Unlock()
+	if s := connections[token]; s != nil {
+		s.activeAnnotationPath = path
+		s.activeAnnotationHash = hash
+	}
+}
+
+func broadcastAnnotationsData(path, originHash string, af *annotations.AnnotationFile, originConn *websocket.Conn) {
+	type target struct {
+		conn    *websocket.Conn
+		writeMu *sync.Mutex
+		hash    string
+	}
+
+	liveConnsMu.Lock()
+	allLive := make([]struct {
+		conn    *websocket.Conn
+		token   string
+		writeMu *sync.Mutex
+	}, 0, len(liveConns))
+	for conn, info := range liveConns {
+		allLive = append(allLive, struct {
+			conn    *websocket.Conn
+			token   string
+			writeMu *sync.Mutex
+		}{conn: conn, token: info.token, writeMu: info.writeMu})
+	}
+	liveConnsMu.Unlock()
+
+	targets := make([]target, 0, len(allLive))
+	for _, live := range allLive {
+		if live.conn == originConn {
+			continue
+		}
+		connectionsMu.Lock()
+		state := connections[live.token]
+		matches := state != nil && state.activeAnnotationPath == path
+		hash := originHash
+		if matches && state.activeAnnotationHash != "" {
+			hash = state.activeAnnotationHash
+		}
+		connectionsMu.Unlock()
+		if !matches {
+			continue
+		}
+		targets = append(targets, target{conn: live.conn, writeMu: live.writeMu, hash: hash})
+	}
+
+	for _, t := range targets {
+		sendAnnotationsData(t.conn, t.writeMu, t.hash, af)
+	}
+}
+
+func registerLiveConn(token string, conn *websocket.Conn, writeMu *sync.Mutex) {
+	liveConnsMu.Lock()
+	defer liveConnsMu.Unlock()
+	liveConns[conn] = struct {
+		token   string
+		writeMu *sync.Mutex
+	}{token: token, writeMu: writeMu}
+}
+
+func unregisterLiveConn(conn *websocket.Conn) {
+	liveConnsMu.Lock()
+	defer liveConnsMu.Unlock()
+	delete(liveConns, conn)
+}
+
+func flushActiveAnnotationOnDisconnect(token string, lgr *logger.Logger) {
+	connectionsMu.Lock()
+	path := ""
+	if s := connections[token]; s != nil {
+		path = s.activeAnnotationPath
+	}
+	connectionsMu.Unlock()
+	if path == "" {
+		return
+	}
+	flushAnnotationPathNow(path, lgr)
+}
+
 func readManifestLevels(hash string) (int, error) {
 	path := tiles.ManifestPathForHash(hash)
 	raw, err := os.ReadFile(path)
@@ -297,7 +796,7 @@ func listTaskImages(imagesRoot string) ([]imageItem, map[string]string, error) {
 	for _, path := range files {
 		canonical, err := canonicalPath(path)
 		if err != nil {
-			continue
+			return nil, nil, fmt.Errorf("canonicalize image path %q: %w", path, err)
 		}
 		hash := tiles.HashForPath(canonical)
 		rel, err := filepath.Rel(absRoot, path)
@@ -325,6 +824,21 @@ func taskImagesPath(db *sql.DB, taskID string) (string, error) {
 		return "", err
 	}
 	return imagesPath, nil
+}
+
+func taskAnnotationsConfig(db *sql.DB, taskID string) (string, bool, error) {
+	if strings.TrimSpace(taskID) == "" {
+		return "", false, nil
+	}
+	var annotationsPath string
+	var checkmark int
+	if err := db.QueryRow("SELECT annotations, checkmark FROM tasks WHERE id = ?", taskID).Scan(&annotationsPath, &checkmark); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	return annotationsPath, checkmark != 0, nil
 }
 
 func listImageFiles(root string) ([]string, error) {
@@ -373,7 +887,7 @@ func canonicalPath(path string) (string, error) {
 	}
 	canonical, err := filepath.EvalSymlinks(abs)
 	if err != nil {
-		return abs, nil
+		return "", err
 	}
 	return canonical, nil
 }

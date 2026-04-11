@@ -408,9 +408,51 @@ A mask is a geometric figure placed on the image canvas. Currently only point ma
 
 - Masks are numbered sequentially (1, 2, 3, …) per image.
 - The image view cursor is a **crosshair** at all times.
-- **Left-click**: places a point mask at the cursor position.
+- **Left-click**: places a point mask at the cursor position. Placement is disabled while a mask is selected.
 - **Shift+left-click**: removes the closest existing mask (if any within a reasonable hit radius).
 - Masks are rendered in the WebGL pass on top of image tiles — no overlay div.
+
+#### Mask selection
+
+- **Double-click** on a mask selects it. Only one mask can be selected at a time.
+- **Escape** cancels the current selection (returns to no mask selected).
+- **Arrow up / Arrow down** cycle through masks in index order; the cycle includes a "none selected" state.
+
+#### Mask and label colors
+
+- **Fill color** is per-mask: derived from the mask's sequential index using the bit-reversed hue algorithm (see [Color Algorithm](#color-algorithm)).
+- **Outline color** is per-label: derived from the label's depth-first index in the task label tree using the same algorithm. Unlabeled masks get a neutral outline (`#888888`).
+- When **no mask is selected**: all masks are drawn with fill and outline.
+- When **a mask is selected**: the selected mask is drawn with fill and outline; non-selected masks are drawn with outline only (no fill).
+
+#### Color algorithm
+
+Labels and masks are assigned a color by index `n = 0, 1, 2, …`:
+
+1. **Bit-reverse** `n` within 8 bits to get integer `r`; compute hue `h = r / 256` (range `[0, 1)`).
+   - n=0 → h=0.0, n=1 → h=0.5, n=2 → h=0.25, n=3 → h=0.75, n=4 → h=0.125, …
+2. **Convert HSV → RGB** with fixed S=0.75, V=0.90.
+
+This guarantees any small set of labels is visually distinct: consecutive indices are always maximally separated on the hue wheel.
+
+```ts
+function labelColor(n: number): string {
+  const BITS = 8;
+  let r = 0;
+  for (let i = 0; i < BITS; i++) r = (r << 1) | ((n >> i) & 1);
+  return hsvToRgbCss(r / (1 << BITS), 0.75, 0.90);
+}
+
+function hsvToRgbCss(h: number, s: number, v: number): string {
+  const i = Math.floor(h * 6), f = h * 6 - i;
+  const p = v * (1 - s), q = v * (1 - f * s), t = v * (1 - (1 - f) * s);
+  const [r, g, b] = ([
+    [v,t,p],[q,v,p],[p,v,t],[p,q,v],[t,p,v],[v,p,q]
+  ] as [number,number,number][])[i % 6];
+  const hex = (x: number) => Math.round(x * 255).toString(16).padStart(2, "0");
+  return `#${hex(r)}${hex(g)}${hex(b)}`;
+}
+```
 
 ### Labels
 
@@ -435,6 +477,70 @@ An annotation is the assignment of a label to a mask.
   - Lists recently used labels, most recent on top.
   - Clicking a list item assigns that label to the mask.
 - The **last assigned label** is the default for the next placed mask (auto-assigned on placement).
+
+### Annotation Persistence
+
+#### File format
+
+- The backend reads three formats: plain COCO, extended COCO (written by nemo-lab), and LabelMe.
+- Format is auto-detected: presence of a top-level `shapes` key → LabelMe; otherwise → COCO / extended COCO.
+- Reading is fully lenient: missing top-level arrays (`images`, `annotations`, `categories`) are treated as empty.
+- The backend **writes only extended COCO**.
+- Polygons read from any source are rasterized to COCO-RLE masks on load; they are never written as polygons. Rasterization uses the original image resolution: for COCO, width/height from the matching `images` entry (by `image_id`); for LabelMe, the top-level `imageWidth`/`imageHeight` fields. Missing or zero dimensions are an error.
+
+#### Extended COCO sidecar fields (top-level keys)
+
+| Key | Content |
+|-----|---------|
+| `nemolab_labels` | Full hierarchical label tree for the task |
+| `nemolab_comments` | Per-annotation and per-image comments |
+| `nemolab_authors` | Author of each comment and annotation |
+
+#### Annotation types
+
+| Type | Stored as |
+|------|-----------|
+| Point | COCO keypoint |
+| Bounding box | COCO `bbox` `[x, y, w, h]` |
+| Mask | COCO-RLE (column-major run-length encoding) |
+| Polygon (input only) | Rasterized to COCO-RLE on read |
+
+#### Write timing and file naming
+
+- Writes are debounced: the file is written 10 seconds after the **last** modification (timer resets on each change).
+- **Single-file mode** (`checkmark = true`): all annotations written to `nemolab.json` in the task `annotations` folder.
+- **Per-image mode** (`checkmark = false`): annotations written to a JSON file with the same name as the image but with `.json` extension.
+
+#### Mode switching
+
+- When the user switches between single-file and per-image mode, only the **current image's** annotations are migrated immediately (old file read, new file written, old file deleted).
+- Subsequent images are migrated lazily when first accessed or modified under the new mode.
+- Untouched images retain their old files until naturally overwritten.
+
+### Multi-user Collaboration
+
+#### Shared annotation store
+
+- The backend maintains one **server-side in-memory annotation store**, shared across all connections, keyed by annotation file path.
+- Individual connections do not hold their own annotation copies — the shared store is the single authoritative source.
+- The 10-second debounce write timer is **per file path** (shared); any user's change resets the timer for that path.
+
+#### Live propagation
+
+- When user A modifies annotations for an image (add/remove/label a mask, or changes a comment):
+  1. The shared store is updated immediately using per-mask merge (last write wins per mask id).
+  2. The full updated `annotations_data` message for that image is pushed to all **other** connections that currently have the same annotation file path active.
+- The receiving frontend applies `annotations_data` identically to a normal load response.
+
+#### Conflict resolution
+
+- Masks are independent units — merge is per mask id, last write wins.
+- A mask added by one user is never silently removed by another user saving (unless they explicitly remove it).
+- A mask removed by one user is propagated to all other active users immediately.
+
+#### Flush on disconnect
+
+- On connection close, any pending dirty annotations for that connection's active file are flushed to disk immediately (don't wait for the debounce timer).
 
 ### Annotation Logging (temporary)
 

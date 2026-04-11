@@ -420,7 +420,9 @@ func userIDFromRequest(db *sql.DB, r *http.Request) (int64, error) {
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
+	if err := json.NewEncoder(w).Encode(value); err != nil {
+		log.Printf("writeJSON encode failed: status=%d type=%T err=%v", status, value, err)
+	}
 }
 
 func syncAdmins(db *sql.DB, admins []string) error {
