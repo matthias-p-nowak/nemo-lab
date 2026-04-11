@@ -68,6 +68,15 @@ function labelColor(n: number): string {
   return hsvToRgbCss(reversed / (1 << BITS), 0.75, 0.90);
 }
 
+/** Returns a CSS hex fill color for mask index n using bit-reversed hue (S=0.50, V=0.70). */
+function maskFillColor(n: number): string {
+  const BITS = 8;
+  const idx = Math.max(0, Math.floor(n));
+  let reversed = 0;
+  for (let i = 0; i < BITS; i++) reversed = (reversed << 1) | ((idx >> i) & 1);
+  return hsvToRgbCss(reversed / (1 << BITS), 0.50, 0.70);
+}
+
 /** Parses #rrggbb into normalized RGB components in [0,1]. */
 function cssHexToRgb01(color: string): [number, number, number] {
   const match = /^#([0-9a-fA-F]{6})$/.exec(color);
@@ -272,6 +281,14 @@ const appState = {
     flipH: false,
     /** Flip the view vertically when true. */
     flipV: false,
+    /** Mask outline opacity in [0,1]. */
+    maskStrokeOpacity: 1.0,
+    /** Mask fill opacity in [0,1]. */
+    maskFillOpacity: 0.4,
+    /** Mask stroke width scalar in [1,20]. */
+    maskStrokeWidth: 3,
+    /** Mask marker diameter in px. */
+    markerSize: 10,
   },
 };
 
@@ -318,6 +335,10 @@ async function loadSettingsOnStartup(): Promise<void> {
     appState.optics.rotate90cw = parseSettingBool(get("optics_rotate90cw"), appState.optics.rotate90cw);
     appState.optics.flipH = parseSettingBool(get("optics_flip_h"), appState.optics.flipH);
     appState.optics.flipV = parseSettingBool(get("optics_flip_v"), appState.optics.flipV);
+    appState.optics.maskStrokeOpacity = parseSettingFloat(get("mask_stroke_opacity"), appState.optics.maskStrokeOpacity);
+    appState.optics.maskFillOpacity = parseSettingFloat(get("mask_fill_opacity"), appState.optics.maskFillOpacity);
+    appState.optics.maskStrokeWidth = parseSettingFloat(get("mask_stroke_width"), appState.optics.maskStrokeWidth);
+    appState.optics.markerSize = parseSettingFloat(get("mask_marker_size"), appState.optics.markerSize);
   } catch (err) {
     console.error("settings: load failed", err);
     logEvent("settings_error", { op: "get", error: String(err) });
@@ -333,6 +354,10 @@ function persistOpticsSettingsLater(): void {
     optics_rotate90cw: String(appState.optics.rotate90cw),
     optics_flip_h: String(appState.optics.flipH),
     optics_flip_v: String(appState.optics.flipV),
+    mask_stroke_opacity: String(appState.optics.maskStrokeOpacity),
+    mask_fill_opacity: String(appState.optics.maskFillOpacity),
+    mask_stroke_width: String(appState.optics.maskStrokeWidth),
+    mask_marker_size: String(appState.optics.markerSize),
   }).catch((err) => {
     console.error("settings: persist optics failed", err);
     logEvent("settings_error", { op: "put", key: "optics", error: String(err) });
@@ -1133,7 +1158,18 @@ function bindActiveLabelPanelHandlers(): void {
 
 /** Produces the optics panel body HTML with sliders and transform toggles. */
 function renderOpticsBody(): string {
-  const { gamma, multiply, add, rotate90cw, flipH, flipV } = appState.optics;
+  const {
+    gamma,
+    multiply,
+    add,
+    rotate90cw,
+    flipH,
+    flipV,
+    maskStrokeOpacity,
+    maskFillOpacity,
+    maskStrokeWidth,
+    markerSize,
+  } = appState.optics;
   return `
     <label class="optics-row">
       <span>gamma</span>
@@ -1167,6 +1203,30 @@ function renderOpticsBody(): string {
       <input type="checkbox" data-transform="flipV" ${flipV ? "checked" : ""}>
       <span>Vertical flip</span>
       <span class="optics-val"></span>
+    </label>
+    <label class="optics-row">
+      <span>stroke opacity</span>
+      <input type="range" data-mask-render="maskStrokeOpacity"
+        min="0" max="1" step="0.05" value="${maskStrokeOpacity}">
+      <span class="optics-val">${maskStrokeOpacity.toFixed(2)}</span>
+    </label>
+    <label class="optics-row">
+      <span>fill opacity</span>
+      <input type="range" data-mask-render="maskFillOpacity"
+        min="0" max="1" step="0.05" value="${maskFillOpacity}">
+      <span class="optics-val">${maskFillOpacity.toFixed(2)}</span>
+    </label>
+    <label class="optics-row">
+      <span>stroke width</span>
+      <input type="range" data-mask-render="maskStrokeWidth"
+        min="1" max="5" step="1" value="${maskStrokeWidth}">
+      <span class="optics-val">${maskStrokeWidth.toFixed(0)}</span>
+    </label>
+    <label class="optics-row">
+      <span>marker size</span>
+      <input type="range" data-mask-render="markerSize"
+        min="5" max="30" step="1" value="${markerSize}">
+      <span class="optics-val">${markerSize.toFixed(0)}</span>
     </label>
     <div class="optics-reset-row">
       <button type="button" class="ghost" data-action="reset-optics" title="Reset optics">↺</button>
@@ -1217,6 +1277,30 @@ function bindOpticsPanelHandlers(): void {
     });
   });
 
+  panel.querySelectorAll<HTMLInputElement>("input[data-mask-render]").forEach((slider) => {
+    slider.addEventListener("input", () => {
+      const key = slider.getAttribute("data-mask-render") as "maskStrokeOpacity" | "maskFillOpacity" | "maskStrokeWidth" | "markerSize";
+      const raw = parseFloat(slider.value);
+      const val = key === "maskStrokeWidth" || key === "markerSize" ? Math.round(raw) : raw;
+      appState.optics[key] = val;
+
+      const valSpan = slider.nextElementSibling as HTMLElement | null;
+      if (valSpan) {
+        valSpan.textContent = key === "maskStrokeWidth" || key === "markerSize" ? val.toFixed(0) : val.toFixed(2);
+      }
+
+      const settingsKey = key === "maskStrokeOpacity"
+        ? "mask_stroke_opacity"
+        : key === "maskFillOpacity"
+          ? "mask_fill_opacity"
+          : key === "maskStrokeWidth"
+            ? "mask_stroke_width"
+            : "mask_marker_size";
+      persistSettingDebouncedLater(settingsKey, String(val));
+      applyOpticsToViewer();
+    });
+  });
+
   panel.querySelector<HTMLButtonElement>('[data-action="reset-optics"]')
     ?.addEventListener("click", () => {
       appState.optics = {
@@ -1226,6 +1310,10 @@ function bindOpticsPanelHandlers(): void {
         rotate90cw: false,
         flipH: false,
         flipV: false,
+        maskStrokeOpacity: 1.0,
+        maskFillOpacity: 0.4,
+        maskStrokeWidth: 3,
+        markerSize: 10,
       };
       applyOpticsToViewer();
       persistOpticsSettingsLater();
@@ -1357,6 +1445,8 @@ class WebGLTileViewer {
   private readonly pointColorUniform: WebGLUniformLocation;
   /** Point program size uniform location. */
   private readonly pointSizeUniform: WebGLUniformLocation;
+  /** Point program ring-cutout uniform location (0 = solid fill, >0 = annulus). */
+  private readonly pointRingUniform: WebGLUniformLocation;
   /** Point program transform matrix uniform location. */
   private readonly pointTransformUniform: WebGLUniformLocation;
 
@@ -1448,9 +1538,14 @@ class WebGLTileViewer {
       `
       precision mediump float;
       uniform vec4 u_color;
+      uniform float u_ring;
       void main() {
         vec2 c = gl_PointCoord - vec2(0.5);
-        if (dot(c, c) > 0.25) {
+        float d = dot(c, c);
+        if (d > 0.25) {
+          discard;
+        }
+        if (u_ring > 0.0 && d < u_ring) {
           discard;
         }
         gl_FragColor = u_color;
@@ -1477,12 +1572,14 @@ class WebGLTileViewer {
     this.pointPosAttrib = gl.getAttribLocation(this.pointProgram, "a_pos");
     const pointColor = gl.getUniformLocation(this.pointProgram, "u_color");
     const pointSize = gl.getUniformLocation(this.pointProgram, "u_size");
+    const pointRing = gl.getUniformLocation(this.pointProgram, "u_ring");
     const pointTransform = gl.getUniformLocation(this.pointProgram, "u_transform");
-    if (!pointColor || !pointSize || !pointTransform) {
+    if (!pointColor || !pointSize || !pointRing || !pointTransform) {
       throw new Error("Point uniforms missing");
     }
     this.pointColorUniform = pointColor;
     this.pointSizeUniform = pointSize;
+    this.pointRingUniform = pointRing;
     this.pointTransformUniform = pointTransform;
 
     const positionBuffer = gl.createBuffer();
@@ -1980,8 +2077,14 @@ class WebGLTileViewer {
     const hasSelectedMask = selectedMaskId !== null && masks.some((mask) => mask.id === selectedMaskId);
     const labelDepthFirstIndex = buildLabelDepthFirstIndexMap(appState.activeLabels);
     const point = new Float32Array(2);
-    const outlineSize = 14;
-    const fillSize = 9;
+    const strokeWidth = Math.min(5, Math.max(1, appState.optics.maskStrokeWidth));
+    const markerSize = Math.max(5, appState.optics.markerSize);
+    const fillSize = markerSize;
+    const outlineSize = markerSize + strokeWidth * 2;
+    const strokeOpacity = Math.max(0, Math.min(1, appState.optics.maskStrokeOpacity));
+    const fillOpacity = Math.max(0, Math.min(1, appState.optics.maskFillOpacity));
+    const ringInnerRadius = Math.max(0, 0.5 - strokeWidth / outlineSize);
+    const ringThreshold = ringInnerRadius * ringInnerRadius;
 
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
@@ -1999,19 +2102,21 @@ class WebGLTileViewer {
       point[1] = 1 - (y / this.canvas.clientHeight) * 2;
       gl.bufferData(gl.ARRAY_BUFFER, point, gl.STREAM_DRAW);
 
-      const fillHex = labelColor(index);
+      const fillHex = maskFillColor(index);
       const labelIndex = mask.labelName ? (labelDepthFirstIndex.get(mask.labelName) ?? null) : null;
       const outlineHex = labelIndex === null ? "#888888" : labelColor(labelIndex);
       const [outlineR, outlineG, outlineB] = cssHexToRgb01(outlineHex);
-      gl.uniform4f(this.pointColorUniform, outlineR, outlineG, outlineB, 1);
+      gl.uniform4f(this.pointColorUniform, outlineR, outlineG, outlineB, strokeOpacity);
       gl.uniform1f(this.pointSizeUniform, outlineSize);
+      gl.uniform1f(this.pointRingUniform, ringThreshold);
       gl.drawArrays(gl.POINTS, 0, 1);
 
       const shouldFill = !hasSelectedMask || mask.id === selectedMaskId;
       if (shouldFill) {
         const [fillR, fillG, fillB] = cssHexToRgb01(fillHex);
-        gl.uniform4f(this.pointColorUniform, fillR, fillG, fillB, 1);
+        gl.uniform4f(this.pointColorUniform, fillR, fillG, fillB, fillOpacity);
         gl.uniform1f(this.pointSizeUniform, fillSize);
+        gl.uniform1f(this.pointRingUniform, 0.0);
         gl.drawArrays(gl.POINTS, 0, 1);
       }
     });

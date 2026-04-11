@@ -34,7 +34,9 @@
 
 - **Mask selection**: Double-click selects a mask; Escape cancels selection; Arrow up/down cycle through masks (cycle includes "none selected"). While a mask is selected, left-click placement is disabled (temporary restriction). (2026-04-11)
 
-- **Mask and label colors**: Fill color is per-mask index (bit-reversed hue, S=0.75 V=0.90); outline color is per-label depth-first index (same algorithm); unlabeled masks get `#888888` outline. No selection: all masks show fill+outline. With selection: selected mask shows fill+outline, others show outline only. (2026-04-11)
+- **Mask and label colors**: Two distinct palettes — fill uses mask index with S=0.50 V=0.70 (muted); outline uses label depth-first index with S=0.75 V=0.90 (vivid). Label colors are task-level stable. Default opacity: fill 40%, outline 100%. Unlabeled masks get `#888888` outline. No selection: all masks show fill+outline. With selection: selected mask shows fill+outline, others show outline only. (2026-04-11, updated 2026-04-11)
+
+- **Mask rendering controls in Optics panel**: Four sliders — stroke opacity (0–1, default 1.0), fill opacity (0–1, default 0.4), stroke width (1–5 px, default 3 px), marker size (5–30 px, default 10 px). Outline drawn as ring (annulus); fill drawn as solid inner circle. Applied immediately via `applyOpticsToViewer()`, persisted as `mask_stroke_opacity`, `mask_fill_opacity`, `mask_stroke_width`, `mask_marker_size`. Reset by panel-title click. (2026-04-11)
 
 - **Masks and annotations**: Point masks placed by left-click, removed by shift+left-click (closest within hit radius). Crosshair cursor on image view. Right-click within 10px of a mask opens context menu with recent labels; clicking assigns label to mask. Last assigned label auto-assigned to next mask. Logged to backend over WS (`mask_created`, `mask_removed`, `label_assigned`, `mouse_click`). Persistence deferred. (2026-04-07)
 

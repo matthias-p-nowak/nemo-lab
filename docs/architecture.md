@@ -188,6 +188,9 @@
 - On `image_ready` for a newly selected hash, frontend sends `load_annotations` for that hash.
 - Frontend applies `annotations_data` only when `hash === appState.currentImageHash`, updates stored image dimensions, and reconstructs point masks from keypoint annotations (`num_keypoints > 0`) with category-id label lookup.
 - Frontend sends `save_annotations` after mask create/remove/label-assign by rebuilding a COCO-like payload from current masks, using current image filename and last-known image width/height.
+- Mask rendering palettes are split: fill uses `maskFillColor` (bit-reversed hue, S=0.50 V=0.70); outline uses label-based `labelColor` (S=0.75 V=0.90) or gray for unlabeled masks.
+- Optics panel includes persisted mask-render controls (`mask_stroke_opacity`, `mask_fill_opacity`, `mask_stroke_width`, `mask_marker_size`) that drive point alpha/size in the WebGL mask draw pass.
+- Mask outline pass is rendered as an annulus (ring) via shader uniform thresholding; fill pass remains a solid circle. This avoids label-color solid dots when fill opacity is set to zero.
 - Mask selection state is stored in `appState.selectedMaskId`: `dblclick` near a mask selects it; `Escape` clears selection; `ArrowUp`/`ArrowDown` cycle through masks in index order with a `null` (none selected) state and wrap-around behavior.
 - While a mask is selected, standard left-click placement is suppressed (temporary restriction); shift-remove and right-click label assignment remain available.
 - Mask point colors are rendered per-point in WebGL:

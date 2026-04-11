@@ -274,8 +274,22 @@ Collapsible panel in the right sidebar. Contains three sliders:
 | Brightness (additive)| -100 – 100  | 0.0     |
 
 - Adjustments are applied immediately as sliders move, in order: gamma → multiply → add. Gamma is applied as `pow(rgb, 1/gamma)` (linear-to-sRGB correction: higher gamma = brighter image).
-- Clicking the panel title resets all three values to their defaults.
+- Clicking the panel title resets all values (image sliders, transform toggles, and mask sliders) to their defaults.
 - Labels, sliders, and numeric values are aligned in a three-column grid (label | slider | value).
+
+#### Mask rendering controls
+
+Three additional sliders in the Optics panel, below the transform toggles:
+
+| Slider | Range | Default |
+|---|---|---|
+| Stroke opacity | 0.0 – 1.0 | 1.0 |
+| Fill opacity | 0.0 – 1.0 | 0.4 |
+| Stroke width | 1 – 20 px | 3 px |
+
+- Applied immediately to mask rendering as sliders move.
+- Persisted in `user_settings` (keys: `mask_stroke_opacity`, `mask_fill_opacity`, `mask_stroke_width`).
+- Reset to defaults when the Optics panel title is clicked.
 
 #### Transform toggles
 
@@ -420,37 +434,38 @@ A mask is a geometric figure placed on the image canvas. Currently only point ma
 
 #### Mask and label colors
 
-- **Fill color** is per-mask: derived from the mask's sequential index using the bit-reversed hue algorithm (see [Color Algorithm](#color-algorithm)).
-- **Outline color** is per-label: derived from the label's depth-first index in the task label tree using the same algorithm. Unlabeled masks get a neutral outline (`#888888`).
+- **Fill color** is per-mask: derived from the mask's sequential index using the mask fill palette (S=0.50, V=0.70 — muted).
+- **Outline color** is per-label: derived from the label's depth-first index in the task label tree using the label outline palette (S=0.75, V=0.90 — vivid). Unlabeled masks get a neutral outline (`#888888`).
+- Label colors are stable across all images in the task (depth-first index in the label tree is task-level, not image-level).
+- The two palettes use different HSV parameters so fill and outline colors never collide.
+- **Default opacity**: fill 40% (alpha 0.4), outline 100% (alpha 1.0). Both are user-adjustable (see [Optics Panel](#optics-panel)).
 - When **no mask is selected**: all masks are drawn with fill and outline.
 - When **a mask is selected**: the selected mask is drawn with fill and outline; non-selected masks are drawn with outline only (no fill).
 
 #### Color algorithm
 
-Labels and masks are assigned a color by index `n = 0, 1, 2, …`:
+Both palettes use bit-reversed hue; only the HSV parameters differ:
 
-1. **Bit-reverse** `n` within 8 bits to get integer `r`; compute hue `h = r / 256` (range `[0, 1)`).
-   - n=0 → h=0.0, n=1 → h=0.5, n=2 → h=0.25, n=3 → h=0.75, n=4 → h=0.125, …
-2. **Convert HSV → RGB** with fixed S=0.75, V=0.90.
+| Palette | Used for | S | V |
+|---|---|---|---|
+| Label/outline | Outline color, label tree display | 0.75 | 0.90 |
+| Mask/fill | Fill color | 0.50 | 0.70 |
 
-This guarantees any small set of labels is visually distinct: consecutive indices are always maximally separated on the hue wheel.
+1. **Bit-reverse** index `n` within 8 bits → hue `h = reversed / 256 ∈ [0, 1)`.
+2. **Convert HSV → RGB** with the palette's S and V values.
 
 ```ts
-function labelColor(n: number): string {
+function labelColor(n: number): string {        // outline / label display
+  return indexToHsvColor(n, 0.75, 0.90);
+}
+function maskFillColor(n: number): string {     // fill
+  return indexToHsvColor(n, 0.50, 0.70);
+}
+function indexToHsvColor(n: number, s: number, v: number): string {
   const BITS = 8;
   let r = 0;
   for (let i = 0; i < BITS; i++) r = (r << 1) | ((n >> i) & 1);
-  return hsvToRgbCss(r / (1 << BITS), 0.75, 0.90);
-}
-
-function hsvToRgbCss(h: number, s: number, v: number): string {
-  const i = Math.floor(h * 6), f = h * 6 - i;
-  const p = v * (1 - s), q = v * (1 - f * s), t = v * (1 - (1 - f) * s);
-  const [r, g, b] = ([
-    [v,t,p],[q,v,p],[p,v,t],[p,q,v],[t,p,v],[v,p,q]
-  ] as [number,number,number][])[i % 6];
-  const hex = (x: number) => Math.round(x * 255).toString(16).padStart(2, "0");
-  return `#${hex(r)}${hex(g)}${hex(b)}`;
+  return hsvToRgbCss(r / (1 << BITS), s, v);
 }
 ```
 

@@ -8,7 +8,6 @@
 # Planned Task items
 
 
-
 # Issues found by review
 
 ## Frontend
