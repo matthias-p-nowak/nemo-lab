@@ -1414,6 +1414,14 @@ function updateMaskContextMenuUI(): void {
   bindMaskContextMenuHandlers();
 }
 
+/** Updates only the mask-mode panel body DOM without remounting the viewer. */
+function updateMaskModePanelUI(): void {
+  const panelBody = appRoot.querySelector<HTMLElement>('[data-panel="maskMode"] .panel__body');
+  if (!panelBody) return;
+  panelBody.innerHTML = renderMaskModeBody();
+  bindMaskModePanelHandlers();
+}
+
 /** Re-renders annotation panel body and redraws WebGL annotations only. */
 function updateAnnotationUI(): void {
   const annotationsPanelBody = appRoot.querySelector<HTMLElement>(
@@ -1455,7 +1463,8 @@ function bindMaskModePanelHandlers(): void {
       appState.maskMode = "point";
       appState.draftBboxMask = null;
     }
-    render();
+    updateMaskModePanelUI();
+    viewer?.draw();
   });
 }
 
