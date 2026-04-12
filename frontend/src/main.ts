@@ -1048,14 +1048,31 @@ ws.addEventListener("message", (event) => {
 function toggleLeftSidebar(): void {
   appState.leftCollapsed = !appState.leftCollapsed;
   persistSettingLater("sidebar_left", appState.leftCollapsed ? "hidden" : "visible");
-  render();
+  applySidebarVisibilityUI();
+  viewer?.resize();
+  viewer?.draw();
 }
 
 /** Toggles right sidebar visibility state. */
 function toggleRightSidebar(): void {
   appState.rightCollapsed = !appState.rightCollapsed;
   persistSettingLater("sidebar_right", appState.rightCollapsed ? "hidden" : "visible");
-  render();
+  applySidebarVisibilityUI();
+  viewer?.resize();
+  viewer?.draw();
+}
+
+/** Applies collapsed sidebar classes/buttons in-place without full app re-render. */
+function applySidebarVisibilityUI(): void {
+  const layout = appRoot.querySelector<HTMLElement>(".layout");
+  if (layout) {
+    layout.classList.toggle("left-collapsed", appState.leftCollapsed);
+    layout.classList.toggle("right-collapsed", appState.rightCollapsed);
+  }
+  const leftBtn = appRoot.querySelector<HTMLButtonElement>('button[data-action="toggle-left"]');
+  if (leftBtn) leftBtn.textContent = appState.leftCollapsed ? ">" : "<";
+  const rightBtn = appRoot.querySelector<HTMLButtonElement>('button[data-action="toggle-right"]');
+  if (rightBtn) rightBtn.textContent = appState.rightCollapsed ? "<" : ">";
 }
 
 /** Updates the current layout CSS variable for right sidebar width. */
@@ -1069,6 +1086,8 @@ function applyRightSidebarWidth(widthPx: number): void {
 function bindRightSidebarResizeHandle(): void {
   const handle = appRoot.querySelector<HTMLElement>(".sidebar--right .sidebar__resize-handle");
   if (!handle) return;
+  if (handle.dataset["boundResize"] === "1") return;
+  handle.dataset["boundResize"] = "1";
 
   handle.addEventListener("pointerdown", (event) => {
     if (appState.rightCollapsed) return;
@@ -1087,6 +1106,31 @@ function bindRightSidebarResizeHandle(): void {
     handle.addEventListener("pointermove", onPointerMove);
     handle.addEventListener("pointerup", onPointerUp);
     handle.addEventListener("pointercancel", onPointerUp);
+  });
+}
+
+/** Binds global navigation/sidebar-toggle actions once via appRoot delegation. */
+function bindGlobalNavHandlers(): void {
+  if ((bindGlobalNavHandlers as { _bound?: boolean })._bound) return;
+  (bindGlobalNavHandlers as { _bound?: boolean })._bound = true;
+  appRoot.addEventListener("click", (event) => {
+    const target = event.target as Element | null;
+    if (!target) return;
+    if (target.closest('[data-action="previous"]')) {
+      goPreviousImage();
+      return;
+    }
+    if (target.closest('[data-action="next"]')) {
+      goNextImage();
+      return;
+    }
+    if (target.closest('[data-action="toggle-left"]')) {
+      toggleLeftSidebar();
+      return;
+    }
+    if (target.closest('[data-action="toggle-right"]')) {
+      toggleRightSidebar();
+    }
   });
 }
 
@@ -1370,9 +1414,11 @@ function renderAnnotationList(): string {
 
   const items = appState.masks
     .map(
-      (mask) =>
-        `<li>#${mask.index} <span class="mask-label-chip">${mask.labelName ? mask.labelName.replace(/</g, "&lt;") : "unlabeled"}</span>` +
+      (mask) => {
+        const selectedClass = appState.selectedMaskId === mask.id ? " is-selected" : "";
+        return `<li class="annotation-list__item${selectedClass}" data-mask-id="${mask.id}">#${mask.index} <span class="mask-label-chip">${mask.labelName ? mask.labelName.replace(/</g, "&lt;") : "unlabeled"}</span>` +
         ` <button type="button" class="task-pin__remove" data-action="remove-mask" data-id="${mask.id}" title="Remove mask">✕</button></li>`
+      }
     )
     .join("");
   return `<ul class="annotation-list">${items}</ul>`;
@@ -1412,7 +1458,6 @@ function updateMaskContextMenuUI(): void {
   } else {
     appRoot.insertAdjacentHTML("beforeend", menuHtml);
   }
-  bindMaskContextMenuHandlers();
 }
 
 /** Updates only the mask-mode panel body DOM without remounting the viewer. */
@@ -1420,7 +1465,6 @@ function updateMaskModePanelUI(): void {
   const panelBody = appRoot.querySelector<HTMLElement>('[data-panel="maskMode"] .panel__body');
   if (!panelBody) return;
   panelBody.innerHTML = renderMaskModeBody();
-  bindMaskModePanelHandlers();
 }
 
 /** Updates only the optics panel body DOM without remounting the viewer. */
@@ -1428,7 +1472,6 @@ function updateOpticsPanelUI(): void {
   const panelBody = appRoot.querySelector<HTMLElement>('[data-panel="optics"] .panel__body');
   if (!panelBody) return;
   panelBody.innerHTML = renderOpticsBody();
-  bindOpticsPanelHandlers();
 }
 
 /** Re-renders annotation panel body and redraws WebGL annotations only. */
@@ -1438,7 +1481,6 @@ function updateAnnotationUI(): void {
   );
   if (annotationsPanelBody) {
     annotationsPanelBody.innerHTML = renderAnnotationList();
-    bindAnnotationPanelHandlers();
   }
   viewer?.draw();
 }
@@ -1447,27 +1489,37 @@ function updateAnnotationUI(): void {
 function updateMaskSelectionUI(): void {
   updateAnnotationUI();
   viewer?.draw();
+  const selectedMaskId = appState.selectedMaskId;
+  if (!selectedMaskId) return;
+  const selectedItem = appRoot.querySelector<HTMLElement>(
+    `[data-panel="annotations"] .annotation-list__item[data-mask-id="${CSS.escape(selectedMaskId)}"]`
+  );
+  selectedItem?.scrollIntoView({ block: "nearest" });
 }
 
 /** Wires annotation list action buttons after panel-body updates. */
 function bindAnnotationPanelHandlers(): void {
-
-  const removeButtons = appRoot.querySelectorAll<HTMLButtonElement>('button[data-action="remove-mask"]');
-  removeButtons.forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const id = btn.getAttribute("data-id");
-      if (id) {
-        removeMask(id);
-      }
-    });
+  if ((bindAnnotationPanelHandlers as { _bound?: boolean })._bound) return;
+  (bindAnnotationPanelHandlers as { _bound?: boolean })._bound = true;
+  appRoot.addEventListener("click", (event) => {
+    const target = event.target as Element | null;
+    const btn = target?.closest<HTMLButtonElement>('button[data-action="remove-mask"]');
+    if (!btn || !appRoot.contains(btn)) return;
+    const id = btn.getAttribute("data-id");
+    if (id) {
+      removeMask(id);
+    }
   });
 }
 
 /** Binds mask mode dropdown change behavior. */
 function bindMaskModePanelHandlers(): void {
-  const select = appRoot.querySelector<HTMLSelectElement>('select[data-action="set-mask-mode"]');
-  if (!select) return;
-  select.addEventListener("change", () => {
+  if ((bindMaskModePanelHandlers as { _bound?: boolean })._bound) return;
+  (bindMaskModePanelHandlers as { _bound?: boolean })._bound = true;
+  appRoot.addEventListener("change", (event) => {
+    const target = event.target as Element | null;
+    const select = target?.closest<HTMLSelectElement>('select[data-action="set-mask-mode"]');
+    if (!select || !appRoot.contains(select)) return;
     const selected = select.value as MaskMode;
     if (selected === "point" || selected === "bounding box") {
       appState.maskMode = selected;
@@ -1485,24 +1537,27 @@ function bindMaskModePanelHandlers(): void {
 
 /** Binds handlers for the floating mask context menu. */
 function bindMaskContextMenuHandlers(): void {
-  appRoot.querySelectorAll<HTMLButtonElement>('button[data-action="assign-mask-label"]').forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const labelName = btn.getAttribute("data-label");
-      const maskId = appState.maskContextMenu.maskId;
-      if (!labelName || !maskId) return;
-      assignLabelToMask(maskId, labelName);
-      closeMaskContextMenu();
-      updateAnnotationUI();
-      updateMaskContextMenuUI();
-    });
+  if ((bindMaskContextMenuHandlers as { _bound?: boolean })._bound) return;
+  (bindMaskContextMenuHandlers as { _bound?: boolean })._bound = true;
+  appRoot.addEventListener("click", (event) => {
+    const target = event.target as Element | null;
+    const btn = target?.closest<HTMLButtonElement>('button[data-action="assign-mask-label"]');
+    if (!btn || !appRoot.contains(btn)) return;
+    const labelName = btn.getAttribute("data-label");
+    const maskId = appState.maskContextMenu.maskId;
+    if (!labelName || !maskId) return;
+    assignLabelToMask(maskId, labelName);
+    closeMaskContextMenu();
+    updateAnnotationUI();
+    updateMaskContextMenuUI();
   });
-  if (!appState.maskContextMenu.open) return;
   document.addEventListener("click", (event) => {
     const target = event.target as Element | null;
+    if (!appState.maskContextMenu.open) return;
     if (target?.closest(".mask-context-menu")) return;
     closeMaskContextMenu();
     updateMaskContextMenuUI();
-  }, { once: true });
+  });
 }
 
 /** Updates active-label panel body content without full app re-render. */
@@ -1510,20 +1565,20 @@ function updateActiveLabelPanel(): void {
   const panelBody = appRoot.querySelector<HTMLElement>('[data-panel="labels"] .panel__body');
   if (!panelBody) return;
   panelBody.innerHTML = renderLabelTree(appState.activeLabels, appState.activeLabelSelectedId, false);
-  bindActiveLabelPanelHandlers();
 }
 
 /** Binds read-only label selection in the sidebar labels panel. */
 function bindActiveLabelPanelHandlers(): void {
-  const panelBody = appRoot.querySelector<HTMLElement>('[data-panel="labels"] .panel__body');
-  if (!panelBody) return;
-  panelBody.querySelectorAll<HTMLElement>(".label-tree__row").forEach((row) => {
-    row.addEventListener("click", () => {
-      const nodeId = row.dataset["nodeId"];
-      if (!nodeId) return;
-      appState.activeLabelSelectedId = nodeId;
-      updateActiveLabelPanel();
-    });
+  if ((bindActiveLabelPanelHandlers as { _bound?: boolean })._bound) return;
+  (bindActiveLabelPanelHandlers as { _bound?: boolean })._bound = true;
+  appRoot.addEventListener("click", (event) => {
+    const target = event.target as Element | null;
+    const row = target?.closest<HTMLElement>('[data-panel="labels"] .label-tree__row');
+    if (!row || !appRoot.contains(row)) return;
+    const nodeId = row.dataset["nodeId"];
+    if (!nodeId) return;
+    appState.activeLabelSelectedId = nodeId;
+    updateActiveLabelPanel();
   });
 }
 
@@ -1607,23 +1662,19 @@ function renderOpticsBody(): string {
 
 /** Wires optics slider input events after panel render. */
 function bindOpticsPanelHandlers(): void {
-  const panel = appRoot.querySelector('[data-panel="optics"]');
-  if (!panel) {
-    return;
-  }
-
-  panel.querySelectorAll<HTMLInputElement>("input[data-optics]").forEach((slider) => {
-    slider.addEventListener("input", () => {
-      const key = slider.getAttribute("data-optics") as "gamma" | "multiply" | "add";
-      const val = parseFloat(slider.value);
+  if ((bindOpticsPanelHandlers as { _bound?: boolean })._bound) return;
+  (bindOpticsPanelHandlers as { _bound?: boolean })._bound = true;
+  appRoot.addEventListener("input", (event) => {
+    const target = event.target as Element | null;
+    const opticsSlider = target?.closest<HTMLInputElement>('input[data-optics]');
+    if (opticsSlider && appRoot.contains(opticsSlider)) {
+      const key = opticsSlider.getAttribute("data-optics") as "gamma" | "multiply" | "add";
+      const val = parseFloat(opticsSlider.value);
       appState.optics[key] = val;
-
-      // Update displayed value next to slider without full re-render
-      const valSpan = slider.nextElementSibling as HTMLElement | null;
+      const valSpan = opticsSlider.nextElementSibling as HTMLElement | null;
       if (valSpan) {
         valSpan.textContent = key === "add" ? val.toFixed(0) : val.toFixed(2);
       }
-
       applyOpticsToViewer();
       const settingsKey = key === "gamma"
         ? "optics_gamma"
@@ -1631,65 +1682,62 @@ function bindOpticsPanelHandlers(): void {
           ? "optics_brightness_mul"
           : "optics_brightness_add";
       persistSettingDebouncedLater(settingsKey, String(val));
-    });
+      return;
+    }
+    const maskSlider = target?.closest<HTMLInputElement>('input[data-mask-render]');
+    if (!maskSlider || !appRoot.contains(maskSlider)) return;
+    const key = maskSlider.getAttribute("data-mask-render") as "maskStrokeOpacity" | "maskFillOpacity" | "maskStrokeWidth" | "markerSize";
+    const raw = parseFloat(maskSlider.value);
+    const val = key === "maskStrokeWidth" || key === "markerSize" ? Math.round(raw) : raw;
+    appState.optics[key] = val;
+    const valSpan = maskSlider.nextElementSibling as HTMLElement | null;
+    if (valSpan) {
+      valSpan.textContent = key === "maskStrokeWidth" || key === "markerSize" ? val.toFixed(0) : val.toFixed(2);
+    }
+    const settingsKey = key === "maskStrokeOpacity"
+      ? "mask_stroke_opacity"
+      : key === "maskFillOpacity"
+        ? "mask_fill_opacity"
+        : key === "maskStrokeWidth"
+          ? "mask_stroke_width"
+          : "mask_marker_size";
+    persistSettingDebouncedLater(settingsKey, String(val));
+    applyOpticsToViewer();
   });
-
-  panel.querySelectorAll<HTMLInputElement>("input[data-transform]").forEach((checkbox) => {
-    checkbox.addEventListener("change", () => {
-      const key = checkbox.getAttribute("data-transform") as "rotate90cw" | "flipH" | "flipV";
-      appState.optics[key] = checkbox.checked;
-      applyOpticsToViewer();
-      const settingsKey = key === "rotate90cw"
-        ? "optics_rotate90cw"
-        : key === "flipH"
-          ? "optics_flip_h"
-          : "optics_flip_v";
-      persistSettingLater(settingsKey, String(checkbox.checked));
-    });
+  appRoot.addEventListener("change", (event) => {
+    const target = event.target as Element | null;
+    const checkbox = target?.closest<HTMLInputElement>('input[data-transform]');
+    if (!checkbox || !appRoot.contains(checkbox)) return;
+    const key = checkbox.getAttribute("data-transform") as "rotate90cw" | "flipH" | "flipV";
+    appState.optics[key] = checkbox.checked;
+    applyOpticsToViewer();
+    const settingsKey = key === "rotate90cw"
+      ? "optics_rotate90cw"
+      : key === "flipH"
+        ? "optics_flip_h"
+        : "optics_flip_v";
+    persistSettingLater(settingsKey, String(checkbox.checked));
   });
-
-  panel.querySelectorAll<HTMLInputElement>("input[data-mask-render]").forEach((slider) => {
-    slider.addEventListener("input", () => {
-      const key = slider.getAttribute("data-mask-render") as "maskStrokeOpacity" | "maskFillOpacity" | "maskStrokeWidth" | "markerSize";
-      const raw = parseFloat(slider.value);
-      const val = key === "maskStrokeWidth" || key === "markerSize" ? Math.round(raw) : raw;
-      appState.optics[key] = val;
-
-      const valSpan = slider.nextElementSibling as HTMLElement | null;
-      if (valSpan) {
-        valSpan.textContent = key === "maskStrokeWidth" || key === "markerSize" ? val.toFixed(0) : val.toFixed(2);
-      }
-
-      const settingsKey = key === "maskStrokeOpacity"
-        ? "mask_stroke_opacity"
-        : key === "maskFillOpacity"
-          ? "mask_fill_opacity"
-          : key === "maskStrokeWidth"
-            ? "mask_stroke_width"
-            : "mask_marker_size";
-      persistSettingDebouncedLater(settingsKey, String(val));
-      applyOpticsToViewer();
-    });
+  appRoot.addEventListener("click", (event) => {
+    const target = event.target as Element | null;
+    const btn = target?.closest<HTMLButtonElement>('[data-action="reset-optics"]');
+    if (!btn || !appRoot.contains(btn)) return;
+    appState.optics = {
+      gamma: 1.0,
+      multiply: 1.0,
+      add: 0.0,
+      rotate90cw: false,
+      flipH: false,
+      flipV: false,
+      maskStrokeOpacity: 1.0,
+      maskFillOpacity: 0.4,
+      maskStrokeWidth: 3,
+      markerSize: 10,
+    };
+    applyOpticsToViewer();
+    persistOpticsSettingsLater();
+    updateOpticsPanelUI();
   });
-
-  panel.querySelector<HTMLButtonElement>('[data-action="reset-optics"]')
-    ?.addEventListener("click", () => {
-      appState.optics = {
-        gamma: 1.0,
-        multiply: 1.0,
-        add: 0.0,
-        rotate90cw: false,
-        flipH: false,
-        flipV: false,
-        maskStrokeOpacity: 1.0,
-        maskFillOpacity: 0.4,
-        maskStrokeWidth: 3,
-        markerSize: 10,
-      };
-      applyOpticsToViewer();
-      persistOpticsSettingsLater();
-      updateOpticsPanelUI();
-    });
 }
 
 function applyOpticsToViewer(): void {
@@ -1752,6 +1800,8 @@ class WebGLTileViewer {
   private readonly onMaskCanvasClick: (payload: MaskCanvasClick) => void;
   /** Returns true when left-button drag should be interpreted as bbox placement. */
   private readonly isBboxDragPlacementEnabled: () => boolean;
+  /** Returns true when bbox mode is active (used to suppress pan-drag). */
+  private readonly isBboxModeActive: () => boolean;
   /** Callback for bbox placement drag gestures. */
   private readonly onMaskCanvasDrag: (payload: MaskCanvasDrag) => void;
   /** Returns the currently editable bbox mask, or null when side-editing is disabled. */
@@ -1883,6 +1933,7 @@ class WebGLTileViewer {
     getMasks: () => MaskPoint[],
     onMaskCanvasClick: (payload: MaskCanvasClick) => void,
     isBboxDragPlacementEnabled: () => boolean,
+    isBboxModeActive: () => boolean,
     onMaskCanvasDrag: (payload: MaskCanvasDrag) => void,
     getEditableBboxMask: () => MaskPoint | null,
     onMaskCanvasBboxSideDrag: (payload: MaskCanvasBboxSideDrag) => void,
@@ -1892,6 +1943,7 @@ class WebGLTileViewer {
     this.getMasks = getMasks;
     this.onMaskCanvasClick = onMaskCanvasClick;
     this.isBboxDragPlacementEnabled = isBboxDragPlacementEnabled;
+    this.isBboxModeActive = isBboxModeActive;
     this.onMaskCanvasDrag = onMaskCanvasDrag;
     this.getEditableBboxMask = getEditableBboxMask;
     this.onMaskCanvasBboxSideDrag = onMaskCanvasBboxSideDrag;
@@ -3041,6 +3093,7 @@ class WebGLTileViewer {
       return;
     }
     this.canvas.focus();
+    this.dragTotalDistance = 0;
 
     if (this.isBboxDragPlacementEnabled()) {
       const mapped = this.mapClientToMaskEvent(event.clientX, event.clientY, {
@@ -3098,6 +3151,10 @@ class WebGLTileViewer {
           return;
         }
       }
+    }
+
+    if (this.isBboxModeActive()) {
+      return;
     }
 
     this.isDragging = true;
@@ -3342,6 +3399,7 @@ function mountViewer(): void {
       updateMaskContextMenuUI();
     },
     () => appState.maskMode === "bounding box" && appState.selectedMaskId === null,
+    () => appState.maskMode === "bounding box",
     (payload) => {
       if (payload.phase === "start") {
         const hadMenuOpen = appState.maskContextMenu.open;
@@ -3751,17 +3809,26 @@ function renderDirBrowserOverlay(): string {
 
 /** Binds directory browser modal handlers. */
 function bindDirBrowserHandlers(): void {
-  document.getElementById("dir-browser-close")?.addEventListener("click", closeDirBrowser);
-  document.getElementById("dir-browser-cancel")?.addEventListener("click", closeDirBrowser);
-  const overlay = document.getElementById("dir-browser-overlay");
-  overlay?.addEventListener("click", (e) => {
-    if (e.target === overlay) {
+  if ((bindDirBrowserHandlers as { _bound?: boolean })._bound) return;
+  (bindDirBrowserHandlers as { _bound?: boolean })._bound = true;
+  appRoot.addEventListener("click", (event) => {
+    const target = event.target as Element | null;
+    if (!target) return;
+    const closeBtn = target.closest("#dir-browser-close, #dir-browser-cancel");
+    if (closeBtn && appRoot.contains(closeBtn)) {
+      closeDirBrowser();
+      return;
+    }
+    const selectBtn = target.closest("#dir-browser-select");
+    if (selectBtn && appRoot.contains(selectBtn)) {
+      dirBrowserCallback?.(dirBrowserPath);
+      closeDirBrowser();
+      return;
+    }
+    const overlay = target.closest("#dir-browser-overlay");
+    if (overlay && target === overlay) {
       closeDirBrowser();
     }
-  });
-  document.getElementById("dir-browser-select")?.addEventListener("click", () => {
-    dirBrowserCallback?.(dirBrowserPath);
-    closeDirBrowser();
   });
 }
 
@@ -3814,45 +3881,48 @@ function renderMenuBar(): string {
 
 /** Wires menu bar and hamburger handlers after render. */
 function bindMenuHandlers(): void {
-  const root = appRoot!;
-
-  root.querySelector<HTMLButtonElement>('[data-action="toggle-menu"]')
-    ?.addEventListener("click", toggleMenu);
-
-  root.querySelector<HTMLButtonElement>('[data-action="open-tasks"]')
-    ?.addEventListener("click", () => {
+  if ((bindMenuHandlers as { _bound?: boolean })._bound) return;
+  (bindMenuHandlers as { _bound?: boolean })._bound = true;
+  appRoot.addEventListener("click", (event) => {
+    const target = event.target as Element | null;
+    if (!target) return;
+    const toggleMenuBtn = target.closest<HTMLButtonElement>('[data-action="toggle-menu"]');
+    if (toggleMenuBtn && appRoot.contains(toggleMenuBtn)) {
+      toggleMenu();
+      return;
+    }
+    const openTasksBtn = target.closest<HTMLButtonElement>('[data-action="open-tasks"]');
+    if (openTasksBtn && appRoot.contains(openTasksBtn)) {
       appState.menuOpen = false;
       openTasksDialog();
-    });
-
-  root.querySelector<HTMLButtonElement>('[data-action="toggle-left-sidebar"]')
-    ?.addEventListener("click", () => { toggleLeftSidebar(); });
-
-  root.querySelector<HTMLButtonElement>('[data-action="toggle-right-sidebar"]')
-    ?.addEventListener("click", () => { toggleRightSidebar(); });
-
-  // Views dropdown toggle
-  root.querySelector<HTMLButtonElement>('[data-action="toggle-menu-dropdown"]')
-    ?.addEventListener("click", (e) => {
-      e.stopPropagation();
-      (e.currentTarget as HTMLElement).closest<HTMLElement>(".menu-bar__item")
-        ?.classList.toggle("menu-bar__item--active");
-    });
-
-  root.querySelectorAll<HTMLButtonElement>('[data-action="set-theme"]').forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const theme = btn.getAttribute("data-theme") === "dark" ? "dark" : "light";
+      return;
+    }
+    if (target.closest('[data-action="toggle-left-sidebar"]')) {
+      toggleLeftSidebar();
+      return;
+    }
+    if (target.closest('[data-action="toggle-right-sidebar"]')) {
+      toggleRightSidebar();
+      return;
+    }
+    const menuDropBtn = target.closest<HTMLButtonElement>('[data-action="toggle-menu-dropdown"]');
+    if (menuDropBtn) {
+      event.stopPropagation();
+      menuDropBtn.closest<HTMLElement>(".menu-bar__item")?.classList.toggle("menu-bar__item--active");
+      return;
+    }
+    const themeBtn = target.closest<HTMLButtonElement>('[data-action="set-theme"]');
+    if (themeBtn) {
+      const theme = themeBtn.getAttribute("data-theme") === "dark" ? "dark" : "light";
       applyTheme(theme);
       persistSettingLater("theme", theme);
-      root.querySelectorAll<HTMLButtonElement>('[data-action="set-theme"]').forEach((b) =>
+      appRoot.querySelectorAll<HTMLButtonElement>('[data-action="set-theme"]').forEach((b) =>
         b.setAttribute("aria-checked", String(b.getAttribute("data-theme") === theme))
       );
-      btn.closest<HTMLElement>(".menu-bar__item")?.classList.remove("menu-bar__item--active");
-    });
+      themeBtn.closest<HTMLElement>(".menu-bar__item")?.classList.remove("menu-bar__item--active");
+    }
   });
-
-  // Close dropdowns on outside click
-  document.addEventListener("click", closeMenuDropdowns, { once: true });
+  document.addEventListener("click", closeMenuDropdowns);
 }
 
 /** Closes all open menu dropdowns. */
@@ -4120,6 +4190,8 @@ function bindLabelTree(treeEl: HTMLElement, task: Task): void {
   };
 
   treeEl.querySelectorAll<HTMLElement>(".label-tree__row").forEach((row) => {
+    if (row.dataset["boundLabelRow"] === "1") return;
+    row.dataset["boundLabelRow"] = "1";
     row.addEventListener("click", () => selectNode(row.dataset["nodeId"]!));
     row.addEventListener("focus", () => selectNode(row.dataset["nodeId"]!));
     if (!editable) return;
@@ -4142,6 +4214,8 @@ function bindLabelTree(treeEl: HTMLElement, task: Task): void {
   });
 
   treeEl.querySelectorAll<HTMLButtonElement>("[data-action='remove-label']").forEach((btn) => {
+    if (btn.dataset["boundRemoveLabel"] === "1") return;
+    btn.dataset["boundRemoveLabel"] = "1";
     btn.addEventListener("click", (e) => {
       e.stopPropagation();
       const removedId = btn.dataset["nodeId"]!;
@@ -4154,6 +4228,8 @@ function bindLabelTree(treeEl: HTMLElement, task: Task): void {
 
   const addInput = treeEl.querySelector<HTMLInputElement>(".label-tree__new");
   if (addInput) {
+    if (addInput.dataset["boundLabelNew"] === "1") return;
+    addInput.dataset["boundLabelNew"] = "1";
     addInput.addEventListener("keydown", (e) => {
       if ((e as KeyboardEvent).key !== "Enter") return;
       e.preventDefault();
@@ -4306,190 +4382,100 @@ function renderTasksDialog(): string {
 
 /** Wires all Tasks dialog handlers after render. */
 function bindTasksDialogHandlers(): void {
-  if (!appState.tasksDialogOpen) return;
-  const root = appRoot!;
+  if ((bindTasksDialogHandlers as { _bound?: boolean })._bound) return;
+  (bindTasksDialogHandlers as { _bound?: boolean })._bound = true;
+  const getTask = (taskId: string | null): Task | null =>
+    taskId ? (appState.tasks.find((t) => t.id === taskId) ?? null) : null;
+  const commitTaskField = (input: HTMLInputElement | HTMLTextAreaElement): void => {
+    const id = input.getAttribute("data-task-id");
+    const field = input.getAttribute("data-field") as keyof Pick<Task, "description" | "images" | "annotations" | "comment"> | null;
+    const task = getTask(id);
+    if (!task || !field) return;
+    task[field] = input.value;
+    input.classList.remove("task-field--dirty");
+    input.classList.add("task-field--saved");
+    setTimeout(() => input.classList.remove("task-field--saved"), 1000);
+    if (field === "description") {
+      const card = appRoot.querySelector<HTMLElement>(`.task-card[data-task-id="${id}"]`);
+      if (card) updateTaskSummaryDesc(card, task);
+    }
+    void runTaskSave(
+      () => persistTaskScalars(task),
+      "Failed to save task field.",
+      "tasks: save field failed"
+    );
+  };
 
-  // Close on backdrop click
-  root.querySelector<HTMLElement>('[data-action="close-tasks-backdrop"]')
-    ?.addEventListener("click", (e) => {
-      if ((e.target as HTMLElement).classList.contains("tasks-backdrop")) closeTasksDialog();
-    });
-  root.querySelector<HTMLButtonElement>('[data-action="close-tasks"]')
-    ?.addEventListener("click", closeTasksDialog);
-
-  // Accordion toggle
-  root.querySelectorAll<HTMLElement>('[data-action="toggle-task"]').forEach((el) => {
-    el.addEventListener("click", () => {
-      const id = el.getAttribute("data-task-id")!;
-      const task = appState.tasks.find((t) => t.id === id);
+  appRoot.addEventListener("click", (event) => {
+    const target = event.target as Element | null;
+    if (!target) return;
+    if (target.closest('[data-action="close-tasks"]')) {
+      closeTasksDialog();
+      return;
+    }
+    const backdrop = target.closest<HTMLElement>('[data-action="close-tasks-backdrop"]');
+    if (backdrop && target === backdrop) {
+      closeTasksDialog();
+      return;
+    }
+    const toggleTaskBtn = target.closest<HTMLElement>('[data-action="toggle-task"]');
+    if (toggleTaskBtn) {
+      const task = getTask(toggleTaskBtn.getAttribute("data-task-id"));
       if (!task) return;
-      if (task.collapsed) {
-        setExpandedTask(task);
-      } else {
-        task.collapsed = true;
-      }
+      if (task.collapsed) setExpandedTask(task);
+      else task.collapsed = true;
       render();
-    });
-  });
-
-  // Task reorder
-  root.querySelectorAll<HTMLButtonElement>('[data-action="move-task-up"]').forEach((btn) => {
-    btn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      void moveTaskBy(btn.getAttribute("data-task-id")!, -1);
-    });
-  });
-  root.querySelectorAll<HTMLButtonElement>('[data-action="move-task-down"]').forEach((btn) => {
-    btn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      void moveTaskBy(btn.getAttribute("data-task-id")!, 1);
-    });
-  });
-
-  // Status dropdown
-  root.querySelectorAll<HTMLSelectElement>('[data-action="set-status"]').forEach((sel) => {
-    sel.addEventListener("change", () => {
-      const id = sel.getAttribute("data-task-id")!;
-      const task = appState.tasks.find((t) => t.id === id);
-      if (!task) return;
-      task.status = sel.value as Task["status"];
-      const card = root.querySelector<HTMLElement>(`.task-card[data-task-id="${id}"]`);
-      card?.querySelectorAll<HTMLElement>(".task-status-dot").forEach((dot) => {
-        dot.style.background = taskStatusColor(task.status);
-      });
-      void runTaskSave(
-        () => persistTaskScalars(task),
-        "Failed to save task status.",
-        "tasks: save status failed"
-      );
-    });
-  });
-
-  // Tag add on Enter
-  root.querySelectorAll<HTMLInputElement>('[data-action="add-tag"]').forEach((input) => {
-    input.addEventListener("keydown", (e) => {
-      if ((e as KeyboardEvent).key !== "Enter") return;
-      const val = input.value.trim();
-      if (!val) return;
-      const id = input.getAttribute("data-task-id")!;
-      const task = appState.tasks.find((t) => t.id === id);
-      if (!task) return;
-      task.tags.push(val);
-      input.value = "";
-      const card = root.querySelector<HTMLElement>(`.task-card[data-task-id="${id}"]`);
-      if (card) {
-        const wrap = card.querySelector<HTMLElement>(".task-tags-wrap");
-        if (wrap) wrap.outerHTML = buildTagsWrapHtml(task);
-        rebindTagsWrap(card, task);
-        updateTaskSummaryTags(card, task);
-      }
-      void runTaskSave(
-        () => persistTaskTags(task),
-        "Failed to save task tags.",
-        "tasks: save tags failed"
-      );
-    });
-  });
-
-  // Tag remove
-  root.querySelectorAll<HTMLButtonElement>('[data-action="remove-tag"]').forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const id = btn.getAttribute("data-task-id")!;
-      const tag = btn.getAttribute("data-tag")!;
-      const task = appState.tasks.find((t) => t.id === id);
-      if (!task) return;
+      return;
+    }
+    const moveUp = target.closest<HTMLButtonElement>('[data-action="move-task-up"]');
+    if (moveUp) {
+      event.stopPropagation();
+      void moveTaskBy(moveUp.getAttribute("data-task-id")!, -1);
+      return;
+    }
+    const moveDown = target.closest<HTMLButtonElement>('[data-action="move-task-down"]');
+    if (moveDown) {
+      event.stopPropagation();
+      void moveTaskBy(moveDown.getAttribute("data-task-id")!, 1);
+      return;
+    }
+    const removeTagBtn = target.closest<HTMLButtonElement>('[data-action="remove-tag"]');
+    if (removeTagBtn) {
+      const id = removeTagBtn.getAttribute("data-task-id");
+      const tag = removeTagBtn.getAttribute("data-tag");
+      const task = getTask(id);
+      if (!task || !tag) return;
       task.tags = task.tags.filter((t) => t !== tag);
-      btn.closest(".task-pin")?.remove();
-      const card = root.querySelector<HTMLElement>(`.task-card[data-task-id="${id}"]`);
+      removeTagBtn.closest(".task-pin")?.remove();
+      const card = appRoot.querySelector<HTMLElement>(`.task-card[data-task-id="${id}"]`);
       if (card) updateTaskSummaryTags(card, task);
-      void runTaskSave(
-        () => persistTaskTags(task),
-        "Failed to save task tags.",
-        "tasks: save tags failed"
-      );
-    });
-  });
-
-  // Text field dirty/saved feedback
-  root.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(".task-field-input[data-field]").forEach((input) => {
-    if ((input as HTMLInputElement).readOnly) return;
-    input.addEventListener("input", () => {
-      input.classList.add("task-field--dirty");
-      input.classList.remove("task-field--saved");
-    });
-    const commit = (): void => {
-      const id = input.getAttribute("data-task-id")!;
-      const field = input.getAttribute("data-field") as keyof Pick<Task, "description" | "images" | "annotations" | "comment">;
-      const task = appState.tasks.find((t) => t.id === id);
-      if (task) task[field] = input.value;
-      input.classList.remove("task-field--dirty");
-      input.classList.add("task-field--saved");
-      setTimeout(() => input.classList.remove("task-field--saved"), 1000);
-      if (field === "description") {
-        const card = root.querySelector<HTMLElement>(`.task-card[data-task-id="${id}"]`);
-        if (card && task) updateTaskSummaryDesc(card, task);
-      }
-      if (task) {
-        void runTaskSave(
-          () => persistTaskScalars(task),
-          "Failed to save task field.",
-          "tasks: save field failed"
-        );
-      }
-    };
-    input.addEventListener("blur", commit);
-    input.addEventListener("keydown", (e) => {
-      if ((e as KeyboardEvent).key === "Enter" && (input as HTMLElement).tagName !== "TEXTAREA") commit();
-    });
-  });
-
-  // Checkmark
-  root.querySelectorAll<HTMLInputElement>('[data-action="set-checkmark"]').forEach((chk) => {
-    chk.addEventListener("change", () => {
-      const id = chk.getAttribute("data-task-id")!;
-      const task = appState.tasks.find((t) => t.id === id);
-      if (!task) return;
-      task.checkmark = chk.checked;
-      void runTaskSave(
-        () => persistTaskScalars(task),
-        "Failed to save task checkmark.",
-        "tasks: save checkmark failed"
-      );
-    });
-  });
-
-  // Delete task
-  root.querySelectorAll<HTMLButtonElement>('[data-action="delete-task"]').forEach((btn) => {
-    btn.addEventListener("click", () => {
-      void removeTask(btn.getAttribute("data-task-id")!);
-    });
-  });
-
-  // Add task
-  root.querySelector<HTMLButtonElement>('[data-action="add-task"]')
-    ?.addEventListener("click", () => {
+      void runTaskSave(() => persistTaskTags(task), "Failed to save task tags.", "tasks: save tags failed");
+      return;
+    }
+    const deleteTaskBtn = target.closest<HTMLButtonElement>('[data-action="delete-task"]');
+    if (deleteTaskBtn) {
+      void removeTask(deleteTaskBtn.getAttribute("data-task-id")!);
+      return;
+    }
+    if (target.closest('[data-action="add-task"]')) {
       void addTask();
-    });
-
-  // Browse directory buttons for images/annotations path fields.
-  root.querySelectorAll<HTMLButtonElement>(".task-browse-btn").forEach((btn) => {
-    const input = btn.closest(".task-path-row")?.querySelector<HTMLInputElement>(".task-field-input");
-    if (!input) return;
-    btn.addEventListener("click", () => {
+      return;
+    }
+    const browseBtn = target.closest<HTMLButtonElement>(".task-browse-btn");
+    if (browseBtn) {
+      const input = browseBtn.closest(".task-path-row")?.querySelector<HTMLInputElement>(".task-field-input");
+      if (!input) return;
       openDirBrowser(input.value || "/", (path) => {
         input.value = path;
-        input.dispatchEvent(new Event("blur"));
+        commitTaskField(input);
       });
-    });
-  });
-
-  // Continue work
-  root.querySelectorAll<HTMLButtonElement>('[data-action="continue-task"]').forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const id = btn.getAttribute("data-task-id")!;
-      const task = appState.tasks.find((t) => t.id === id);
+      return;
+    }
+    const continueBtn = target.closest<HTMLButtonElement>('[data-action="continue-task"]');
+    if (continueBtn) {
+      const id = continueBtn.getAttribute("data-task-id");
+      const task = getTask(id);
       if (!task) return;
-
       if (task.status !== "doing") {
         task.status = "doing";
         void runTaskSave(
@@ -4498,9 +4484,7 @@ function bindTasksDialogHandlers(): void {
           "tasks: continue-work status save failed"
         );
       }
-
       logEvent("set_active_task", { task_id: id });
-
       appState.activeLabels = task.labels;
       appState.activeLabelSelectedId = firstLeafLabelId(task.labels);
       appState.recentLabels = [];
@@ -4515,17 +4499,114 @@ function bindTasksDialogHandlers(): void {
       appState.currentImageHash = null;
       appState.masks = [];
       closeMaskContextMenu();
-
       appState.tasksDialogOpen = false;
       render();
-    });
+      return;
+    }
+    const labelRow = target.closest<HTMLElement>(".label-tree[data-task-id] .label-tree__row");
+    if (labelRow) {
+      const tree = labelRow.closest<HTMLElement>(".label-tree[data-task-id]");
+      const task = getTask(tree?.dataset["taskId"] ?? null);
+      const nodeId = labelRow.dataset["nodeId"];
+      if (!task || !nodeId) return;
+      task.selectedLabelId = nodeId;
+      tree?.querySelectorAll(".label-tree__row").forEach((row) => {
+        row.classList.toggle("is-selected", (row as HTMLElement).dataset["nodeId"] === nodeId);
+      });
+      return;
+    }
+    const removeLabelBtn = target.closest<HTMLButtonElement>(".label-tree [data-action='remove-label']");
+    if (removeLabelBtn) {
+      event.stopPropagation();
+      const tree = removeLabelBtn.closest<HTMLElement>(".label-tree[data-task-id]");
+      const task = getTask(tree?.dataset["taskId"] ?? null);
+      const removedId = removeLabelBtn.dataset["nodeId"];
+      if (!task || !tree || !removedId) return;
+      removeLabelNode(removedId, task.labels);
+      if (task.selectedLabelId === removedId) task.selectedLabelId = null;
+      refreshLabelTree(tree, task);
+      void runTaskSave(() => persistTaskLabels(task), "Failed to save labels.", "tasks: save labels failed");
+    }
   });
 
-  // Label trees
-  root.querySelectorAll<HTMLElement>(".label-tree[data-task-id]").forEach((treeEl) => {
-    const taskId = treeEl.dataset["taskId"]!;
-    const task = appState.tasks.find((t) => t.id === taskId);
-    if (task) bindLabelTree(treeEl, task);
+  appRoot.addEventListener("change", (event) => {
+    const target = event.target as Element | null;
+    const statusSel = target?.closest<HTMLSelectElement>('[data-action="set-status"]');
+    if (statusSel) {
+      const task = getTask(statusSel.getAttribute("data-task-id"));
+      if (!task) return;
+      task.status = statusSel.value as Task["status"];
+      const card = appRoot.querySelector<HTMLElement>(`.task-card[data-task-id="${task.id}"]`);
+      card?.querySelectorAll<HTMLElement>(".task-status-dot").forEach((dot) => {
+        dot.style.background = taskStatusColor(task.status);
+      });
+      void runTaskSave(() => persistTaskScalars(task), "Failed to save task status.", "tasks: save status failed");
+      return;
+    }
+    const chk = target?.closest<HTMLInputElement>('[data-action="set-checkmark"]');
+    if (!chk) return;
+    const task = getTask(chk.getAttribute("data-task-id"));
+    if (!task) return;
+    task.checkmark = chk.checked;
+    void runTaskSave(() => persistTaskScalars(task), "Failed to save task checkmark.", "tasks: save checkmark failed");
+  });
+
+  appRoot.addEventListener("input", (event) => {
+    const target = event.target as Element | null;
+    const input = target?.closest<HTMLInputElement | HTMLTextAreaElement>(".task-field-input[data-field]");
+    if (!input || (input as HTMLInputElement).readOnly) return;
+    input.classList.add("task-field--dirty");
+    input.classList.remove("task-field--saved");
+  });
+
+  appRoot.addEventListener("focusout", (event) => {
+    const target = event.target as Element | null;
+    const input = target?.closest<HTMLInputElement | HTMLTextAreaElement>(".task-field-input[data-field]");
+    if (!input || (input as HTMLInputElement).readOnly) return;
+    commitTaskField(input);
+  });
+
+  appRoot.addEventListener("keydown", (event) => {
+    const target = event.target as Element | null;
+    if (!target) return;
+    const addTagInput = target.closest<HTMLInputElement>('[data-action="add-tag"]');
+    if (addTagInput && event.key === "Enter") {
+      event.preventDefault();
+      const val = addTagInput.value.trim();
+      if (!val) return;
+      const task = getTask(addTagInput.getAttribute("data-task-id"));
+      if (!task) return;
+      task.tags.push(val);
+      addTagInput.value = "";
+      const card = appRoot.querySelector<HTMLElement>(`.task-card[data-task-id="${task.id}"]`);
+      if (card) {
+        const wrap = card.querySelector<HTMLElement>(".task-tags-wrap");
+        if (wrap) wrap.outerHTML = buildTagsWrapHtml(task);
+        updateTaskSummaryTags(card, task);
+      }
+      void runTaskSave(() => persistTaskTags(task), "Failed to save task tags.", "tasks: save tags failed");
+      return;
+    }
+    const fieldInput = target.closest<HTMLInputElement | HTMLTextAreaElement>(".task-field-input[data-field]");
+    if (fieldInput && event.key === "Enter" && fieldInput.tagName !== "TEXTAREA") {
+      event.preventDefault();
+      commitTaskField(fieldInput);
+      return;
+    }
+    const newLabelInput = target.closest<HTMLInputElement>(".label-tree[data-task-id] .label-tree__new");
+    if (newLabelInput && event.key === "Enter") {
+      event.preventDefault();
+      const val = newLabelInput.value.trim();
+      if (!val) return;
+      const tree = newLabelInput.closest<HTMLElement>(".label-tree[data-task-id]");
+      const task = getTask(tree?.dataset["taskId"] ?? null);
+      if (!task || !tree) return;
+      const newId = labelNodeId();
+      task.labels.push({ id: newId, text: val, children: [] });
+      task.selectedLabelId = newId;
+      refreshLabelTree(tree, task, newId);
+      void runTaskSave(() => persistTaskLabels(task), "Failed to save labels.", "tasks: save labels failed");
+    }
   });
 }
 
@@ -4548,6 +4629,8 @@ function buildTagsWrapHtml(task: Task): string {
 /** Re-binds tag handlers inside a card after incremental tag-wrap update. */
 function rebindTagsWrap(card: HTMLElement, task: Task): void {
   card.querySelectorAll<HTMLButtonElement>('[data-action="remove-tag"]').forEach((btn) => {
+    if (btn.dataset["boundRemoveTag"] === "1") return;
+    btn.dataset["boundRemoveTag"] = "1";
     btn.addEventListener("click", () => {
       const tag = btn.getAttribute("data-tag")!;
       task.tags = task.tags.filter((t) => t !== tag);
@@ -4560,24 +4643,27 @@ function rebindTagsWrap(card: HTMLElement, task: Task): void {
       );
     });
   });
-  card.querySelector<HTMLInputElement>('[data-action="add-tag"]')
-    ?.addEventListener("keydown", (e) => {
-      if (e.key !== "Enter") return;
-      const input = e.currentTarget as HTMLInputElement;
-      const val = input.value.trim();
-      if (!val) return;
-      task.tags.push(val);
-      input.value = "";
-      const wrap = card.querySelector<HTMLElement>(".task-tags-wrap");
-      if (wrap) wrap.outerHTML = buildTagsWrapHtml(task);
-      rebindTagsWrap(card, task);
-      updateTaskSummaryTags(card, task);
-      void runTaskSave(
-        () => persistTaskTags(task),
-        "Failed to save task tags.",
-        "tasks: save tags failed"
-      );
-    });
+  const addInput = card.querySelector<HTMLInputElement>('[data-action="add-tag"]');
+  if (!addInput) return;
+  if (addInput.dataset["boundAddTag"] === "1") return;
+  addInput.dataset["boundAddTag"] = "1";
+  addInput.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter") return;
+    const input = e.currentTarget as HTMLInputElement;
+    const val = input.value.trim();
+    if (!val) return;
+    task.tags.push(val);
+    input.value = "";
+    const wrap = card.querySelector<HTMLElement>(".task-tags-wrap");
+    if (wrap) wrap.outerHTML = buildTagsWrapHtml(task);
+    rebindTagsWrap(card, task);
+    updateTaskSummaryTags(card, task);
+    void runTaskSave(
+      () => persistTaskTags(task),
+      "Failed to save task tags.",
+      "tasks: save tags failed"
+    );
+  });
 }
 
 /** Updates the tags preview in the collapsed summary row. */
@@ -4634,7 +4720,7 @@ function restoreFocusFromSnapshot(snapshot: FocusSnapshot | null): void {
   target.focus();
 }
 
-/** Renders the prototype UI and rebinds event handlers. */
+/** Renders the prototype UI. */
 function render(): void {
   const focusSnapshot = captureFocusSnapshot();
   appRoot.innerHTML = `
@@ -4691,23 +4777,6 @@ function render(): void {
     ${renderDirBrowserOverlay()}
   `;
 
-  const previousBtn = appRoot.querySelector<HTMLButtonElement>('button[data-action="previous"]');
-  const nextBtn = appRoot.querySelector<HTMLButtonElement>('button[data-action="next"]');
-  const toggleLeftBtn = appRoot.querySelector<HTMLButtonElement>('button[data-action="toggle-left"]');
-  const toggleRightBtn = appRoot.querySelector<HTMLButtonElement>('button[data-action="toggle-right"]');
-  previousBtn?.addEventListener("click", goPreviousImage);
-  nextBtn?.addEventListener("click", goNextImage);
-  toggleLeftBtn?.addEventListener("click", toggleLeftSidebar);
-  toggleRightBtn?.addEventListener("click", toggleRightSidebar);
-
-  bindAnnotationPanelHandlers();
-  bindOpticsPanelHandlers();
-  bindMenuHandlers();
-  bindActiveLabelPanelHandlers();
-  bindMaskModePanelHandlers();
-  bindMaskContextMenuHandlers();
-  bindTasksDialogHandlers();
-  bindDirBrowserHandlers();
   bindRightSidebarResizeHandle();
   mountViewer();
   restoreFocusFromSnapshot(focusSnapshot);
@@ -4715,5 +4784,14 @@ function render(): void {
 
 void (async () => {
   await loadSettingsOnStartup();
+  bindAnnotationPanelHandlers();
+  bindOpticsPanelHandlers();
+  bindMenuHandlers();
+  bindGlobalNavHandlers();
+  bindActiveLabelPanelHandlers();
+  bindMaskModePanelHandlers();
+  bindMaskContextMenuHandlers();
+  bindTasksDialogHandlers();
+  bindDirBrowserHandlers();
   render();
 })();

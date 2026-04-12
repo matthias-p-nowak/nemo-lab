@@ -386,6 +386,17 @@ Certain UI preferences are persisted per user in the backend and restored on nex
 - Each setting is written via `PUT /api/settings` immediately when it changes in the UI.
 - `theme` is no longer sourced from `nemo.toml`; the server-side default is `light` when no setting exists.
 
+### DOM Update Strategy
+
+Targeted `updateXxxUI()` functions replace `render()` for all state changes that do not require a full UI rebuild. Each function rewrites only the affected panel/element's `innerHTML`.
+
+Event handlers are bound once via **event delegation** on `appRoot` at startup. Each handler uses `e.target.closest('[data-action="..."]')` to identify the source. Handlers survive `innerHTML` replacements inside panels — no rebinding after panel updates.
+
+Migration:
+1. Convert existing `bindXxxHandlers()` calls to delegation on `appRoot` (bind once at startup).
+2. Remove rebind calls from all `updateXxxUI()` functions.
+3. Replace remaining `render()` call sites with targeted `updateXxxUI()` functions.
+
 ### Focus Preservation in render()
 
 The `render()` function rebuilds the HTML tree, which causes the browser to lose the currently focused element. To prevent this:
