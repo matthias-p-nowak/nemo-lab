@@ -869,7 +869,7 @@ function goPreviousImage(): void {
     logEvent("image_change", { filename: current.filename, hash: current.hash });
   }
   sendPrefetch(appState.imageList, appState.currentImageIndex);
-  render();
+  updateImageStateUI();
 }
 
 /** Moves to next image and resets mask state for the new image. */
@@ -892,7 +892,7 @@ function goNextImage(): void {
     logEvent("image_change", { filename: current.filename, hash: current.hash });
   }
   sendPrefetch(appState.imageList, appState.currentImageIndex);
-  render();
+  updateImageStateUI();
 }
 
 ws.addEventListener("message", (event) => {
@@ -922,7 +922,7 @@ ws.addEventListener("message", (event) => {
     appState.masks = [];
     appState.selectedMaskId = null;
     appState.maskContextMenu.open = false;
-    render();
+    updateImageStateUI();
     if (images.length > 0) {
       sendPrefetch(images, 0);
     }
@@ -1495,6 +1495,16 @@ function updateMaskSelectionUI(): void {
     `[data-panel="annotations"] .annotation-list__item[data-mask-id="${CSS.escape(selectedMaskId)}"]`
   );
   selectedItem?.scrollIntoView({ block: "nearest" });
+}
+
+/** Updates image-reset UI state without remounting the viewer. */
+function updateImageStateUI(): void {
+  updateAnnotationUI();
+  updateMaskSelectionUI();
+  const canvas = appRoot.querySelector<HTMLCanvasElement>(".image-view__canvas");
+  const waitingForImageReady = appState.currentImageHash === null;
+  canvas?.classList.toggle("image-view__canvas--zoom-loading", waitingForImageReady);
+  viewer?.draw();
 }
 
 /** Wires annotation list action buttons after panel-body updates. */
