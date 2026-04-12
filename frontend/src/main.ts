@@ -2,6 +2,8 @@
 const config = {
   /** Maximum pointer travel (CSS px) between down and up to count as a click/annotation. */
   clickMaxDragPx: 10,
+  /** Maximum pointer-to-edge distance (CSS px) for bbox side-edit hit-testing. */
+  bboxSideHitPx: 10,
 };
 
 /** Applies a theme by setting data-theme on <html>. */
@@ -186,14 +188,28 @@ const appState = {
   currentImageHash: null as string | null,
   annotationImageWidth: 1,
   annotationImageHeight: 1,
+  /** Active task images root path used for full image-path logging. */
+  activeTaskImagesPath: "" as string,
+  /** Active task annotations root path used for source/destination logging. */
+  activeTaskAnnotationsPath: "" as string,
+  /** Active task annotation mode; true when using single-file nemolab.json. */
+  activeTaskSingleFile: false,
+  /** Hash awaiting ordered activation logging once annotations payload arrives. */
+  pendingActivationLogHash: null as string | null,
   leftCollapsed: false,
   rightCollapsed: false,
   rightSidebarWidth: 320,
   masks: [] as MaskPoint[],
+  /** Live bbox preview mask shown only while dragging in bbox mode. */
+  draftBboxMask: null as MaskPoint | null,
   /** Currently selected mask id, or null when no mask is selected. */
   selectedMaskId: null as string | null,
   /** Recently assigned labels, most recent first. */
   recentLabels: [] as string[],
+  /** Active mask placement mode selected in the right sidebar. */
+  maskMode: "point" as MaskMode,
+  /** Inline mask-mode status/error message rendered in selector panel. */
+  maskModeError: null as string | null,
   /** Context menu state for right-click label assignment on masks. */
   maskContextMenu: {
     open: false,
@@ -458,19 +474,29 @@ interface BackendMe {
   is_admin: boolean;
 }
 
-/** Minimal point-mask model for the current image. */
+/** Minimal point/bbox mask model for the current image. */
 interface MaskPoint {
   /** Stable mask identifier. */
   id: string;
   /** Sequential mask index within the current image. */
   index: number;
+  /** Geometry kind represented by this mask. */
+  kind: "point" | "bbox";
   /** X coordinate in normalized image space (0..1). */
   x: number;
   /** Y coordinate in normalized image space (0..1). */
   y: number;
+  /** Bbox width in normalized image space (0..1), for kind=bbox. */
+  w?: number;
+  /** Bbox height in normalized image space (0..1), for kind=bbox. */
+  h?: number;
   /** Optional assigned label name. */
   labelName: string | null;
 }
+
+/** Supported mask placement modes shown in the sidebar selector. */
+type MaskMode = "point" | "bounding box" | "freehand";
+type BboxEdge = "x0" | "x1" | "y0" | "y1";
 
 /** Tile manifest produced by the tiling script. */
 interface TileManifest {
@@ -546,6 +572,36 @@ interface MaskCanvasClick {
   clientY: number;
 }
 
+/** Canvas drag payload used for bbox placement gestures. */
+interface MaskCanvasDrag {
+  /** Drag lifecycle phase. */
+  phase: "start" | "move" | "end";
+  /** Canvas-local X coordinate in CSS pixels. */
+  canvasX: number;
+  /** Canvas-local Y coordinate in CSS pixels. */
+  canvasY: number;
+  /** Source image-normalized X coordinate. */
+  imageX: number;
+  /** Source image-normalized Y coordinate. */
+  imageY: number;
+  /** Accumulated pointer travel in CSS pixels since pointerdown. */
+  dragDistance: number;
+}
+
+/** Canvas drag payload used for bbox-side editing gestures. */
+interface MaskCanvasBboxSideDrag {
+  /** Drag lifecycle phase. */
+  phase: "start" | "move" | "end";
+  /** Target bbox mask id. */
+  maskId: string;
+  /** Target source-space edge being moved. */
+  edge: BboxEdge;
+  /** Source image-normalized X coordinate. */
+  imageX: number;
+  /** Source image-normalized Y coordinate. */
+  imageY: number;
+}
+
 /** Main app container. */
 // Non-null assertion is safe: the throw below ensures the app never proceeds without #app.
 // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
@@ -588,24 +644,141 @@ interface WsAnnotationRow {
   category_id?: number;
   keypoints?: number[];
   num_keypoints?: number;
+  bbox?: number[];
+  segmentation?: unknown;
 }
 
 interface WsAnnotationFile {
   images?: WsAnnotationImage[];
   annotations?: WsAnnotationRow[];
   categories?: WsAnnotationCategory[];
+  nemolab_labels?: unknown;
+  nemolab_comments?: unknown;
+  nemolab_authors?: unknown;
 }
 
 /** Converts arbitrary WS payload to a typed annotation file with array defaults. */
-function normalizeWsAnnotationFile(raw: unknown): Required<WsAnnotationFile> {
+function normalizeWsAnnotationFile(raw: unknown): Required<WsAnnotationFile> & { hasNemolabSidecars: boolean } {
   if (!raw || typeof raw !== "object") {
-    return { images: [], annotations: [], categories: [] };
+    return {
+      images: [],
+      annotations: [],
+      categories: [],
+      nemolab_labels: undefined,
+      nemolab_comments: undefined,
+      nemolab_authors: undefined,
+      hasNemolabSidecars: false,
+    };
   }
   const src = raw as Record<string, unknown>;
   const images = Array.isArray(src["images"]) ? src["images"] as WsAnnotationImage[] : [];
   const annotations = Array.isArray(src["annotations"]) ? src["annotations"] as WsAnnotationRow[] : [];
   const categories = Array.isArray(src["categories"]) ? src["categories"] as WsAnnotationCategory[] : [];
-  return { images, annotations, categories };
+  const hasNemolabSidecars =
+    src["nemolab_labels"] !== undefined ||
+    src["nemolab_comments"] !== undefined ||
+    src["nemolab_authors"] !== undefined;
+  return {
+    images,
+    annotations,
+    categories,
+    nemolab_labels: src["nemolab_labels"],
+    nemolab_comments: src["nemolab_comments"],
+    nemolab_authors: src["nemolab_authors"],
+    hasNemolabSidecars,
+  };
+}
+
+/** Joins two server-style paths while preserving slash direction from base where possible. */
+function joinServerPath(base: string, child: string): string {
+  if (!base) return child;
+  if (!child) return base;
+  if (child.startsWith("/") || /^[A-Za-z]:[\\/]/.test(child)) return child;
+  const sep = base.includes("\\") && !base.includes("/") ? "\\" : "/";
+  const trimmedBase = base.replace(/[\\/]+$/, "");
+  const trimmedChild = child.replace(/^[\\/]+/, "");
+  return `${trimmedBase}${sep}${trimmedChild}`;
+}
+
+/** Returns filename stem without extension. */
+function fileStem(path: string): string {
+  const parts = path.split(/[\\/]/);
+  const name = parts[parts.length - 1] ?? path;
+  const dot = name.lastIndexOf(".");
+  return dot > 0 ? name.slice(0, dot) : name;
+}
+
+/** Builds full image path from active task images root and image-list filename. */
+function getActiveImageFullPath(): string | null {
+  const current = getCurrentImageEntry();
+  if (!current) return null;
+  if (!appState.activeTaskImagesPath) return current.filename;
+  return joinServerPath(appState.activeTaskImagesPath, current.filename);
+}
+
+/** Computes the active annotation source/destination file path for current image. */
+function getActiveAnnotationFilePath(): string | null {
+  const current = getCurrentImageEntry();
+  const root = appState.activeTaskAnnotationsPath;
+  if (!current || !root) return null;
+  if (appState.activeTaskSingleFile) {
+    return joinServerPath(root, "nemolab.json");
+  }
+  return joinServerPath(root, `${fileStem(current.filename)}.json`);
+}
+
+/** Summarizes annotation primitive counts in one compact string. */
+function summarizeAnnotationTypes(rows: WsAnnotationRow[]): string {
+  let pointCount = 0;
+  let bboxCount = 0;
+  let maskCount = 0;
+  rows.forEach((ann) => {
+    const keypoints = Array.isArray(ann.keypoints) ? ann.keypoints : [];
+    if ((typeof ann.num_keypoints === "number" && ann.num_keypoints > 0) || keypoints.length >= 2) {
+      pointCount += 1;
+    }
+    if (Array.isArray(ann.bbox) && ann.bbox.length >= 4) {
+      bboxCount += 1;
+    }
+    if (ann.segmentation !== undefined && ann.segmentation !== null) {
+      maskCount += 1;
+    }
+  });
+  const parts: string[] = [];
+  if (pointCount > 0) parts.push(`${pointCount} point`);
+  if (bboxCount > 0) parts.push(`${bboxCount} bbox`);
+  if (maskCount > 0) parts.push(`${maskCount} mask`);
+  return parts.length > 0 ? parts.join(", ") : "0 annotations";
+}
+
+/** Emits image-switch annotation logs in required order for newly activated image hash. */
+function emitImageActivationLogsIfPending(
+  hash: string,
+  payload: Required<WsAnnotationFile> & { hasNemolabSidecars: boolean }
+): void {
+  if (appState.pendingActivationLogHash !== hash) return;
+  const imageFullPath = getActiveImageFullPath();
+  const annotationFilePath = getActiveAnnotationFilePath();
+  if (imageFullPath) {
+    logEvent("image_activated", { filename: imageFullPath });
+  }
+  const hasSourceData =
+    payload.annotations.length > 0 ||
+    payload.images.length > 0 ||
+    payload.categories.length > 0 ||
+    payload.hasNemolabSidecars;
+  if (annotationFilePath && hasSourceData) {
+    logEvent("annotations_source", {
+      file: annotationFilePath,
+      count: payload.annotations.length,
+      file_format: payload.hasNemolabSidecars ? "extended_coco" : "coco",
+      annotation_types: summarizeAnnotationTypes(payload.annotations),
+    });
+  }
+  if (annotationFilePath) {
+    logEvent("annotations_destination", { file: annotationFilePath });
+  }
+  appState.pendingActivationLogHash = null;
 }
 
 /** Builds and sends save_annotations payload from current in-memory mask state. */
@@ -639,8 +812,19 @@ function sendSaveAnnotations(): void {
     id: toNumericID(mask),
     image_id: currentImageID,
     category_id: mask.labelName ? categoryIdByName.get(mask.labelName.trim()) : undefined,
-    keypoints: [mask.x * width, mask.y * height, 2],
-    num_keypoints: 1,
+    ...(mask.kind === "bbox"
+      ? {
+          bbox: [
+            mask.x * width,
+            mask.y * height,
+            Math.max(0, (mask.w ?? 0) * width),
+            Math.max(0, (mask.h ?? 0) * height),
+          ],
+        }
+      : {
+          keypoints: [mask.x * width, mask.y * height, 2],
+          num_keypoints: 1,
+        }),
   }));
 
   ws.send(JSON.stringify({
@@ -673,6 +857,7 @@ function goPreviousImage(): void {
   // Clear active hash so remount does not briefly reload the previous image
   // while waiting for the next image_ready event.
   appState.currentImageHash = null;
+  appState.pendingActivationLogHash = null;
   appState.annotationImageWidth = 1;
   appState.annotationImageHeight = 1;
   appState.masks = [];
@@ -695,6 +880,7 @@ function goNextImage(): void {
   // Clear active hash so remount does not briefly reload the previous image
   // while waiting for the next image_ready event.
   appState.currentImageHash = null;
+  appState.pendingActivationLogHash = null;
   appState.annotationImageWidth = 1;
   appState.annotationImageHeight = 1;
   appState.masks = [];
@@ -729,6 +915,7 @@ ws.addEventListener("message", (event) => {
     appState.imageList = images;
     appState.currentImageIndex = 0;
     appState.currentImageHash = null;
+    appState.pendingActivationLogHash = null;
     appState.annotationImageWidth = 1;
     appState.annotationImageHeight = 1;
     appState.masks = [];
@@ -757,6 +944,7 @@ ws.addEventListener("message", (event) => {
       appState.masks = [];
       appState.selectedMaskId = null;
       appState.maskContextMenu.open = false;
+      appState.pendingActivationLogHash = hash;
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: "load_annotations", hash }));
       }
@@ -780,6 +968,7 @@ ws.addEventListener("message", (event) => {
       return;
     }
     const payload = normalizeWsAnnotationFile(m["annotations"]);
+    emitImageActivationLogsIfPending(hash, payload);
     const currentImageID = appState.currentImageIndex + 1;
     const image = payload.images.find((img) => typeof img?.id === "number" && img.id === currentImageID);
     const width = Math.max(1, Math.round(typeof image?.width === "number" ? image.width : appState.annotationImageWidth));
@@ -797,6 +986,37 @@ ws.addEventListener("message", (event) => {
     payload.annotations.forEach((ann) => {
       if (!ann || typeof ann !== "object") return;
       if (ann.image_id !== currentImageID) return;
+      const bbox = Array.isArray(ann.bbox) ? ann.bbox : [];
+      const bx = typeof bbox[0] === "number" ? bbox[0] : NaN;
+      const by = typeof bbox[1] === "number" ? bbox[1] : NaN;
+      const bw = typeof bbox[2] === "number" ? bbox[2] : NaN;
+      const bh = typeof bbox[3] === "number" ? bbox[3] : NaN;
+      if (
+        bbox.length >= 4 &&
+        Number.isFinite(bx) &&
+        Number.isFinite(by) &&
+        Number.isFinite(bw) &&
+        Number.isFinite(bh) &&
+        bw > 0 &&
+        bh > 0
+      ) {
+        const x = bx / width;
+        const y = by / height;
+        const w = bw / width;
+        const h = bh / height;
+        if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(w) || !Number.isFinite(h)) return;
+        masks.push({
+          id: String(ann.id),
+          index: masks.length + 1,
+          kind: "bbox",
+          x,
+          y,
+          w,
+          h,
+          labelName: typeof ann.category_id === "number" ? (categoryNameByID.get(ann.category_id) ?? null) : null,
+        });
+        return;
+      }
       const numKeypoints = typeof ann.num_keypoints === "number" ? ann.num_keypoints : 0;
       const keypoints = Array.isArray(ann.keypoints) ? ann.keypoints : [];
       if (numKeypoints <= 0 || keypoints.length < 2) return;
@@ -809,6 +1029,7 @@ ws.addEventListener("message", (event) => {
       masks.push({
         id: String(ann.id),
         index: masks.length + 1,
+        kind: "point",
         x,
         y,
         labelName: typeof ann.category_id === "number" ? (categoryNameByID.get(ann.category_id) ?? null) : null,
@@ -984,8 +1205,81 @@ function addMask(x: number, y: number): void {
   const mask: MaskPoint = {
     id: createMaskId(),
     index: nextIndex,
+    kind: "point",
     x,
     y,
+    labelName: defaultLabel,
+  };
+  appState.masks.push(mask);
+  if (appState.currentImageHash) {
+    logEvent("mask_created", {
+      image_hash: appState.currentImageHash,
+      mask_index: mask.index,
+      x: mask.x,
+      y: mask.y,
+    });
+    sendSaveAnnotations();
+  }
+  if (mask.labelName) {
+    assignLabelToMask(mask.id, mask.labelName);
+  }
+  updateAnnotationUI();
+}
+
+/** Builds canonical bbox coordinates from two opposite corners in normalized space. */
+function normalizeBboxFromCorners(
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number
+): { x: number; y: number; w: number; h: number } {
+  const minX = Math.max(0, Math.min(1, Math.min(x0, x1)));
+  const minY = Math.max(0, Math.min(1, Math.min(y0, y1)));
+  const maxX = Math.max(0, Math.min(1, Math.max(x0, x1)));
+  const maxY = Math.max(0, Math.min(1, Math.max(y0, y1)));
+  return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+}
+
+/** Applies one dragged source-space edge to a bbox mask while preserving non-negative size. */
+function applyDraggedBboxEdge(mask: MaskPoint, edge: BboxEdge, imageX: number, imageY: number): void {
+  if (mask.kind !== "bbox") return;
+  const minSize = 1e-6;
+  let x0 = mask.x;
+  let y0 = mask.y;
+  let x1 = mask.x + Math.max(0, mask.w ?? 0);
+  let y1 = mask.y + Math.max(0, mask.h ?? 0);
+  const nx = Math.max(0, Math.min(1, imageX));
+  const ny = Math.max(0, Math.min(1, imageY));
+  if (edge === "x0") {
+    x0 = Math.max(0, Math.min(nx, x1 - minSize));
+  } else if (edge === "x1") {
+    x1 = Math.min(1, Math.max(nx, x0 + minSize));
+  } else if (edge === "y0") {
+    y0 = Math.max(0, Math.min(ny, y1 - minSize));
+  } else {
+    y1 = Math.min(1, Math.max(ny, y0 + minSize));
+  }
+  mask.x = x0;
+  mask.y = y0;
+  mask.w = Math.max(minSize, x1 - x0);
+  mask.h = Math.max(minSize, y1 - y0);
+}
+
+/** Adds a bbox mask from two opposite corners and applies selected label if available. */
+function addBboxMask(x0: number, y0: number, x1: number, y1: number): void {
+  const { x, y, w, h } = normalizeBboxFromCorners(x0, y0, x1, y1);
+  if (w <= 0 || h <= 0) return;
+
+  const nextIndex = appState.masks.reduce((max, mask) => Math.max(max, mask.index), 0) + 1;
+  const defaultLabel = getSelectedLabelName();
+  const mask: MaskPoint = {
+    id: createMaskId(),
+    index: nextIndex,
+    kind: "bbox",
+    x,
+    y,
+    w,
+    h,
     labelName: defaultLabel,
   };
   appState.masks.push(mask);
@@ -1029,6 +1323,7 @@ function removeMask(maskId: string): void {
 /** Clears all masks for the current image. */
 function clearMasks(): void {
   appState.masks = [];
+  appState.draftBboxMask = null;
   appState.selectedMaskId = null;
   appState.maskContextMenu.open = false;
   appState.maskContextMenu.maskId = null;
@@ -1045,6 +1340,24 @@ function renderPanel(
     <section class="panel" data-panel="${panelName}">
       <div class="panel__body">${contentHtml}</div>
     </section>
+  `;
+}
+
+/** Renders mask mode selector panel body. */
+function renderMaskModeBody(): string {
+  const selectedMode = appState.maskMode;
+  const messageHtml = appState.maskModeError
+    ? `<div class="mask-mode-panel__error" role="status">${appState.maskModeError}</div>`
+    : '<div class="mask-mode-panel__hint">Point mode places a mask on left-click.</div>';
+  return `
+    <div class="mask-mode-panel">
+      <select class="mask-mode-panel__select" data-action="set-mask-mode" aria-label="Mask mode">
+        <option value="point"${selectedMode === "point" ? " selected" : ""}>point</option>
+        <option value="bounding box"${selectedMode === "bounding box" ? " selected" : ""}>bounding box</option>
+        <option value="freehand"${selectedMode === "freehand" ? " selected" : ""}>freehand</option>
+      </select>
+      ${messageHtml}
+    </div>
   `;
 }
 
@@ -1087,6 +1400,20 @@ function renderMaskContextMenu(): string {
   `;
 }
 
+/** Updates only the floating mask context-menu DOM without remounting the viewer. */
+function updateMaskContextMenuUI(): void {
+  appRoot.querySelector(".mask-context-menu")?.remove();
+  const menuHtml = renderMaskContextMenu();
+  if (!menuHtml) return;
+  const dirOverlay = appRoot.querySelector("#dir-browser-overlay");
+  if (dirOverlay) {
+    dirOverlay.insertAdjacentHTML("beforebegin", menuHtml);
+  } else {
+    appRoot.insertAdjacentHTML("beforeend", menuHtml);
+  }
+  bindMaskContextMenuHandlers();
+}
+
 /** Re-renders annotation panel body and redraws WebGL annotations only. */
 function updateAnnotationUI(): void {
   const annotationsPanelBody = appRoot.querySelector<HTMLElement>(
@@ -1113,6 +1440,25 @@ function bindAnnotationPanelHandlers(): void {
   });
 }
 
+/** Binds mask mode dropdown change behavior. */
+function bindMaskModePanelHandlers(): void {
+  const select = appRoot.querySelector<HTMLSelectElement>('select[data-action="set-mask-mode"]');
+  if (!select) return;
+  select.addEventListener("change", () => {
+    const selected = select.value as MaskMode;
+    if (selected === "point" || selected === "bounding box") {
+      appState.maskMode = selected;
+      appState.maskModeError = null;
+      appState.draftBboxMask = null;
+    } else {
+      appState.maskModeError = "Mode not yet supported.";
+      appState.maskMode = "point";
+      appState.draftBboxMask = null;
+    }
+    render();
+  });
+}
+
 /** Binds handlers for the floating mask context menu. */
 function bindMaskContextMenuHandlers(): void {
   appRoot.querySelectorAll<HTMLButtonElement>('button[data-action="assign-mask-label"]').forEach((btn) => {
@@ -1122,7 +1468,8 @@ function bindMaskContextMenuHandlers(): void {
       if (!labelName || !maskId) return;
       assignLabelToMask(maskId, labelName);
       closeMaskContextMenu();
-      render();
+      updateAnnotationUI();
+      updateMaskContextMenuUI();
     });
   });
   if (!appState.maskContextMenu.open) return;
@@ -1130,7 +1477,7 @@ function bindMaskContextMenuHandlers(): void {
     const target = event.target as Element | null;
     if (target?.closest(".mask-context-menu")) return;
     closeMaskContextMenu();
-    render();
+    updateMaskContextMenuUI();
   }, { once: true });
 }
 
@@ -1379,6 +1726,14 @@ class WebGLTileViewer {
   private readonly getMasks: () => MaskPoint[];
   /** Callback for primary/secondary mask interactions from canvas clicks. */
   private readonly onMaskCanvasClick: (payload: MaskCanvasClick) => void;
+  /** Returns true when left-button drag should be interpreted as bbox placement. */
+  private readonly isBboxDragPlacementEnabled: () => boolean;
+  /** Callback for bbox placement drag gestures. */
+  private readonly onMaskCanvasDrag: (payload: MaskCanvasDrag) => void;
+  /** Returns the currently editable bbox mask, or null when side-editing is disabled. */
+  private readonly getEditableBboxMask: () => MaskPoint | null;
+  /** Callback for bbox-side editing drag gestures. */
+  private readonly onMaskCanvasBboxSideDrag: (payload: MaskCanvasBboxSideDrag) => void;
   /** Callback for selecting a mask by double-click hit-testing. */
   private readonly onMaskCanvasDoubleClick: (maskId: string) => void;
 
@@ -1449,6 +1804,14 @@ class WebGLTileViewer {
   private readonly pointRingUniform: WebGLUniformLocation;
   /** Point program transform matrix uniform location. */
   private readonly pointTransformUniform: WebGLUniformLocation;
+  /** Solid-rectangle shader program used for bbox fill/outline quads. */
+  private readonly rectProgram: WebGLProgram;
+  /** Rect program position attribute location. */
+  private readonly rectPosAttrib: number;
+  /** Rect program color uniform location. */
+  private readonly rectColorUniform: WebGLUniformLocation;
+  /** Rect program transform matrix uniform location. */
+  private readonly rectTransformUniform: WebGLUniformLocation;
 
   /** Shared buffer for quad positions and point positions. */
   private readonly positionBuffer: WebGLBuffer;
@@ -1468,13 +1831,25 @@ class WebGLTileViewer {
   private offsetY = 0;
   /** True while primary-pointer drag pan is active. */
   private isDragging = false;
+  /** True while a primary-pointer bbox placement drag is active. */
+  private isBboxDragPlacing = false;
+  /** Active pointer id for bbox placement drag, or null when idle. */
+  private bboxDragPointerId: number | null = null;
+  /** True while a primary-pointer bbox side-edit drag is active. */
+  private isBboxSideEditing = false;
+  /** Active pointer id for bbox side-edit drag, or null when idle. */
+  private bboxSideEditPointerId: number | null = null;
+  /** Active bbox side-edit mask id, or null when idle. */
+  private bboxSideEditMaskId: string | null = null;
+  /** Active bbox source-edge being edited, or null when idle. */
+  private bboxSideEditEdge: BboxEdge | null = null;
   /** Debounce timer for zoom log events (fires 500 ms after last wheel tick). */
   private zoomLogTimer: ReturnType<typeof setTimeout> | null = null;
   /** Previous pointer X used for drag delta integration. */
   private dragLastX = 0;
   /** Previous pointer Y used for drag delta integration. */
   private dragLastY = 0;
-/** Accumulated pointer travel in CSS px since last pointerdown. */
+  /** Accumulated pointer travel in CSS px since last pointerdown. */
   private dragTotalDistance = 0;
   /** Current full R/H/V transform matrix in NDC (column-major mat3). */
   private transformMatrix = new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]);
@@ -1483,11 +1858,19 @@ class WebGLTileViewer {
     canvas: HTMLCanvasElement,
     getMasks: () => MaskPoint[],
     onMaskCanvasClick: (payload: MaskCanvasClick) => void,
+    isBboxDragPlacementEnabled: () => boolean,
+    onMaskCanvasDrag: (payload: MaskCanvasDrag) => void,
+    getEditableBboxMask: () => MaskPoint | null,
+    onMaskCanvasBboxSideDrag: (payload: MaskCanvasBboxSideDrag) => void,
     onMaskCanvasDoubleClick: (maskId: string) => void
   ) {
     this.canvas = canvas;
     this.getMasks = getMasks;
     this.onMaskCanvasClick = onMaskCanvasClick;
+    this.isBboxDragPlacementEnabled = isBboxDragPlacementEnabled;
+    this.onMaskCanvasDrag = onMaskCanvasDrag;
+    this.getEditableBboxMask = getEditableBboxMask;
+    this.onMaskCanvasBboxSideDrag = onMaskCanvasBboxSideDrag;
     this.onMaskCanvasDoubleClick = onMaskCanvasDoubleClick;
 
     const gl = canvas.getContext("webgl", { alpha: false, antialias: true });
@@ -1553,6 +1936,24 @@ class WebGLTileViewer {
       `
     );
 
+    this.rectProgram = this.createProgram(
+      `
+      attribute vec2 a_pos;
+      uniform mat3 u_transform;
+      void main() {
+        vec3 pos = u_transform * vec3(a_pos, 1.0);
+        gl_Position = vec4(pos.xy, 0.0, 1.0);
+      }
+      `,
+      `
+      precision mediump float;
+      uniform vec4 u_color;
+      void main() {
+        gl_FragColor = u_color;
+      }
+      `
+    );
+
     this.tilePosAttrib = gl.getAttribLocation(this.tileProgram, "a_pos");
     this.tileUvAttrib = gl.getAttribLocation(this.tileProgram, "a_uv");
     const tileSampler = gl.getUniformLocation(this.tileProgram, "u_tex");
@@ -1581,6 +1982,15 @@ class WebGLTileViewer {
     this.pointSizeUniform = pointSize;
     this.pointRingUniform = pointRing;
     this.pointTransformUniform = pointTransform;
+
+    this.rectPosAttrib = gl.getAttribLocation(this.rectProgram, "a_pos");
+    const rectColor = gl.getUniformLocation(this.rectProgram, "u_color");
+    const rectTransform = gl.getUniformLocation(this.rectProgram, "u_transform");
+    if (!rectColor || !rectTransform) {
+      throw new Error("Rect uniforms missing");
+    }
+    this.rectColorUniform = rectColor;
+    this.rectTransformUniform = rectTransform;
 
     const positionBuffer = gl.createBuffer();
     const uvBuffer = gl.createBuffer();
@@ -1664,6 +2074,7 @@ class WebGLTileViewer {
     gl.deleteBuffer(this.uvBuffer);
     gl.deleteProgram(this.tileProgram);
     gl.deleteProgram(this.pointProgram);
+    gl.deleteProgram(this.rectProgram);
   }
 
   /** Loads a new tiled image by stem name. */
@@ -2065,7 +2476,7 @@ class WebGLTileViewer {
     return { x, y, width, height };
   }
 
-/** Draws normalized mask points over image content. */
+/** Draws normalized masks (point + bbox) over image content. */
   private drawAnnotations(): void {
     const masks = this.getMasks().slice().sort((a, b) => a.index - b.index);
     if (masks.length === 0) {
@@ -2085,39 +2496,112 @@ class WebGLTileViewer {
     const fillOpacity = Math.max(0, Math.min(1, appState.optics.maskFillOpacity));
     const ringInnerRadius = Math.max(0, 0.5 - strokeWidth / outlineSize);
     const ringThreshold = ringInnerRadius * ringInnerRadius;
+    const rectStrokeX = this.baseTransform.width > 0 ? strokeWidth / this.baseTransform.width : 0;
+    const rectStrokeY = this.baseTransform.height > 0 ? strokeWidth / this.baseTransform.height : 0;
 
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
-    gl.useProgram(this.pointProgram);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.positionBuffer);
-    gl.enableVertexAttribArray(this.pointPosAttrib);
-    gl.vertexAttribPointer(this.pointPosAttrib, 2, gl.FLOAT, false, 0, 0);
-    gl.uniformMatrix3fv(this.pointTransformUniform, false, this.transformMatrix);
+    const setupPointProgram = (): void => {
+      gl.useProgram(this.pointProgram);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.positionBuffer);
+      gl.enableVertexAttribArray(this.pointPosAttrib);
+      gl.vertexAttribPointer(this.pointPosAttrib, 2, gl.FLOAT, false, 0, 0);
+      gl.uniformMatrix3fv(this.pointTransformUniform, false, this.transformMatrix);
+    };
+    const setupRectProgram = (): void => {
+      gl.useProgram(this.rectProgram);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.positionBuffer);
+      gl.enableVertexAttribArray(this.rectPosAttrib);
+      gl.vertexAttribPointer(this.rectPosAttrib, 2, gl.FLOAT, false, 0, 0);
+      gl.uniformMatrix3fv(this.rectTransformUniform, false, this.transformMatrix);
+    };
+    const drawRectNormalized = (
+      x0Norm: number,
+      y0Norm: number,
+      x1Norm: number,
+      y1Norm: number,
+      color: [number, number, number],
+      alpha: number
+    ): void => {
+      if (alpha <= 0 || x1Norm <= x0Norm || y1Norm <= y0Norm) return;
+      const x0 = this.baseTransform.x + x0Norm * this.baseTransform.width;
+      const y0 = this.baseTransform.y + y0Norm * this.baseTransform.height;
+      const x1 = this.baseTransform.x + x1Norm * this.baseTransform.width;
+      const y1 = this.baseTransform.y + y1Norm * this.baseTransform.height;
+      gl.bufferData(gl.ARRAY_BUFFER, this.rectToNdc(x0, y0, x1, y1), gl.STREAM_DRAW);
+      gl.uniform4f(this.rectColorUniform, color[0], color[1], color[2], alpha);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    };
+    let pointProgramActive = false;
+    let rectProgramActive = false;
 
     masks.forEach((mask, index) => {
-      const x = this.baseTransform.x + mask.x * this.baseTransform.width;
-      const y = this.baseTransform.y + mask.y * this.baseTransform.height;
-      point[0] = (x / this.canvas.clientWidth) * 2 - 1;
-      point[1] = 1 - (y / this.canvas.clientHeight) * 2;
-      gl.bufferData(gl.ARRAY_BUFFER, point, gl.STREAM_DRAW);
-
       const fillHex = maskFillColor(index);
       const labelIndex = mask.labelName ? (labelDepthFirstIndex.get(mask.labelName) ?? null) : null;
       const outlineHex = labelIndex === null ? "#888888" : labelColor(labelIndex);
       const [outlineR, outlineG, outlineB] = cssHexToRgb01(outlineHex);
-      gl.uniform4f(this.pointColorUniform, outlineR, outlineG, outlineB, strokeOpacity);
-      gl.uniform1f(this.pointSizeUniform, outlineSize);
-      gl.uniform1f(this.pointRingUniform, ringThreshold);
-      gl.drawArrays(gl.POINTS, 0, 1);
-
       const shouldFill = !hasSelectedMask || mask.id === selectedMaskId;
+      if (mask.kind === "point") {
+        if (!pointProgramActive) {
+          setupPointProgram();
+          pointProgramActive = true;
+          rectProgramActive = false;
+        }
+        const x = this.baseTransform.x + mask.x * this.baseTransform.width;
+        const y = this.baseTransform.y + mask.y * this.baseTransform.height;
+        point[0] = (x / this.canvas.clientWidth) * 2 - 1;
+        point[1] = 1 - (y / this.canvas.clientHeight) * 2;
+        gl.bufferData(gl.ARRAY_BUFFER, point, gl.STREAM_DRAW);
+
+        gl.uniform4f(this.pointColorUniform, outlineR, outlineG, outlineB, strokeOpacity);
+        gl.uniform1f(this.pointSizeUniform, outlineSize);
+        gl.uniform1f(this.pointRingUniform, ringThreshold);
+        gl.drawArrays(gl.POINTS, 0, 1);
+
+        if (shouldFill) {
+          const [fillR, fillG, fillB] = cssHexToRgb01(fillHex);
+          gl.uniform4f(this.pointColorUniform, fillR, fillG, fillB, fillOpacity);
+          gl.uniform1f(this.pointSizeUniform, fillSize);
+          gl.uniform1f(this.pointRingUniform, 0.0);
+          gl.drawArrays(gl.POINTS, 0, 1);
+        }
+        return;
+      }
+      if (mask.kind !== "bbox") return;
+      if (!rectProgramActive) {
+        setupRectProgram();
+        rectProgramActive = true;
+        pointProgramActive = false;
+      }
+      const bw = Math.max(0, mask.w ?? 0);
+      const bh = Math.max(0, mask.h ?? 0);
+      const x0 = mask.x;
+      const y0 = mask.y;
+      const x1 = mask.x + bw;
+      const y1 = mask.y + bh;
+      const outlineColor: [number, number, number] = [outlineR, outlineG, outlineB];
+      const insetX = Math.min(rectStrokeX, bw / 2);
+      const insetY = Math.min(rectStrokeY, bh / 2);
+      const topY1 = Math.min(y1, y0 + insetY);
+      const bottomY0 = Math.max(y0, y1 - insetY);
+      const leftX1 = Math.min(x1, x0 + insetX);
+      const rightX0 = Math.max(x0, x1 - insetX);
+      drawRectNormalized(x0, y0, x1, topY1, outlineColor, strokeOpacity);
+      drawRectNormalized(x0, bottomY0, x1, y1, outlineColor, strokeOpacity);
+      drawRectNormalized(x0, topY1, leftX1, bottomY0, outlineColor, strokeOpacity);
+      drawRectNormalized(rightX0, topY1, x1, bottomY0, outlineColor, strokeOpacity);
+
       if (shouldFill) {
         const [fillR, fillG, fillB] = cssHexToRgb01(fillHex);
-        gl.uniform4f(this.pointColorUniform, fillR, fillG, fillB, fillOpacity);
-        gl.uniform1f(this.pointSizeUniform, fillSize);
-        gl.uniform1f(this.pointRingUniform, 0.0);
-        gl.drawArrays(gl.POINTS, 0, 1);
+        drawRectNormalized(
+          x0 + insetX,
+          y0 + insetY,
+          x1 - insetX,
+          y1 - insetY,
+          [fillR, fillG, fillB],
+          fillOpacity
+        );
       }
     });
 
@@ -2228,12 +2712,33 @@ class WebGLTileViewer {
     const maxDistSq = radiusPx * radiusPx;
     let best: { id: string; distSq: number } | null = null;
     this.getMasks().forEach((mask) => {
-      const display = this.applyForwardTransformToNormalizedPoint(mask.x, mask.y);
-      const mx = this.transform.x + display.x * this.transform.width;
-      const my = this.transform.y + display.y * this.transform.height;
-      const dx = mx - px;
-      const dy = my - py;
-      const distSq = dx * dx + dy * dy;
+      let distSq = Number.POSITIVE_INFINITY;
+      if (mask.kind === "bbox") {
+        const bw = Math.max(0, mask.w ?? 0);
+        const bh = Math.max(0, mask.h ?? 0);
+        const corners = [
+          this.applyForwardTransformToNormalizedPoint(mask.x, mask.y),
+          this.applyForwardTransformToNormalizedPoint(mask.x + bw, mask.y),
+          this.applyForwardTransformToNormalizedPoint(mask.x, mask.y + bh),
+          this.applyForwardTransformToNormalizedPoint(mask.x + bw, mask.y + bh),
+        ];
+        const xs = corners.map((c) => this.transform.x + c.x * this.transform.width);
+        const ys = corners.map((c) => this.transform.y + c.y * this.transform.height);
+        const minX = Math.min(...xs);
+        const maxX = Math.max(...xs);
+        const minY = Math.min(...ys);
+        const maxY = Math.max(...ys);
+        const dx = Math.max(minX - px, 0, px - maxX);
+        const dy = Math.max(minY - py, 0, py - maxY);
+        distSq = dx * dx + dy * dy;
+      } else {
+        const display = this.applyForwardTransformToNormalizedPoint(mask.x, mask.y);
+        const mx = this.transform.x + display.x * this.transform.width;
+        const my = this.transform.y + display.y * this.transform.height;
+        const dx = mx - px;
+        const dy = my - py;
+        distSq = dx * dx + dy * dy;
+      }
       if (distSq > maxDistSq) return;
       if (!best || distSq < best.distSq) {
         best = { id: mask.id, distSq };
@@ -2242,34 +2747,119 @@ class WebGLTileViewer {
     return best?.id ?? null;
   }
 
-  /** Handles primary-button click by mapping into normalized image coordinates. */
-  private readonly handleCanvasClick = (event: MouseEvent): void => {
-    if (event.button !== 0) return;
-    if (this.dragTotalDistance > config.clickMaxDragPx) return;
-    const bounds = this.canvas.getBoundingClientRect();
-    const px = event.clientX - bounds.left;
-    const py = event.clientY - bounds.top;
+  /** Returns shortest Euclidean distance from point to finite line segment in CSS pixels. */
+  private distancePointToSegment(
+    px: number,
+    py: number,
+    ax: number,
+    ay: number,
+    bx: number,
+    by: number
+  ): number {
+    const vx = bx - ax;
+    const vy = by - ay;
+    const wx = px - ax;
+    const wy = py - ay;
+    const vv = vx * vx + vy * vy;
+    if (vv <= 1e-12) {
+      const dx = px - ax;
+      const dy = py - ay;
+      return Math.sqrt(dx * dx + dy * dy);
+    }
+    const t = Math.max(0, Math.min(1, (wx * vx + wy * vy) / vv));
+    const cx = ax + t * vx;
+    const cy = ay + t * vy;
+    const dx = px - cx;
+    const dy = py - cy;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
 
-    if (
-      px < this.transform.x ||
-      py < this.transform.y ||
-      px > this.transform.x + this.transform.width ||
-      py > this.transform.y + this.transform.height
-    ) {
-      return;
+  /** Finds nearest editable bbox source-edge by display-space side hit-testing. */
+  private findNearestEditableBboxEdge(mask: MaskPoint, px: number, py: number, radiusPx: number): BboxEdge | null {
+    if (mask.kind !== "bbox") return null;
+    const bw = Math.max(0, mask.w ?? 0);
+    const bh = Math.max(0, mask.h ?? 0);
+    if (bw <= 0 || bh <= 0) return null;
+
+    const c00 = this.applyForwardTransformToNormalizedPoint(mask.x, mask.y);
+    const c10 = this.applyForwardTransformToNormalizedPoint(mask.x + bw, mask.y);
+    const c01 = this.applyForwardTransformToNormalizedPoint(mask.x, mask.y + bh);
+    const c11 = this.applyForwardTransformToNormalizedPoint(mask.x + bw, mask.y + bh);
+    const toCanvas = (p: { x: number; y: number }): { x: number; y: number } => ({
+      x: this.transform.x + p.x * this.transform.width,
+      y: this.transform.y + p.y * this.transform.height,
+    });
+    const p00 = toCanvas(c00);
+    const p10 = toCanvas(c10);
+    const p01 = toCanvas(c01);
+    const p11 = toCanvas(c11);
+    const candidates: Array<{ edge: BboxEdge; dist: number }> = [
+      { edge: "x0", dist: this.distancePointToSegment(px, py, p00.x, p00.y, p01.x, p01.y) },
+      { edge: "x1", dist: this.distancePointToSegment(px, py, p10.x, p10.y, p11.x, p11.y) },
+      { edge: "y0", dist: this.distancePointToSegment(px, py, p00.x, p00.y, p10.x, p10.y) },
+      { edge: "y1", dist: this.distancePointToSegment(px, py, p01.x, p01.y, p11.x, p11.y) },
+    ];
+    candidates.sort((a, b) => a.dist - b.dist);
+    const nearest = candidates[0];
+    if (!nearest || nearest.dist > radiusPx) return null;
+    return nearest.edge;
+  }
+
+  /** Maps client coordinates into canvas/image coordinates, optionally clamping to image bounds. */
+  private mapClientToMaskEvent(
+    clientX: number,
+    clientY: number,
+    options: { clampToImage: boolean; includeHitMask: boolean }
+  ): Omit<MaskCanvasClick, "button" | "shiftKey"> | null {
+    const bounds = this.canvas.getBoundingClientRect();
+    let px = clientX - bounds.left;
+    let py = clientY - bounds.top;
+
+    const minX = this.transform.x;
+    const maxX = this.transform.x + this.transform.width;
+    const minY = this.transform.y;
+    const maxY = this.transform.y + this.transform.height;
+
+    const inImage = px >= minX && px <= maxX && py >= minY && py <= maxY;
+    if (!inImage && !options.clampToImage) {
+      return null;
+    }
+    if (!inImage && options.clampToImage) {
+      px = Math.max(minX, Math.min(maxX, px));
+      py = Math.max(minY, Math.min(maxY, py));
     }
 
     const displayX = (px - this.transform.x) / this.transform.width;
     const displayY = (py - this.transform.y) / this.transform.height;
     const source = this.applyInverseTransformToNormalizedPoint(displayX, displayY);
-    this.onMaskCanvasClick({
-      button: "left",
+    return {
       canvasX: px,
       canvasY: py,
       imageX: source.x,
       imageY: source.y,
+      hitMaskId: options.includeHitMask ? this.findClosestMaskId(px, py, 10) : null,
+      clientX,
+      clientY,
+    };
+  }
+
+  /** Handles primary-button click by mapping into normalized image coordinates. */
+  private readonly handleCanvasClick = (event: MouseEvent): void => {
+    if (event.button !== 0) return;
+    if (this.dragTotalDistance > config.clickMaxDragPx) return;
+    const mapped = this.mapClientToMaskEvent(event.clientX, event.clientY, {
+      clampToImage: false,
+      includeHitMask: true,
+    });
+    if (!mapped) return;
+    this.onMaskCanvasClick({
+      button: "left",
+      canvasX: mapped.canvasX,
+      canvasY: mapped.canvasY,
+      imageX: mapped.imageX,
+      imageY: mapped.imageY,
       shiftKey: event.shiftKey,
-      hitMaskId: this.findClosestMaskId(px, py, 10),
+      hitMaskId: mapped.hitMaskId,
       clientX: event.clientX,
       clientY: event.clientY,
     });
@@ -2279,30 +2869,19 @@ class WebGLTileViewer {
   private readonly handleCanvasContextMenu = (event: MouseEvent): void => {
     event.preventDefault();
     if (this.dragTotalDistance > config.clickMaxDragPx) return;
-    const bounds = this.canvas.getBoundingClientRect();
-    const px = event.clientX - bounds.left;
-    const py = event.clientY - bounds.top;
-
-    if (
-      px < this.transform.x ||
-      py < this.transform.y ||
-      px > this.transform.x + this.transform.width ||
-      py > this.transform.y + this.transform.height
-    ) {
-      return;
-    }
-
-    const displayX = (px - this.transform.x) / this.transform.width;
-    const displayY = (py - this.transform.y) / this.transform.height;
-    const source = this.applyInverseTransformToNormalizedPoint(displayX, displayY);
+    const mapped = this.mapClientToMaskEvent(event.clientX, event.clientY, {
+      clampToImage: false,
+      includeHitMask: true,
+    });
+    if (!mapped) return;
     this.onMaskCanvasClick({
       button: "right",
-      canvasX: px,
-      canvasY: py,
-      imageX: source.x,
-      imageY: source.y,
+      canvasX: mapped.canvasX,
+      canvasY: mapped.canvasY,
+      imageX: mapped.imageX,
+      imageY: mapped.imageY,
       shiftKey: event.shiftKey,
-      hitMaskId: this.findClosestMaskId(px, py, 10),
+      hitMaskId: mapped.hitMaskId,
       clientX: event.clientX,
       clientY: event.clientY,
     });
@@ -2312,18 +2891,12 @@ class WebGLTileViewer {
   private readonly handleCanvasDoubleClick = (event: MouseEvent): void => {
     if (event.button !== 0) return;
     if (this.dragTotalDistance > config.clickMaxDragPx) return;
-    const bounds = this.canvas.getBoundingClientRect();
-    const px = event.clientX - bounds.left;
-    const py = event.clientY - bounds.top;
-    if (
-      px < this.transform.x ||
-      py < this.transform.y ||
-      px > this.transform.x + this.transform.width ||
-      py > this.transform.y + this.transform.height
-    ) {
-      return;
-    }
-    const hitMaskId = this.findClosestMaskId(px, py, 10);
+    const mapped = this.mapClientToMaskEvent(event.clientX, event.clientY, {
+      clampToImage: false,
+      includeHitMask: true,
+    });
+    if (!mapped) return;
+    const hitMaskId = mapped.hitMaskId;
     if (hitMaskId) {
       this.onMaskCanvasDoubleClick(hitMaskId);
     }
@@ -2444,6 +3017,65 @@ class WebGLTileViewer {
       return;
     }
     this.canvas.focus();
+
+    if (this.isBboxDragPlacementEnabled()) {
+      const mapped = this.mapClientToMaskEvent(event.clientX, event.clientY, {
+        clampToImage: false,
+        includeHitMask: false,
+      });
+      if (mapped) {
+        this.isBboxDragPlacing = true;
+        this.bboxDragPointerId = event.pointerId;
+        this.dragLastX = event.clientX;
+        this.dragLastY = event.clientY;
+        this.dragTotalDistance = 0;
+        this.canvas.setPointerCapture(event.pointerId);
+        this.onMaskCanvasDrag({
+          phase: "start",
+          canvasX: mapped.canvasX,
+          canvasY: mapped.canvasY,
+          imageX: mapped.imageX,
+          imageY: mapped.imageY,
+          dragDistance: 0,
+        });
+        return;
+      }
+    }
+
+    const editableBbox = this.getEditableBboxMask();
+    if (editableBbox) {
+      const mapped = this.mapClientToMaskEvent(event.clientX, event.clientY, {
+        clampToImage: false,
+        includeHitMask: false,
+      });
+      if (mapped) {
+        const edge = this.findNearestEditableBboxEdge(
+          editableBbox,
+          mapped.canvasX,
+          mapped.canvasY,
+          config.bboxSideHitPx
+        );
+        if (edge) {
+          this.isBboxSideEditing = true;
+          this.bboxSideEditPointerId = event.pointerId;
+          this.bboxSideEditMaskId = editableBbox.id;
+          this.bboxSideEditEdge = edge;
+          this.dragLastX = event.clientX;
+          this.dragLastY = event.clientY;
+          this.dragTotalDistance = 0;
+          this.canvas.setPointerCapture(event.pointerId);
+          this.onMaskCanvasBboxSideDrag({
+            phase: "start",
+            maskId: editableBbox.id,
+            edge,
+            imageX: mapped.imageX,
+            imageY: mapped.imageY,
+          });
+          return;
+        }
+      }
+    }
+
     this.isDragging = true;
     this.dragLastX = event.clientX;
     this.dragLastY = event.clientY;
@@ -2453,6 +3085,59 @@ class WebGLTileViewer {
 
   /** Integrates pointer movement into pan offset while dragging. */
   private readonly handlePointerMove = (event: PointerEvent): void => {
+    if (this.isBboxSideEditing) {
+      if (this.bboxSideEditPointerId !== null && event.pointerId !== this.bboxSideEditPointerId) {
+        return;
+      }
+      if (this.dragLastX !== event.clientX || this.dragLastY !== event.clientY) {
+        const dx = event.clientX - this.dragLastX;
+        const dy = event.clientY - this.dragLastY;
+        this.dragTotalDistance += Math.sqrt(dx * dx + dy * dy);
+        this.dragLastX = event.clientX;
+        this.dragLastY = event.clientY;
+      }
+      const mapped = this.mapClientToMaskEvent(event.clientX, event.clientY, {
+        clampToImage: true,
+        includeHitMask: false,
+      });
+      if (!mapped || !this.bboxSideEditMaskId || !this.bboxSideEditEdge) return;
+      this.onMaskCanvasBboxSideDrag({
+        phase: "move",
+        maskId: this.bboxSideEditMaskId,
+        edge: this.bboxSideEditEdge,
+        imageX: mapped.imageX,
+        imageY: mapped.imageY,
+      });
+      return;
+    }
+
+    if (this.isBboxDragPlacing) {
+      if (this.bboxDragPointerId !== null && event.pointerId !== this.bboxDragPointerId) {
+        return;
+      }
+      if (this.dragLastX !== event.clientX || this.dragLastY !== event.clientY) {
+        const dx = event.clientX - this.dragLastX;
+        const dy = event.clientY - this.dragLastY;
+        this.dragTotalDistance += Math.sqrt(dx * dx + dy * dy);
+        this.dragLastX = event.clientX;
+        this.dragLastY = event.clientY;
+      }
+      const mapped = this.mapClientToMaskEvent(event.clientX, event.clientY, {
+        clampToImage: true,
+        includeHitMask: false,
+      });
+      if (!mapped) return;
+      this.onMaskCanvasDrag({
+        phase: "move",
+        canvasX: mapped.canvasX,
+        canvasY: mapped.canvasY,
+        imageX: mapped.imageX,
+        imageY: mapped.imageY,
+        dragDistance: this.dragTotalDistance,
+      });
+      return;
+    }
+
     if (!this.isDragging || !this.manifest) {
       return;
     }
@@ -2476,7 +3161,54 @@ class WebGLTileViewer {
   };
 
   /** Ends drag-pan and refreshes level selection if needed. */
-  private readonly handlePointerUp = (_event: PointerEvent): void => {
+  private readonly handlePointerUp = (event: PointerEvent): void => {
+    if (this.isBboxSideEditing) {
+      if (this.bboxSideEditPointerId !== null && event.pointerId !== this.bboxSideEditPointerId) {
+        return;
+      }
+      const mapped = this.mapClientToMaskEvent(event.clientX, event.clientY, {
+        clampToImage: true,
+        includeHitMask: false,
+      });
+      if (mapped && this.bboxSideEditMaskId && this.bboxSideEditEdge) {
+        this.onMaskCanvasBboxSideDrag({
+          phase: "end",
+          maskId: this.bboxSideEditMaskId,
+          edge: this.bboxSideEditEdge,
+          imageX: mapped.imageX,
+          imageY: mapped.imageY,
+        });
+      }
+      this.isBboxSideEditing = false;
+      this.bboxSideEditPointerId = null;
+      this.bboxSideEditMaskId = null;
+      this.bboxSideEditEdge = null;
+      return;
+    }
+
+    if (this.isBboxDragPlacing) {
+      if (this.bboxDragPointerId !== null && event.pointerId !== this.bboxDragPointerId) {
+        return;
+      }
+      const mapped = this.mapClientToMaskEvent(event.clientX, event.clientY, {
+        clampToImage: true,
+        includeHitMask: false,
+      });
+      if (mapped) {
+        this.onMaskCanvasDrag({
+          phase: "end",
+          canvasX: mapped.canvasX,
+          canvasY: mapped.canvasY,
+          imageX: mapped.imageX,
+          imageY: mapped.imageY,
+          dragDistance: this.dragTotalDistance,
+        });
+      }
+      this.isBboxDragPlacing = false;
+      this.bboxDragPointerId = null;
+      return;
+    }
+
     if (!this.isDragging) {
       return;
     }
@@ -2541,9 +3273,10 @@ function mountViewer(): void {
   }
 
   viewer?.destroy();
+  let bboxDragStart: { imageX: number; imageY: number } | null = null;
   viewer = new WebGLTileViewer(
     canvas,
-    () => appState.masks,
+    () => (appState.draftBboxMask ? [...appState.masks, appState.draftBboxMask] : appState.masks),
     (payload) => {
       if (!appState.currentImageHash) return;
       logEvent("mouse_click", {
@@ -2554,7 +3287,11 @@ function mountViewer(): void {
         image_y: payload.imageY,
       });
       if (payload.button === "left") {
+        const hadMenuOpen = appState.maskContextMenu.open;
         closeMaskContextMenu();
+        if (hadMenuOpen) {
+          updateMaskContextMenuUI();
+        }
         if (payload.shiftKey) {
           if (payload.hitMaskId) {
             removeMask(payload.hitMaskId);
@@ -2562,6 +3299,9 @@ function mountViewer(): void {
           return;
         }
         if (appState.selectedMaskId !== null) {
+          return;
+        }
+        if (appState.maskMode === "bounding box") {
           return;
         }
         addMask(payload.imageX, payload.imageY);
@@ -2575,7 +3315,78 @@ function mountViewer(): void {
       } else {
         closeMaskContextMenu();
       }
-      render();
+      updateMaskContextMenuUI();
+    },
+    () => appState.maskMode === "bounding box" && appState.selectedMaskId === null,
+    (payload) => {
+      if (payload.phase === "start") {
+        const hadMenuOpen = appState.maskContextMenu.open;
+        closeMaskContextMenu();
+        if (hadMenuOpen) {
+          updateMaskContextMenuUI();
+        }
+        bboxDragStart = { imageX: payload.imageX, imageY: payload.imageY };
+        appState.draftBboxMask = null;
+        return;
+      }
+      if (!bboxDragStart || appState.maskMode !== "bounding box" || appState.selectedMaskId !== null) {
+        appState.draftBboxMask = null;
+        return;
+      }
+      if (payload.dragDistance < config.clickMaxDragPx) {
+        appState.draftBboxMask = null;
+        if (payload.phase === "end") {
+          bboxDragStart = null;
+          viewer?.draw();
+        }
+        return;
+      }
+
+      const preview = normalizeBboxFromCorners(
+        bboxDragStart.imageX,
+        bboxDragStart.imageY,
+        payload.imageX,
+        payload.imageY
+      );
+      const previewMask: MaskPoint = {
+        id: "__draft-bbox__",
+        index: appState.masks.reduce((max, mask) => Math.max(max, mask.index), 0) + 1,
+        kind: "bbox",
+        x: preview.x,
+        y: preview.y,
+        w: preview.w,
+        h: preview.h,
+        labelName: null,
+      };
+      appState.draftBboxMask = previewMask;
+      viewer?.draw();
+
+      if (payload.phase === "end") {
+        appState.draftBboxMask = null;
+        addBboxMask(bboxDragStart.imageX, bboxDragStart.imageY, payload.imageX, payload.imageY);
+        bboxDragStart = null;
+      }
+    },
+    () => {
+      if (appState.maskMode !== "bounding box") return null;
+      if (!appState.selectedMaskId) return null;
+      const selected = appState.masks.find((mask) => mask.id === appState.selectedMaskId) ?? null;
+      if (!selected || selected.kind !== "bbox") return null;
+      return selected;
+    },
+    (payload) => {
+      if (appState.maskMode !== "bounding box") return;
+      const mask = appState.masks.find((m) => m.id === payload.maskId);
+      if (!mask || mask.kind !== "bbox") return;
+      applyDraggedBboxEdge(mask, payload.edge, payload.imageX, payload.imageY);
+      if (payload.phase === "end") {
+        if (appState.currentImageHash) {
+          sendSaveAnnotations();
+        }
+        updateAnnotationUI();
+        return;
+      }
+      viewer?.draw();
     },
     (maskId) => {
       appState.selectedMaskId = maskId;
@@ -2929,19 +3740,19 @@ function bindDirBrowserHandlers(): void {
   });
 }
 
-/** Produces the hamburger button + menu bar HTML. */
+/** Produces the hamburger button and menu bar HTML. */
 function renderMenuBar(): string {
   const open = appState.menuOpen;
   return `
+    <button class="hamburger" type="button" aria-label="Toggle menu" aria-expanded="${open}"
+            data-action="toggle-menu">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+        <line x1="3" y1="6"  x2="21" y2="6"/>
+        <line x1="3" y1="12" x2="21" y2="12"/>
+        <line x1="3" y1="18" x2="21" y2="18"/>
+      </svg>
+    </button>
     <div class="menu-bar ${open ? "menu-bar--open" : ""}">
-      <button class="hamburger" type="button" aria-label="Toggle menu" aria-expanded="${open}"
-              data-action="toggle-menu">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-          <line x1="3" y1="6"  x2="21" y2="6"/>
-          <line x1="3" y1="12" x2="21" y2="12"/>
-          <line x1="3" y1="18" x2="21" y2="18"/>
-        </svg>
-      </button>
       <nav class="menu-bar__items" aria-hidden="${!open}">
         <div class="menu-bar__item" data-menu="tasks">
           <button type="button" class="menu-bar__btn" data-action="open-tasks">Tasks</button>
@@ -3668,6 +4479,12 @@ function bindTasksDialogHandlers(): void {
       appState.activeLabels = task.labels;
       appState.activeLabelSelectedId = firstLeafLabelId(task.labels);
       appState.recentLabels = [];
+      appState.activeTaskImagesPath = task.images;
+      appState.activeTaskAnnotationsPath = task.annotations;
+      appState.activeTaskSingleFile = task.checkmark;
+      appState.pendingActivationLogHash = null;
+      appState.maskMode = "point";
+      appState.maskModeError = null;
       appState.imageList = [];
       appState.currentImageIndex = 0;
       appState.currentImageHash = null;
@@ -3754,9 +4571,48 @@ function updateTaskSummaryDesc(card: HTMLElement, task: Task): void {
   if (preview) preview.textContent = task.description.split("\n")[0] ?? "";
 }
 
+interface FocusSnapshot {
+  selector: string;
+  index: number;
+}
+
+/** Captures enough identity for the currently focused element to restore focus after render(). */
+function captureFocusSnapshot(): FocusSnapshot | null {
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement)) return null;
+  if (active === document.body) return null;
+  if (active.id) {
+    return { selector: `#${CSS.escape(active.id)}`, index: 0 };
+  }
+
+  const tag = active.tagName.toLowerCase();
+  const attrNames = ["data-action", "name", "type", "aria-label", "placeholder"];
+  const selectorParts = [tag];
+  for (const attr of attrNames) {
+    const value = active.getAttribute(attr);
+    if (!value) continue;
+    selectorParts.push(`[${attr}="${CSS.escape(value)}"]`);
+  }
+  const selector = selectorParts.join("");
+  const matches = Array.from(document.querySelectorAll<HTMLElement>(selector));
+  const index = Math.max(0, matches.indexOf(active));
+  return { selector, index };
+}
+
+/** Restores focus to a matching element after render(), if one still exists. */
+function restoreFocusFromSnapshot(snapshot: FocusSnapshot | null): void {
+  if (!snapshot) return;
+  const matches = Array.from(document.querySelectorAll<HTMLElement>(snapshot.selector));
+  if (matches.length === 0) return;
+  const target = matches[Math.min(snapshot.index, matches.length - 1)];
+  if (!target || target === document.activeElement) return;
+  target.focus();
+}
+
 /** Renders the prototype UI and rebinds event handlers. */
 function render(): void {
-      appRoot.innerHTML = `
+  const focusSnapshot = captureFocusSnapshot();
+  appRoot.innerHTML = `
     <div class="layout ${appState.leftCollapsed ? "left-collapsed" : ""} ${
       appState.rightCollapsed ? "right-collapsed" : ""
     }" style="--sidebar-right-width: ${appState.rightSidebarWidth}px;">
@@ -3779,6 +4635,7 @@ function render(): void {
         <div class="sidebar__content panels">
           ${renderPanel("optics", "optics", renderOpticsBody())}
           ${renderPanel("labels", "labels", renderLabelTree(appState.activeLabels, appState.activeLabelSelectedId, false))}
+          ${renderPanel("maskMode", "mask mode", renderMaskModeBody())}
           ${renderPanel(
             "annotations",
             "annotations",
@@ -3822,11 +4679,13 @@ function render(): void {
   bindOpticsPanelHandlers();
   bindMenuHandlers();
   bindActiveLabelPanelHandlers();
+  bindMaskModePanelHandlers();
   bindMaskContextMenuHandlers();
   bindTasksDialogHandlers();
   bindDirBrowserHandlers();
   bindRightSidebarResizeHandle();
   mountViewer();
+  restoreFocusFromSnapshot(focusSnapshot);
 }
 
 void (async () => {

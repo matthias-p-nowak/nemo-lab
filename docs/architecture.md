@@ -86,7 +86,7 @@
 - Shared annotation content state is package-global and keyed by annotation file path (`annotationStore[path]`), not per connection.
 - `set_active_task` loads `tasks.annotations` + `tasks.checkmark` and resets per-token active annotation selection state.
 - Additional WS message types:
-  - `load_annotations` (`hash`) → resolve hash to image path, choose annotation file path (`nemolab.json` for single-file mode, `<image>.json` otherwise), read through `backend/annotations.ReadAnnotations` on first access, cache globally by path, return `annotations_data`.
+  - `load_annotations` (`hash`) → resolve hash to image path, choose annotation file path (`nemolab.json` for single-file mode, `<image>.json` otherwise). If target file is missing, migration/import checks run in order: opposite-mode file inside `annotationsDir` (migrate + delete old), then image-adjacent sidecar (`<image_dir>/<stem>.json`) (import only, original kept). Resolved content is read through `backend/annotations.ReadAnnotations` on first access, cached globally by path, and returned as `annotations_data`.
   - `save_annotations` (`hash`, `annotations`) → resolve file path, merge incoming data into the shared path entry, mark path dirty, and reset a per-path 10s debounce timer.
 - Save merge policy is last-write-wins per annotation id for the targeted image id; missing ids from incoming payload for that image are removed from the shared state.
 - On save, WS broadcasts updated `annotations_data` to other active connections whose `activeAnnotationPath` matches the same file path.
@@ -184,9 +184,12 @@
 - Viewer input handlers emit telemetry with module-level `logEvent(...)` over the shared WebSocket.
 - `PageUp`/`PageDown` optics transform cycling is bound once at module init on `document` keydown so it works independent of canvas focus across rerenders; handler ignores editable targets (`INPUT`, `TEXTAREA`, `SELECT`, contenteditable) and calls `preventDefault()` to suppress browser page scroll.
 - Logged frontend events include `image_change`, document `focus` (`focusin`/`focusout`), and temporary mask interaction events (`mouse_click`, `mask_created`, `mask_removed`, `label_assigned`).
+- Left sidebar uses the same scrollable content-wrapper pattern as the right sidebar (`.sidebar__content` with vertical overflow); the left content wrapper has top margin to clear the fixed top-left controls. The hamburger button is rendered as a fixed control adjacent to the fixed left-sidebar toggle.
+- On new-image activation (`image_ready` for a new hash), frontend defers activation logging until matching `annotations_data` arrives, then emits in order: `image_activated` (full image path), optional `annotations_source` (only when loaded payload is non-empty, with count/format/type summary), and `annotations_destination` (active write-target path from task annotations mode).
 - Canvas left-click adds a mask point only if total pointer travel since `pointerdown` is ≤ `config.clickMaxDragPx` (default 10 CSS px); longer drags are treated as pan gestures and suppressed. `Shift+left-click` removes nearest mask within 10 CSS px. Right-click near a mask opens a floating label assignment menu.
+- Right sidebar includes a mask-mode selector panel between Labels and Masks. `appState.maskMode` is the active mode (`point`, `bounding box`, `freehand`) and defaults to `point` on task activation. Selecting `bounding box` or `freehand` shows inline `Mode not yet supported.` feedback and immediately reverts selection back to `point`.
 - On `image_ready` for a newly selected hash, frontend sends `load_annotations` for that hash.
-- Frontend applies `annotations_data` only when `hash === appState.currentImageHash`, updates stored image dimensions, and reconstructs point masks from keypoint annotations (`num_keypoints > 0`) with category-id label lookup.
+- Frontend applies `annotations_data` only when `hash === appState.currentImageHash`, updates stored image dimensions, and reconstructs masks from either COCO keypoints (`point`) or COCO `bbox` (`bounding box`) annotations with category-id label lookup.
 - Frontend sends `save_annotations` after mask create/remove/label-assign by rebuilding a COCO-like payload from current masks, using current image filename and last-known image width/height.
 - Mask rendering palettes are split: fill uses `maskFillColor` (bit-reversed hue, S=0.50 V=0.70); outline uses label-based `labelColor` (S=0.75 V=0.90) or gray for unlabeled masks.
 - Optics panel includes persisted mask-render controls (`mask_stroke_opacity`, `mask_fill_opacity`, `mask_stroke_width`, `mask_marker_size`) that drive point alpha/size in the WebGL mask draw pass.
@@ -198,4 +201,5 @@
   - outline color = `labelColor(labelDepthFirstIndex)` for labeled masks, else `#888888`
   - with no selected mask: all masks draw outline + fill
   - with a selected mask: selected mask draws outline + fill; non-selected masks draw outline only.
+- Bounding-box masks are rendered in the same WebGL pass as filled/outlined rectangles in image-normalized coordinates, reusing the same fill/outline colors, opacity controls, stroke width, and selection fill-suppression behavior as point masks.
 - The canvas border color indicates viewer readiness/zoom resolution: yellow while the selected image is not yet ready in the viewer, green when `fitLevel < manifest.levels - 1` (below max tile resolution), and brown when at the finest level. Updated via CSS classes toggled on the canvas element. The yellow debug box-shadow is removed.

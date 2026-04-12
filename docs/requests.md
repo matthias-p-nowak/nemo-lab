@@ -38,9 +38,23 @@
 
 - **Mask rendering controls in Optics panel**: Four sliders — stroke opacity (0–1, default 1.0), fill opacity (0–1, default 0.4), stroke width (1–5 px, default 3 px), marker size (5–30 px, default 10 px). Outline drawn as ring (annulus); fill drawn as solid inner circle. Applied immediately via `applyOpticsToViewer()`, persisted as `mask_stroke_opacity`, `mask_fill_opacity`, `mask_stroke_width`, `mask_marker_size`. Reset by panel-title click. (2026-04-11)
 
+- **Bounding box mask rendering**: Bbox annotations loaded from COCO `bbox` fields are rendered in the WebGL pass as filled rectangles with outlines, using the same fill/outline color, opacity, and selection rules as point masks. Coordinates are image-normalized. (2026-04-12)
+
+- **render() focus preservation**: The `render()` function must save `document.activeElement` before rebuilding the DOM and restore focus to the matching element afterward. If the previously focused element no longer exists after render, focus is not restored. (2026-04-12)
+
+- **Bounding box mask placement**: In `bounding box` mode, pressing the mouse button down and moving at least 10 CSS px begins drawing a new bbox; the rectangle updates live during drag and is finalized on mouse-up (opposite corner). Dragging less than 10 px is ignored. (2026-04-12)
+
+- **Bounding box mask editing**: When exactly one mask is selected and it is a bounding box, dragging across any side of the rectangle (from either direction, inside or outside) moves that side to the pointer release position. Only side movement is supported (no corner resize, no whole-box drag). (2026-04-12)
+
 - **Masks and annotations**: Point masks placed by left-click, removed by shift+left-click (closest within hit radius). Crosshair cursor on image view. Right-click within 10px of a mask opens context menu with recent labels; clicking assigns label to mask. Last assigned label auto-assigned to next mask. Logged to backend over WS (`mask_created`, `mask_removed`, `label_assigned`, `mouse_click`). Persistence deferred. (2026-04-07)
 
+- **Annotation image-switch logging**: On image activation, frontend logs `image_activated` (full filename), `annotations_source` (source file path, annotation count, file format, annotation type summary) for each source file in both per-image and single-file modes, and `annotations_destination` (write target path). If no source file exists, no `annotations_source` is emitted. Annotation mutations (`mask_created`, `mask_removed`, `label_assigned`) are logged on every change. (2026-04-12)
+
+- **Mask mode selector**: A dropdown panel between Labels and Masks in the right sidebar. Modes: `point` (left-click places point mask), `bounding box` (click-drag places rectangle), `freehand` (click-drag records pointer path as polygon). Default: `point`. The active mode controls left-click placement behavior. Selecting an unimplemented mode (`bounding box`, `freehand`) shows an inline error "Mode not yet supported." (2026-04-12)
+
 - **Menu bar restructure**: Left and right sidebar toggles are always-visible fixed buttons. The hamburger + menu items form a middle section that is invisible and `pointer-events: none` when closed (mouse events pass through to canvas). Hamburger moves inside the menu bar middle section. (2026-04-07)
+
+- **Left sidebar restructure**: Left sidebar mirrors right sidebar structure — scrollable content area with top margin to clear the two fixed buttons. Hamburger button is positioned adjacent to the left-sidebar toggle button (both top-left). Left sidebar content scrolls vertically (`overflow-y: auto`). (2026-04-12)
 
 - **GUI cleanup**: Remove `<strong>` label text from both sidebar headers; remove `div.image-view__toolbar` entirely; fix hamburger/left-sidebar-toggle collision by moving hamburger to `left: 52px`. (2026-04-07)
 

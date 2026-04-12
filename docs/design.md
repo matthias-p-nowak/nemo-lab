@@ -386,6 +386,14 @@ Certain UI preferences are persisted per user in the backend and restored on nex
 - Each setting is written via `PUT /api/settings` immediately when it changes in the UI.
 - `theme` is no longer sourced from `nemo.toml`; the server-side default is `light` when no setting exists.
 
+### Focus Preservation in render()
+
+The `render()` function rebuilds the HTML tree, which causes the browser to lose the currently focused element. To prevent this:
+
+- Before rebuilding the DOM, record `document.activeElement` and enough identity to re-focus it after render (e.g. a CSS selector or `id`).
+- After the DOM is rebuilt, locate the matching element and call `.focus()` on it.
+- If no element was focused, or the focused element no longer exists after render, do nothing.
+
 ### GUI Cleanup
 
 - Both sidebar headers (`sidebar--left` and `sidebar--right`) have no label text — the header retains only the toggle button.
@@ -416,15 +424,55 @@ The menu bar is restructured so that sidebar toggle buttons are always visible a
 - `.sidebar__content` has `flex: 1` and `overflow-y: auto` so panels scroll vertically and are never clipped.
 - Each `.panel` expands to its natural content height — no fixed or max height on `.panel` or `.panel__body`.
 
+### Left Sidebar
+
+- Structure mirrors the right sidebar: a scrollable `.sidebar__content` area with a top margin sufficient to clear the two fixed buttons (left-sidebar toggle and hamburger).
+- The hamburger button is positioned adjacent to (next to) the left-sidebar show/hide toggle button, both fixed at the top-left corner.
+- `.sidebar__content` on the left sidebar has `overflow-y: auto` so its panels scroll vertically and are never clipped.
+
+### Mask Mode Selector
+
+A dropdown panel in the right sidebar, placed between the Labels panel and the Masks panel. It shows the currently active mask mode and allows the user to switch between modes.
+
+**Modes:**
+
+| Mode | Description |
+|------|-------------|
+| `point` | Places a single-point mask on left-click |
+| `bounding box` | Places a rectangular mask by click-drag |
+| `freehand` | Places a freehand polygon mask by click-drag |
+
+- Default mode on task load: `point`.
+- The selected mode controls placement behavior for left-click interactions on the canvas.
+- Selecting `bounding box` or `freehand` (not yet implemented) displays an inline error message in the panel: "Mode not yet supported."
+
 ### Masks
 
-A mask is a geometric figure placed on the image canvas. Currently only point masks are supported; rectangle and freehand are future extensions.
+A mask is a geometric figure placed on the image canvas.
 
 - Masks are numbered sequentially (1, 2, 3, …) per image.
 - The image view cursor is a **crosshair** at all times.
-- **Left-click**: places a point mask at the cursor position. Placement is disabled while a mask is selected.
+- Placement behavior depends on the active [mask mode](#mask-mode-selector).
+- **Left-click** (point mode): places a point mask at the cursor position. Placement is disabled while a mask is selected.
+- **Left-click drag** (bounding box mode): defines the rectangle by drag; mask is placed on release.
+- **Left-click drag** (freehand mode): records pointer path as a freehand polygon; mask is placed on release.
 - **Shift+left-click**: removes the closest existing mask (if any within a reasonable hit radius).
 - Masks are rendered in the WebGL pass on top of image tiles — no overlay div.
+- **Bounding box masks** (loaded from COCO `bbox` annotations) are rendered as a filled rectangle with an outline, using the same fill/outline color and opacity rules as point masks. The rectangle is defined in image-normalized coordinates.
+
+#### Bounding box placement (bounding box mode, no mask selected)
+
+- On `pointerdown`: record the start position.
+- If pointer travels ≥ 10 CSS px before `pointerup`: draw and continuously update a live rectangle from start to current position.
+- On `pointerup`: finalize the bbox at the release position (opposite corner from start).
+- If travel < 10 CSS px: ignore (no mask created).
+
+#### Bounding box editing (bounding box mode, one bbox mask selected)
+
+- Only side movement is supported (no corner resize, no whole-box drag).
+- On `pointerdown`: determine which side the pointer is nearest to (if within a reasonable hit distance).
+- Dragging from either direction (inside or outside the box) moves that side.
+- On `pointerup`: side is placed at the release position.
 
 #### Mask selection
 
@@ -569,3 +617,27 @@ Until persistence is implemented, the frontend logs the following events to the 
 | `mouse_click` | button (`left`\|`right`), canvas `x`, `y`, image-normalized `x`, `y` |
 
 > Persistence of masks and annotations to `nemolab.json` or DB is out of scope for this task.
+
+### Annotation Image-Switch Logging
+
+When the active image changes, the frontend logs the following events over WebSocket:
+
+| Event | Payload fields | Description |
+|---|---|---|
+| `image_activated` | `filename` (full path) | Full filename of the newly active image |
+| `annotations_source` | `file` (path), `count` (int), `file_format` (`coco`\|`extended_coco`\|`labelme`), `annotation_types` (summary string) | One entry per source file loaded; emitted for both per-image sidecar and single-file (`nemolab.json`) modes |
+| `annotations_destination` | `file` (path) | Path where new/changed annotations will be written |
+
+- `annotation_types` is a human-readable summary, e.g. `"10 point, 3 bbox"`.
+- If no source file exists for the current image, no `annotations_source` event is emitted.
+- Both per-image mode and single-file mode emit `annotations_source` (source file path differs by mode).
+
+### Annotation Change Logging
+
+The frontend logs every annotation mutation over WebSocket:
+
+| Event | Payload fields |
+|---|---|
+| `mask_created` | image hash, mask index, image-normalized `x`, `y` |
+| `mask_removed` | image hash, mask index |
+| `label_assigned` | image hash, mask index, label name |

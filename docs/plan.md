@@ -12,8 +12,8 @@
 
 ## Frontend
 
+
 ## Backend
 
 # Issues noted during tests
 
-- ~~**Single-file mode: masks from image #1 appear on image #2** — frontend hardcoded `image_id: 1` for all images; fixed to use `currentImageIndex + 1` in both save and load paths.~~ (fixed)

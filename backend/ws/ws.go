@@ -415,21 +415,36 @@ func migrateAnnotationFileIfNeeded(token, path, annotationsDir string, singleFil
 	}
 
 	otherPath := annotationFilePath(annotationsDir, !singleFile, imagePath)
-	if !fileExists(otherPath) {
+	if fileExists(otherPath) {
+		af, err := annotations.ReadAnnotations(otherPath)
+		if err != nil {
+			return fmt.Errorf("read old-mode annotation file %q: %w", otherPath, err)
+		}
+		if err := annotations.WriteAnnotations(path, af); err != nil {
+			return fmt.Errorf("write migrated annotation file %q: %w", path, err)
+		}
+		if err := os.Remove(otherPath); err != nil {
+			return fmt.Errorf("remove old-mode annotation file %q: %w", otherPath, err)
+		}
+		log.Printf("ws annotations migrated token=%s old=%s new=%s", tokenPrefix(token), otherPath, path)
 		return nil
 	}
 
-	af, err := annotations.ReadAnnotations(otherPath)
+	imageDir := filepath.Dir(imagePath)
+	base := filepath.Base(imagePath)
+	stem := strings.TrimSuffix(base, filepath.Ext(base))
+	imageSidecar := filepath.Join(imageDir, stem+".json")
+	if imageSidecar == path || !fileExists(imageSidecar) {
+		return nil
+	}
+	af, err := annotations.ReadAnnotations(imageSidecar)
 	if err != nil {
-		return fmt.Errorf("read old-mode annotation file %q: %w", otherPath, err)
+		return fmt.Errorf("read image-sidecar annotation file %q: %w", imageSidecar, err)
 	}
 	if err := annotations.WriteAnnotations(path, af); err != nil {
-		return fmt.Errorf("write migrated annotation file %q: %w", path, err)
+		return fmt.Errorf("write imported annotation file %q: %w", path, err)
 	}
-	if err := os.Remove(otherPath); err != nil {
-		return fmt.Errorf("remove old-mode annotation file %q: %w", otherPath, err)
-	}
-	log.Printf("ws annotations migrated token=%s old=%s new=%s", tokenPrefix(token), otherPath, path)
+	log.Printf("ws annotations imported token=%s source=%s dest=%s", tokenPrefix(token), imageSidecar, path)
 	return nil
 }
 

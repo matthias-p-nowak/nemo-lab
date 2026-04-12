@@ -119,6 +119,10 @@ body {
   overflow-y: auto;
 }
 
+.sidebar--left .sidebar__content {
+  margin-top: 36px;
+}
+
 .layout.left-collapsed .sidebar--left .sidebar__content,
 .layout.right-collapsed .sidebar--right .sidebar__content {
   display: none;
@@ -201,6 +205,40 @@ button:hover {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+.mask-mode-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mask-mode-panel__select {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg-panel-alt);
+  color: var(--text);
+  padding: 6px 8px;
+  font-size: 0.9rem;
+
+  &:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+}
+
+.mask-mode-panel__hint,
+.mask-mode-panel__error {
+  font-size: 0.8rem;
+}
+
+.mask-mode-panel__hint {
+  color: var(--text-muted);
+}
+
+.mask-mode-panel__error {
+  color: #c13d3d;
 }
 
 .panel[data-panel="optics"] {
@@ -298,7 +336,15 @@ textarea {
 // ── Hamburger ────────────────────────────────────────────────────────────────
 
 .hamburger {
-  position: static;
+  position: fixed;
+  top: 10px;
+  left: 44px;
+  z-index: 220;
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   pointer-events: auto;
   background: none;
   border: none;
