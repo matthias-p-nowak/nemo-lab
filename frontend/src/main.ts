@@ -145,13 +145,14 @@ function handleDocumentMaskMenuEscape(e: KeyboardEvent): void {
     e.preventDefault();
     appState.selectedMaskId = null;
     closeMaskContextMenu();
-    render();
+    updateMaskSelectionUI();
+    updateMaskContextMenuUI();
     return;
   }
   if (!appState.maskContextMenu.open) return;
   e.preventDefault();
   closeMaskContextMenu();
-  render();
+  updateMaskContextMenuUI();
 }
 
 /** Cycles selected mask through index order, including the "none selected" state. */
@@ -165,7 +166,7 @@ function cycleSelectedMask(step: 1 | -1): void {
   const currentPos = Math.max(0, cycle.indexOf(appState.selectedMaskId));
   const nextPos = (currentPos + step + cycle.length) % cycle.length;
   appState.selectedMaskId = cycle[nextPos];
-  render();
+  updateMaskSelectionUI();
 }
 
 /** Handles global ArrowUp/ArrowDown for mask selection cycling. */
@@ -1422,6 +1423,14 @@ function updateMaskModePanelUI(): void {
   bindMaskModePanelHandlers();
 }
 
+/** Updates only the optics panel body DOM without remounting the viewer. */
+function updateOpticsPanelUI(): void {
+  const panelBody = appRoot.querySelector<HTMLElement>('[data-panel="optics"] .panel__body');
+  if (!panelBody) return;
+  panelBody.innerHTML = renderOpticsBody();
+  bindOpticsPanelHandlers();
+}
+
 /** Re-renders annotation panel body and redraws WebGL annotations only. */
 function updateAnnotationUI(): void {
   const annotationsPanelBody = appRoot.querySelector<HTMLElement>(
@@ -1431,6 +1440,12 @@ function updateAnnotationUI(): void {
     annotationsPanelBody.innerHTML = renderAnnotationList();
     bindAnnotationPanelHandlers();
   }
+  viewer?.draw();
+}
+
+/** Refreshes selection-dependent annotation visuals without full app re-render. */
+function updateMaskSelectionUI(): void {
+  updateAnnotationUI();
   viewer?.draw();
 }
 
@@ -1673,7 +1688,7 @@ function bindOpticsPanelHandlers(): void {
       };
       applyOpticsToViewer();
       persistOpticsSettingsLater();
-      render();
+      updateOpticsPanelUI();
     });
 }
 
@@ -1703,7 +1718,7 @@ function cycleOpticsTransform(step: 1 | -1): void {
   appState.optics.flipV = nextState.flipV;
   applyOpticsToViewer();
   persistOpticsSettingsLater();
-  render();
+  updateOpticsPanelUI();
 }
 
 /** Resolves level dimensions from the full-size manifest dimensions. */
@@ -3400,7 +3415,8 @@ function mountViewer(): void {
     (maskId) => {
       appState.selectedMaskId = maskId;
       closeMaskContextMenu();
-      render();
+      updateMaskSelectionUI();
+      updateMaskContextMenuUI();
     }
   );
 
