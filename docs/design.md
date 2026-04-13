@@ -455,7 +455,8 @@ A dropdown panel in the right sidebar, placed between the Labels panel and the M
 
 - Default mode on task load: `point`.
 - The selected mode controls placement behavior for left-click interactions on the canvas.
-- Selecting `bounding box` or `freehand` (not yet implemented) displays an inline error message in the panel: "Mode not yet supported."
+- Selecting `bounding box` (not yet implemented) displays an inline error message in the panel: "Mode not yet supported."
+- Freehand mode is fully implemented; see [Freehand mask drawing](#freehand-mask-drawing).
 
 ### Masks
 
@@ -464,7 +465,7 @@ A mask is a geometric figure placed on the image canvas.
 - Masks are numbered sequentially (1, 2, 3, …) per image.
 - The image view cursor is a **crosshair** at all times.
 - Placement behavior depends on the active [mask mode](#mask-mode-selector).
-- **Left-click** (point mode): places a point mask at the cursor position. Placement is disabled while a mask is selected.
+- **Left-click** (point mode): places a point mask at the cursor position. Placement is disabled while a mask is selected, and also suppressed when the click lands on an existing mask (to avoid creating a mask on the first click of a double-click).
 - **Left-click drag** (bounding box mode): defines the rectangle by drag; mask is placed on release.
 - **Left-click drag** (freehand mode): records pointer path as a freehand polygon; mask is placed on release.
 - **Shift+left-click**: removes the closest existing mask (if any within a reasonable hit radius).
@@ -485,11 +486,49 @@ A mask is a geometric figure placed on the image canvas.
 - Dragging from either direction (inside or outside the box) moves that side.
 - On `pointerup`: side is placed at the release position.
 
+#### Freehand mask drawing
+
+Geometry library: **Shapely** (`LineString`, `Polygon`, `unary_union`, `polygonize`, `split`, `simplify`).
+Reference implementation: `~/projects/ai-code/annotrix/wt/dev0/tmp/freehand_trial.py`
+
+**Stroke capture (during drag)**
+- On pointer down: begin collecting stroke points.
+- On pointer move: append a point only if Euclidean distance from the last sampled point ≥ `min_sample_distance_px` (default 3 px, configurable). Draw a live red preview line.
+- Stroke shorter than `min_sample_distance_px` after sampling → no-op.
+
+**On release: classify stroke**
+
+Convert sampled points to a Shapely `LineString`, then branch on `stroke.is_simple`:
+
+*A. Self-intersecting stroke → create new loop*
+1. `merged = unary_union(stroke)` — splits the line at self-intersection points.
+2. Count resulting segments. If > `max_self_intersection_segments` (default 3) → reject (no-op).
+3. `loops = polygonize(merged)` — extract enclosed polygons. If none → no-op.
+4. Keep the largest-area loop.
+5. Apply `simplify(tolerance, preserve_topology=True)` (default tolerance 0.5 px).
+6. Append to mask list.
+
+*B. Simple (non-self-intersecting) stroke → edit existing loop*
+
+Near-endpoint closure rule: if the stroke endpoint is < `closure_distance_px` (default 10 px) from the start, close the stroke and treat it as a new loop via path A.
+
+For editing an existing loop:
+1. For each loop compute **overlap score** = `outline.intersection(stroke)`: nonzero length → score = length; point-only intersection → score = point count; zero → skip.
+2. Select loop with highest score. Tie-break: larger area; then stable lowest index.
+3. **Split/rejoin**: split the loop outline at the stroke and the stroke at the outline (need ≥ 3 parts each, else no-op). Try all combinations of kept outline parts + stroke part; `polygonize` each; keep the largest valid resulting polygon. Apply simplification.
+4. No valid candidate → no-op.
+
+**Rendering**
+- Live stroke preview: red outline.
+- Finalized freehand masks: rendered with the standard fill/outline color and opacity rules (same as point and bbox masks).
+
 #### Mask selection
 
 - **Double-click** on a mask selects it. Only one mask can be selected at a time.
 - **Escape** cancels the current selection (returns to no mask selected).
 - **Arrow up / Arrow down** cycle through masks in index order; the cycle includes a "none selected" state.
+- **Delete** key (when a mask is selected) removes the selected mask.
+- **Clicking an annotation row** in the Annotations panel selects that mask.
 
 #### Mask and label colors
 
@@ -546,6 +585,13 @@ The label panel in the right sidebar (read-only view) doubles as a label selecto
 ### Annotations
 
 An annotation is the assignment of a label to a mask.
+
+#### Annotations panel selection indicator
+
+- The Annotations panel in the right sidebar lists all masks for the current image.
+- The row corresponding to the currently selected mask is visually highlighted (e.g. distinct background or border).
+- When no mask is selected, no row is highlighted.
+- Selecting a mask (via double-click or Arrow up/down) scrolls its row into view in the panel.
 
 - **Right-click** within 10 CSS px of a mask opens a context menu:
   - Lists recently used labels, most recent on top.

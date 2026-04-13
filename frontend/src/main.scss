@@ -280,6 +280,17 @@ button:hover {
   overflow: auto;
 }
 
+.annotation-list__item {
+  padding: 2px 4px;
+  border-radius: 4px;
+  outline: 1px solid transparent;
+
+  &.is-selected {
+    outline-color: var(--accent);
+    background: rgba(109, 211, 255, 0.08);
+  }
+}
+
 .mask-label-chip {
   display: inline-block;
   margin: 0 6px;

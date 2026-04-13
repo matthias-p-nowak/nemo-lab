@@ -4,6 +4,14 @@ const config = {
   clickMaxDragPx: 10,
   /** Maximum pointer-to-edge distance (CSS px) for bbox side-edit hit-testing. */
   bboxSideHitPx: 10,
+  /** Minimum sample spacing for freehand stroke points in CSS pixels. */
+  freehandMinSamplePx: 3,
+  /** Endpoint distance threshold (CSS px) to auto-close freehand stroke. */
+  freehandClosureDistancePx: 10,
+  /** Simplification tolerance for freehand polygons in source image pixels. */
+  freehandSimplifyTolerance: 0.5,
+  /** Reject self-intersecting freehand strokes above this complexity. */
+  freehandMaxSelfIntersectionSegments: 3,
 };
 
 /** Applies a theme by setting data-theme on <html>. */
@@ -155,6 +163,17 @@ function handleDocumentMaskMenuEscape(e: KeyboardEvent): void {
   updateMaskContextMenuUI();
 }
 
+/** Handles Delete for removing currently selected mask (guarded, global listener). */
+function handleDocumentSelectedMaskDeleteKeydown(e: KeyboardEvent): void {
+  if (e.key !== "Delete") return;
+  if (isEditableKeyTarget(e.target)) return;
+  if (appState.selectedMaskId === null) return;
+  e.preventDefault();
+  removeMask(appState.selectedMaskId);
+  appState.selectedMaskId = null;
+  updateMaskSelectionUI();
+}
+
 /** Cycles selected mask through index order, including the "none selected" state. */
 function cycleSelectedMask(step: 1 | -1): void {
   const orderedMaskIds = appState.masks
@@ -180,6 +199,7 @@ function handleDocumentMaskSelectionCycleKeydown(e: KeyboardEvent): void {
 
 document.addEventListener("keydown", handleDocumentPageCycleKeydown);
 document.addEventListener("keydown", handleDocumentMaskMenuEscape);
+document.addEventListener("keydown", handleDocumentSelectedMaskDeleteKeydown);
 document.addEventListener("keydown", handleDocumentMaskSelectionCycleKeydown);
 
 /** Mutable prototype application state. */
@@ -203,6 +223,8 @@ const appState = {
   masks: [] as MaskPoint[],
   /** Live bbox preview mask shown only while dragging in bbox mode. */
   draftBboxMask: null as MaskPoint | null,
+  /** Live freehand stroke preview points shown only while dragging in freehand mode. */
+  draftFreehandStroke: null as DraftFreehandStroke | null,
   /** Currently selected mask id, or null when no mask is selected. */
   selectedMaskId: null as string | null,
   /** Recently assigned labels, most recent first. */
@@ -475,14 +497,14 @@ interface BackendMe {
   is_admin: boolean;
 }
 
-/** Minimal point/bbox mask model for the current image. */
+/** Minimal point/bbox/freehand mask model for the current image. */
 interface MaskPoint {
   /** Stable mask identifier. */
   id: string;
   /** Sequential mask index within the current image. */
   index: number;
   /** Geometry kind represented by this mask. */
-  kind: "point" | "bbox";
+  kind: "point" | "bbox" | "freehand";
   /** X coordinate in normalized image space (0..1). */
   x: number;
   /** Y coordinate in normalized image space (0..1). */
@@ -491,6 +513,8 @@ interface MaskPoint {
   w?: number;
   /** Bbox height in normalized image space (0..1), for kind=bbox. */
   h?: number;
+  /** Freehand polygon points in normalized image space (0..1), for kind=freehand. */
+  points?: Array<{ x: number; y: number }>;
   /** Optional assigned label name. */
   labelName: string | null;
 }
@@ -601,6 +625,17 @@ interface MaskCanvasBboxSideDrag {
   imageX: number;
   /** Source image-normalized Y coordinate. */
   imageY: number;
+}
+
+interface FreehandSample {
+  canvasX: number;
+  canvasY: number;
+  imageX: number;
+  imageY: number;
+}
+
+interface DraftFreehandStroke {
+  points: FreehandSample[];
 }
 
 /** Main app container. */
@@ -822,6 +857,12 @@ function sendSaveAnnotations(): void {
             Math.max(0, (mask.h ?? 0) * height),
           ],
         }
+      : mask.kind === "freehand" && Array.isArray(mask.points) && mask.points.length >= 3
+      ? {
+          segmentation: [
+            mask.points.flatMap((point) => [point.x * width, point.y * height]),
+          ],
+        }
       : {
           keypoints: [mask.x * width, mask.y * height, 2],
           num_keypoints: 1,
@@ -862,6 +903,8 @@ function goPreviousImage(): void {
   appState.annotationImageWidth = 1;
   appState.annotationImageHeight = 1;
   appState.masks = [];
+  appState.draftBboxMask = null;
+  appState.draftFreehandStroke = null;
   appState.selectedMaskId = null;
   appState.maskContextMenu.open = false;
   const current = getCurrentImageEntry();
@@ -885,6 +928,8 @@ function goNextImage(): void {
   appState.annotationImageWidth = 1;
   appState.annotationImageHeight = 1;
   appState.masks = [];
+  appState.draftBboxMask = null;
+  appState.draftFreehandStroke = null;
   appState.selectedMaskId = null;
   appState.maskContextMenu.open = false;
   const current = getCurrentImageEntry();
@@ -920,6 +965,8 @@ ws.addEventListener("message", (event) => {
     appState.annotationImageWidth = 1;
     appState.annotationImageHeight = 1;
     appState.masks = [];
+    appState.draftBboxMask = null;
+    appState.draftFreehandStroke = null;
     appState.selectedMaskId = null;
     appState.maskContextMenu.open = false;
     updateImageStateUI();
@@ -943,6 +990,8 @@ ws.addEventListener("message", (event) => {
       appState.annotationImageWidth = 1;
       appState.annotationImageHeight = 1;
       appState.masks = [];
+      appState.draftBboxMask = null;
+      appState.draftFreehandStroke = null;
       appState.selectedMaskId = null;
       appState.maskContextMenu.open = false;
       appState.pendingActivationLogHash = hash;
@@ -987,6 +1036,33 @@ ws.addEventListener("message", (event) => {
     payload.annotations.forEach((ann) => {
       if (!ann || typeof ann !== "object") return;
       if (ann.image_id !== currentImageID) return;
+      const segmentation = Array.isArray(ann.segmentation) ? ann.segmentation : [];
+      const firstPolygon = Array.isArray(segmentation[0]) ? segmentation[0] : null;
+      if (firstPolygon && firstPolygon.length >= 6) {
+        const points: Array<{ x: number; y: number }> = [];
+        for (let i = 0; i + 1 < firstPolygon.length; i += 2) {
+          const px = typeof firstPolygon[i] === "number" ? firstPolygon[i] : NaN;
+          const py = typeof firstPolygon[i + 1] === "number" ? firstPolygon[i + 1] : NaN;
+          if (!Number.isFinite(px) || !Number.isFinite(py)) continue;
+          points.push({
+            x: Math.max(0, Math.min(1, px / width)),
+            y: Math.max(0, Math.min(1, py / height)),
+          });
+        }
+        const deduped = dedupeConsecutivePoints(points, 1e-6);
+        if (deduped.length >= 3) {
+          masks.push({
+            id: String(ann.id),
+            index: masks.length + 1,
+            kind: "freehand",
+            x: deduped[0].x,
+            y: deduped[0].y,
+            points: deduped.map((point) => ({ x: point.x, y: point.y })),
+            labelName: typeof ann.category_id === "number" ? (categoryNameByID.get(ann.category_id) ?? null) : null,
+          });
+          return;
+        }
+      }
       const bbox = Array.isArray(ann.bbox) ? ann.bbox : [];
       const bx = typeof bbox[0] === "number" ? bbox[0] : NaN;
       const by = typeof bbox[1] === "number" ? bbox[1] : NaN;
@@ -1037,6 +1113,8 @@ ws.addEventListener("message", (event) => {
       });
     });
     appState.masks = masks;
+    appState.draftBboxMask = null;
+    appState.draftFreehandStroke = null;
     appState.selectedMaskId = null;
     closeMaskContextMenu();
     updateAnnotationUI();
@@ -1343,6 +1421,505 @@ function addBboxMask(x0: number, y0: number, x1: number, y1: number): void {
   updateAnnotationUI();
 }
 
+interface GeometryPoint {
+  x: number;
+  y: number;
+}
+
+interface SegmentIntersection {
+  point: GeometryPoint;
+  tA: number;
+  tB: number;
+}
+
+interface StrokeSelfIntersection extends SegmentIntersection {
+  segA: number;
+  segB: number;
+}
+
+/** Returns Euclidean distance in pixels between two points. */
+function distancePx(a: GeometryPoint, b: GeometryPoint): number {
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+/** Converts a normalized image-space point to source pixel coordinates. */
+function normalizedToImagePx(point: GeometryPoint): GeometryPoint {
+  return {
+    x: point.x * Math.max(1, appState.annotationImageWidth),
+    y: point.y * Math.max(1, appState.annotationImageHeight),
+  };
+}
+
+/** Converts a source pixel-space point to normalized image coordinates. */
+function imagePxToNormalized(point: GeometryPoint): GeometryPoint {
+  return {
+    x: Math.max(0, Math.min(1, point.x / Math.max(1, appState.annotationImageWidth))),
+    y: Math.max(0, Math.min(1, point.y / Math.max(1, appState.annotationImageHeight))),
+  };
+}
+
+/** Returns absolute polygon area using shoelace formula. */
+function polygonArea(points: GeometryPoint[]): number {
+  if (points.length < 3) return 0;
+  let acc = 0;
+  for (let i = 0; i < points.length; i += 1) {
+    const a = points[i];
+    const b = points[(i + 1) % points.length];
+    acc += a.x * b.y - b.x * a.y;
+  }
+  return Math.abs(acc) * 0.5;
+}
+
+/** Returns canonical point-key string with fixed precision for map/set lookup. */
+function pointKey(point: GeometryPoint, precision = 4): string {
+  return `${point.x.toFixed(precision)},${point.y.toFixed(precision)}`;
+}
+
+/** Removes adjacent duplicates and near-duplicates from point lists. */
+function dedupeConsecutivePoints(points: GeometryPoint[], epsilon = 1e-6): GeometryPoint[] {
+  const out: GeometryPoint[] = [];
+  points.forEach((point) => {
+    const prev = out[out.length - 1];
+    if (prev && distancePx(prev, point) <= epsilon) return;
+    out.push({ x: point.x, y: point.y });
+  });
+  return out;
+}
+
+/** Returns signed triangle area helper for orientation checks. */
+function orient2d(a: GeometryPoint, b: GeometryPoint, c: GeometryPoint): number {
+  return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+}
+
+/** Returns segment-segment intersection with segment-relative t values, or null. */
+function intersectSegments(
+  a0: GeometryPoint,
+  a1: GeometryPoint,
+  b0: GeometryPoint,
+  b1: GeometryPoint,
+  epsilon = 1e-9
+): SegmentIntersection | null {
+  const r = { x: a1.x - a0.x, y: a1.y - a0.y };
+  const s = { x: b1.x - b0.x, y: b1.y - b0.y };
+  const denom = r.x * s.y - r.y * s.x;
+  if (Math.abs(denom) <= epsilon) return null;
+  const qmp = { x: b0.x - a0.x, y: b0.y - a0.y };
+  const t = (qmp.x * s.y - qmp.y * s.x) / denom;
+  const u = (qmp.x * r.y - qmp.y * r.x) / denom;
+  if (t < -epsilon || t > 1 + epsilon || u < -epsilon || u > 1 + epsilon) return null;
+  return {
+    point: { x: a0.x + t * r.x, y: a0.y + t * r.y },
+    tA: t,
+    tB: u,
+  };
+}
+
+/** Finds non-adjacent self intersections in an open stroke polyline. */
+function findStrokeSelfIntersections(points: GeometryPoint[]): StrokeSelfIntersection[] {
+  const intersections: StrokeSelfIntersection[] = [];
+  if (points.length < 4) return intersections;
+  for (let i = 0; i < points.length - 1; i += 1) {
+    for (let j = i + 2; j < points.length - 1; j += 1) {
+      const hit = intersectSegments(points[i], points[i + 1], points[j], points[j + 1]);
+      if (!hit) continue;
+      if (hit.tA <= 1e-6 || hit.tA >= 1 - 1e-6) continue;
+      if (hit.tB <= 1e-6 || hit.tB >= 1 - 1e-6) continue;
+      intersections.push({ ...hit, segA: i, segB: j });
+    }
+  }
+  return intersections;
+}
+
+/** Inserts self-intersection split points into the stroke path in segment order. */
+function buildAugmentedStrokePoints(
+  points: GeometryPoint[],
+  intersections: StrokeSelfIntersection[]
+): GeometryPoint[] {
+  const hitsBySegment = new Map<number, Array<{ t: number; point: GeometryPoint }>>();
+  intersections.forEach((hit) => {
+    const aHits = hitsBySegment.get(hit.segA) ?? [];
+    aHits.push({ t: hit.tA, point: hit.point });
+    hitsBySegment.set(hit.segA, aHits);
+    const bHits = hitsBySegment.get(hit.segB) ?? [];
+    bHits.push({ t: hit.tB, point: hit.point });
+    hitsBySegment.set(hit.segB, bHits);
+  });
+
+  const out: GeometryPoint[] = [];
+  for (let seg = 0; seg < points.length - 1; seg += 1) {
+    if (seg === 0) out.push(points[0]);
+    const hits = (hitsBySegment.get(seg) ?? []).sort((a, b) => a.t - b.t);
+    hits.forEach((hit) => out.push(hit.point));
+    out.push(points[seg + 1]);
+  }
+  return dedupeConsecutivePoints(out, 1e-4);
+}
+
+/** Simplifies an open polyline with Douglas-Peucker in source pixel space. */
+function simplifyPolyline(points: GeometryPoint[], epsilon: number): GeometryPoint[] {
+  if (points.length <= 2) return points.slice();
+  let bestDist = 0;
+  let bestIndex = -1;
+  const a = points[0];
+  const b = points[points.length - 1];
+  const abx = b.x - a.x;
+  const aby = b.y - a.y;
+  const ab2 = abx * abx + aby * aby;
+  for (let i = 1; i < points.length - 1; i += 1) {
+    const p = points[i];
+    let dist = 0;
+    if (ab2 <= 1e-12) {
+      dist = distancePx(a, p);
+    } else {
+      const t = Math.max(0, Math.min(1, ((p.x - a.x) * abx + (p.y - a.y) * aby) / ab2));
+      const proj = { x: a.x + t * abx, y: a.y + t * aby };
+      dist = distancePx(p, proj);
+    }
+    if (dist > bestDist) {
+      bestDist = dist;
+      bestIndex = i;
+    }
+  }
+  if (bestDist <= epsilon || bestIndex < 0) return [a, b];
+  const left = simplifyPolyline(points.slice(0, bestIndex + 1), epsilon);
+  const right = simplifyPolyline(points.slice(bestIndex), epsilon);
+  return [...left.slice(0, -1), ...right];
+}
+
+/** Simplifies a closed polygon ring and returns open vertices (first not repeated). */
+function simplifyClosedPolygon(points: GeometryPoint[], epsilon: number): GeometryPoint[] {
+  const ring = dedupeConsecutivePoints(points);
+  if (ring.length < 3) return [];
+  const closed = [...ring, ring[0]];
+  const simplified = simplifyPolyline(closed, epsilon);
+  const open = dedupeConsecutivePoints(simplified.slice(0, -1));
+  if (open.length < 3) return [];
+  return open;
+}
+
+/** Extracts the largest enclosed loop from a self-intersecting stroke path. */
+function extractLargestLoopFromSelfIntersectingStroke(strokePx: GeometryPoint[]): GeometryPoint[] | null {
+  const intersections = findStrokeSelfIntersections(strokePx);
+  const segmentCount = intersections.length + 1;
+  if (segmentCount > config.freehandMaxSelfIntersectionSegments) return null;
+  const augmented = buildAugmentedStrokePoints(strokePx, intersections);
+  const indicesByKey = new Map<string, number[]>();
+  augmented.forEach((point, index) => {
+    const key = pointKey(point, 3);
+    const arr = indicesByKey.get(key) ?? [];
+    arr.push(index);
+    indicesByKey.set(key, arr);
+  });
+
+  let best: GeometryPoint[] | null = null;
+  let bestArea = 0;
+  indicesByKey.forEach((indices) => {
+    if (indices.length < 2) return;
+    for (let a = 0; a < indices.length - 1; a += 1) {
+      for (let b = a + 1; b < indices.length; b += 1) {
+        const i = indices[a];
+        const j = indices[b];
+        if (j - i < 2) continue;
+        const loop = dedupeConsecutivePoints(augmented.slice(i, j + 1), 1e-4);
+        if (loop.length < 3) continue;
+        const simplified = simplifyClosedPolygon(loop, config.freehandSimplifyTolerance);
+        const area = polygonArea(simplified);
+        if (area <= 0) continue;
+        if (area > bestArea) {
+          bestArea = area;
+          best = simplified;
+        }
+      }
+    }
+  });
+  return best;
+}
+
+/** Finds stroke/polygon-edge intersections with stroke-order metadata. */
+function findStrokePolygonIntersections(
+  strokePx: GeometryPoint[],
+  polygonPx: GeometryPoint[]
+): Array<{ point: GeometryPoint; strokeSeg: number; strokeT: number; polyEdge: number; polyT: number }> {
+  const out: Array<{ point: GeometryPoint; strokeSeg: number; strokeT: number; polyEdge: number; polyT: number }> = [];
+  const n = polygonPx.length;
+  for (let s = 0; s < strokePx.length - 1; s += 1) {
+    for (let e = 0; e < n; e += 1) {
+      const hit = intersectSegments(
+        strokePx[s],
+        strokePx[s + 1],
+        polygonPx[e],
+        polygonPx[(e + 1) % n]
+      );
+      if (!hit) continue;
+      out.push({
+        point: hit.point,
+        strokeSeg: s,
+        strokeT: hit.tA,
+        polyEdge: e,
+        polyT: hit.tB,
+      });
+    }
+  }
+  out.sort((a, b) => (a.strokeSeg - b.strokeSeg) || (a.strokeT - b.strokeT));
+  const deduped: typeof out = [];
+  out.forEach((entry) => {
+    const prev = deduped[deduped.length - 1];
+    if (prev && distancePx(prev.point, entry.point) < 1e-4) return;
+    deduped.push(entry);
+  });
+  return deduped;
+}
+
+/** Returns overlap score between a stroke and polygon outline for loop selection. */
+function strokePolygonOverlapScore(strokePx: GeometryPoint[], polygonPx: GeometryPoint[]): number {
+  const hits = findStrokePolygonIntersections(strokePx, polygonPx);
+  return hits.length;
+}
+
+/** Returns stroke subpath between two intersection samples, inclusive of endpoints. */
+function strokeSliceBetween(
+  strokePx: GeometryPoint[],
+  start: { point: GeometryPoint; strokeSeg: number },
+  end: { point: GeometryPoint; strokeSeg: number }
+): GeometryPoint[] {
+  const out: GeometryPoint[] = [{ x: start.point.x, y: start.point.y }];
+  for (let seg = start.strokeSeg + 1; seg <= end.strokeSeg; seg += 1) {
+    out.push(strokePx[seg]);
+  }
+  out.push({ x: end.point.x, y: end.point.y });
+  return dedupeConsecutivePoints(out, 1e-4);
+}
+
+/** Returns polygon boundary path from start edge-point to end edge-point in chosen direction. */
+function polygonBoundaryPathBetween(
+  polygonPx: GeometryPoint[],
+  startEdge: number,
+  startPoint: GeometryPoint,
+  endEdge: number,
+  endPoint: GeometryPoint,
+  forward: boolean
+): GeometryPoint[] {
+  const n = polygonPx.length;
+  const out: GeometryPoint[] = [{ x: startPoint.x, y: startPoint.y }];
+  if (forward) {
+    let edge = startEdge;
+    while (edge !== endEdge) {
+      out.push(polygonPx[(edge + 1) % n]);
+      edge = (edge + 1) % n;
+    }
+  } else {
+    let edge = startEdge;
+    while (edge !== endEdge) {
+      out.push(polygonPx[edge]);
+      edge = (edge - 1 + n) % n;
+    }
+  }
+  out.push({ x: endPoint.x, y: endPoint.y });
+  return dedupeConsecutivePoints(out, 1e-4);
+}
+
+/** Picks the largest valid polygon candidate after split/rejoin edit. */
+function chooseLargestPolygonCandidate(candidates: GeometryPoint[][]): GeometryPoint[] | null {
+  let best: GeometryPoint[] | null = null;
+  let bestArea = 0;
+  candidates.forEach((candidate) => {
+    const simplified = simplifyClosedPolygon(candidate, config.freehandSimplifyTolerance);
+    if (simplified.length < 3) return;
+    const area = polygonArea(simplified);
+    if (area <= bestArea) return;
+    bestArea = area;
+    best = simplified;
+  });
+  return best;
+}
+
+/** Triangulates a simple polygon using ear clipping; returns triangle vertex indices. */
+function triangulatePolygon(points: Array<{ x: number; y: number }>): number[] {
+  if (points.length < 3) return [];
+  const areaSigned = points.reduce((acc, point, i) => {
+    const next = points[(i + 1) % points.length];
+    return acc + point.x * next.y - next.x * point.y;
+  }, 0);
+  const ccw = areaSigned >= 0;
+  const indices = points.map((_, i) => i);
+  const triangles: number[] = [];
+
+  const pointInTriangle = (
+    p: { x: number; y: number },
+    a: { x: number; y: number },
+    b: { x: number; y: number },
+    c: { x: number; y: number }
+  ): boolean => {
+    const o1 = orient2d(a, b, p);
+    const o2 = orient2d(b, c, p);
+    const o3 = orient2d(c, a, p);
+    if (ccw) return o1 >= -1e-9 && o2 >= -1e-9 && o3 >= -1e-9;
+    return o1 <= 1e-9 && o2 <= 1e-9 && o3 <= 1e-9;
+  };
+
+  const isEar = (idxPos: number): boolean => {
+    const prevIdx = indices[(idxPos - 1 + indices.length) % indices.length];
+    const currIdx = indices[idxPos];
+    const nextIdx = indices[(idxPos + 1) % indices.length];
+    const a = points[prevIdx];
+    const b = points[currIdx];
+    const c = points[nextIdx];
+    const turn = orient2d(a, b, c);
+    if (ccw ? turn <= 1e-9 : turn >= -1e-9) return false;
+    for (let i = 0; i < indices.length; i += 1) {
+      const testIdx = indices[i];
+      if (testIdx === prevIdx || testIdx === currIdx || testIdx === nextIdx) continue;
+      if (pointInTriangle(points[testIdx], a, b, c)) return false;
+    }
+    return true;
+  };
+
+  let guard = 0;
+  while (indices.length > 2 && guard < points.length * points.length) {
+    let clipped = false;
+    for (let i = 0; i < indices.length; i += 1) {
+      if (!isEar(i)) continue;
+      const prevIdx = indices[(i - 1 + indices.length) % indices.length];
+      const currIdx = indices[i];
+      const nextIdx = indices[(i + 1) % indices.length];
+      triangles.push(prevIdx, currIdx, nextIdx);
+      indices.splice(i, 1);
+      clipped = true;
+      break;
+    }
+    if (!clipped) break;
+    guard += 1;
+  }
+  return triangles;
+}
+
+/** Applies freehand split/rejoin editing to one polygon, returning updated polygon pixels or null. */
+function editPolygonWithStroke(strokePx: GeometryPoint[], polygonPx: GeometryPoint[]): GeometryPoint[] | null {
+  const intersections = findStrokePolygonIntersections(strokePx, polygonPx);
+  if (intersections.length < 2) return null;
+  const first = intersections[0];
+  const last = intersections[intersections.length - 1];
+  const strokePart = strokeSliceBetween(strokePx, first, last);
+  if (strokePart.length < 2) return null;
+
+  const forwardBoundary = polygonBoundaryPathBetween(
+    polygonPx,
+    first.polyEdge,
+    first.point,
+    last.polyEdge,
+    last.point,
+    true
+  );
+  const backwardBoundary = polygonBoundaryPathBetween(
+    polygonPx,
+    first.polyEdge,
+    first.point,
+    last.polyEdge,
+    last.point,
+    false
+  );
+  const strokePartReversed = strokePart.slice().reverse();
+  return chooseLargestPolygonCandidate([
+    [...forwardBoundary, ...strokePartReversed],
+    [...backwardBoundary, ...strokePart],
+  ]);
+}
+
+/** Adds a freehand polygon mask from normalized points and applies selected label if available. */
+function addFreehandMask(points: Array<{ x: number; y: number }>): void {
+  if (points.length < 3) return;
+  const nextIndex = appState.masks.reduce((max, mask) => Math.max(max, mask.index), 0) + 1;
+  const defaultLabel = getSelectedLabelName();
+  const mask: MaskPoint = {
+    id: createMaskId(),
+    index: nextIndex,
+    kind: "freehand",
+    x: points[0].x,
+    y: points[0].y,
+    points: points.map((point) => ({ x: point.x, y: point.y })),
+    labelName: defaultLabel,
+  };
+  appState.masks.push(mask);
+  if (appState.currentImageHash) {
+    logEvent("mask_created", {
+      image_hash: appState.currentImageHash,
+      mask_index: mask.index,
+      x: mask.x,
+      y: mask.y,
+    });
+    sendSaveAnnotations();
+  }
+  if (mask.labelName) {
+    assignLabelToMask(mask.id, mask.labelName);
+  }
+  updateAnnotationUI();
+}
+
+/** Applies a new polygon point-set to an existing freehand mask and persists changes. */
+function updateFreehandMask(mask: MaskPoint, points: Array<{ x: number; y: number }>): void {
+  if (mask.kind !== "freehand" || points.length < 3) return;
+  mask.points = points.map((point) => ({ x: point.x, y: point.y }));
+  mask.x = points[0].x;
+  mask.y = points[0].y;
+  if (appState.currentImageHash) {
+    sendSaveAnnotations();
+  }
+  updateAnnotationUI();
+}
+
+/** Finalizes a sampled freehand stroke into either a new loop or an edited existing loop. */
+function finalizeFreehandStroke(samples: FreehandSample[]): void {
+  const sampled = dedupeConsecutivePoints(
+    samples.map((sample) => ({ x: sample.imageX, y: sample.imageY })),
+    1e-6
+  );
+  if (sampled.length < 2) return;
+  const strokePx = sampled.map((point) => normalizedToImagePx(point));
+  const isNearClosure =
+    distancePx(
+      { x: samples[0].canvasX, y: samples[0].canvasY },
+      { x: samples[samples.length - 1].canvasX, y: samples[samples.length - 1].canvasY }
+    ) < config.freehandClosureDistancePx;
+
+  const selfIntersections = findStrokeSelfIntersections(strokePx);
+  const treatAsNewLoop = selfIntersections.length > 0 || isNearClosure;
+  if (treatAsNewLoop) {
+    const closedStroke = isNearClosure ? [...strokePx, strokePx[0]] : strokePx;
+    const loopPx =
+      selfIntersections.length > 0
+        ? extractLargestLoopFromSelfIntersectingStroke(closedStroke)
+        : simplifyClosedPolygon(closedStroke, config.freehandSimplifyTolerance);
+    if (!loopPx || loopPx.length < 3) return;
+    const points = loopPx.map((point) => imagePxToNormalized(point));
+    addFreehandMask(points);
+    return;
+  }
+
+  const freehandMasks = appState.masks.filter((mask) => mask.kind === "freehand" && Array.isArray(mask.points) && (mask.points?.length ?? 0) >= 3);
+  if (freehandMasks.length === 0) return;
+  const ranked = freehandMasks
+    .map((mask) => {
+      const polygonPx = (mask.points ?? []).map((point) => normalizedToImagePx(point));
+      return {
+        mask,
+        polygonPx,
+        score: strokePolygonOverlapScore(strokePx, polygonPx),
+        area: polygonArea(polygonPx),
+      };
+    })
+    .filter((item) => item.score > 0)
+    .sort((a, b) => (b.score - a.score) || (b.area - a.area) || (a.mask.index - b.mask.index));
+  if (ranked.length === 0) return;
+
+  const target = ranked[0];
+  const editedPx = editPolygonWithStroke(strokePx, target.polygonPx);
+  if (!editedPx || editedPx.length < 3) return;
+  const normalized = editedPx.map((point) => imagePxToNormalized(point));
+  updateFreehandMask(target.mask, normalized);
+}
+
 /** Removes one mask by id and emits logging. */
 function removeMask(maskId: string): void {
   const idx = appState.masks.findIndex((mask) => mask.id === maskId);
@@ -1369,6 +1946,7 @@ function removeMask(maskId: string): void {
 function clearMasks(): void {
   appState.masks = [];
   appState.draftBboxMask = null;
+  appState.draftFreehandStroke = null;
   appState.selectedMaskId = null;
   appState.maskContextMenu.open = false;
   appState.maskContextMenu.maskId = null;
@@ -1520,6 +2098,18 @@ function bindAnnotationPanelHandlers(): void {
       removeMask(id);
     }
   });
+  appRoot.addEventListener("click", (event) => {
+    const target = event.target as Element | null;
+    if (!target) return;
+    if (target.closest('button[data-action="remove-mask"]')) return;
+    const row = target.closest<HTMLElement>('.annotation-list__item[data-mask-id]');
+    if (!row || !appRoot.contains(row)) return;
+    const maskId = row.getAttribute("data-mask-id");
+    if (!maskId) return;
+    appState.selectedMaskId = maskId;
+    closeMaskContextMenu();
+    updateMaskSelectionUI();
+  });
 }
 
 /** Binds mask mode dropdown change behavior. */
@@ -1531,14 +2121,16 @@ function bindMaskModePanelHandlers(): void {
     const select = target?.closest<HTMLSelectElement>('select[data-action="set-mask-mode"]');
     if (!select || !appRoot.contains(select)) return;
     const selected = select.value as MaskMode;
-    if (selected === "point" || selected === "bounding box") {
+    if (selected === "point" || selected === "bounding box" || selected === "freehand") {
       appState.maskMode = selected;
       appState.maskModeError = null;
       appState.draftBboxMask = null;
+      appState.draftFreehandStroke = null;
     } else {
-      appState.maskModeError = "Mode not yet supported.";
+      appState.maskModeError = null;
       appState.maskMode = "point";
       appState.draftBboxMask = null;
+      appState.draftFreehandStroke = null;
     }
     updateMaskModePanelUI();
     viewer?.draw();
@@ -1820,6 +2412,8 @@ class WebGLTileViewer {
   private readonly onMaskCanvasBboxSideDrag: (payload: MaskCanvasBboxSideDrag) => void;
   /** Callback for selecting a mask by double-click hit-testing. */
   private readonly onMaskCanvasDoubleClick: (maskId: string) => void;
+  /** Access to current freehand draft stroke preview points. */
+  private readonly getDraftFreehandStroke: () => DraftFreehandStroke | null;
 
   /** Manifest for current image. */
   private manifest: TileManifest | null = null;
@@ -1947,7 +2541,8 @@ class WebGLTileViewer {
     onMaskCanvasDrag: (payload: MaskCanvasDrag) => void,
     getEditableBboxMask: () => MaskPoint | null,
     onMaskCanvasBboxSideDrag: (payload: MaskCanvasBboxSideDrag) => void,
-    onMaskCanvasDoubleClick: (maskId: string) => void
+    onMaskCanvasDoubleClick: (maskId: string) => void,
+    getDraftFreehandStroke: () => DraftFreehandStroke | null
   ) {
     this.canvas = canvas;
     this.getMasks = getMasks;
@@ -1958,6 +2553,7 @@ class WebGLTileViewer {
     this.getEditableBboxMask = getEditableBboxMask;
     this.onMaskCanvasBboxSideDrag = onMaskCanvasBboxSideDrag;
     this.onMaskCanvasDoubleClick = onMaskCanvasDoubleClick;
+    this.getDraftFreehandStroke = getDraftFreehandStroke;
 
     const gl = canvas.getContext("webgl", { alpha: false, antialias: true });
     if (!gl) {
@@ -2562,10 +3158,11 @@ class WebGLTileViewer {
     return { x, y, width, height };
   }
 
-/** Draws normalized masks (point + bbox) over image content. */
+/** Draws normalized masks (point + bbox + freehand) over image content. */
   private drawAnnotations(): void {
     const masks = this.getMasks().slice().sort((a, b) => a.index - b.index);
-    if (masks.length === 0) {
+    const draftFreehand = this.getDraftFreehandStroke();
+    if (masks.length === 0 && (!draftFreehand || draftFreehand.points.length < 2)) {
       return;
     }
 
@@ -2584,6 +3181,14 @@ class WebGLTileViewer {
     const ringThreshold = ringInnerRadius * ringInnerRadius;
     const rectStrokeX = this.baseTransform.width > 0 ? strokeWidth / this.baseTransform.width : 0;
     const rectStrokeY = this.baseTransform.height > 0 ? strokeWidth / this.baseTransform.height : 0;
+    const sourceToNdc = (xNorm: number, yNorm: number): [number, number] => {
+      const x = this.baseTransform.x + xNorm * this.baseTransform.width;
+      const y = this.baseTransform.y + yNorm * this.baseTransform.height;
+      return [
+        (x / this.canvas.clientWidth) * 2 - 1,
+        1 - (y / this.canvas.clientHeight) * 2,
+      ];
+    };
 
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
@@ -2621,6 +3226,52 @@ class WebGLTileViewer {
     };
     let pointProgramActive = false;
     let rectProgramActive = false;
+    const ensureRectProgram = (): void => {
+      if (rectProgramActive) return;
+      setupRectProgram();
+      rectProgramActive = true;
+      pointProgramActive = false;
+    };
+    const drawPolylineNormalized = (
+      points: Array<{ x: number; y: number }>,
+      color: [number, number, number],
+      alpha: number,
+      closed: boolean
+    ): void => {
+      if (alpha <= 0 || points.length < 2) return;
+      ensureRectProgram();
+      const coords: number[] = [];
+      points.forEach((point) => {
+        const [nx, ny] = sourceToNdc(point.x, point.y);
+        coords.push(nx, ny);
+      });
+      if (closed) {
+        const [nx, ny] = sourceToNdc(points[0].x, points[0].y);
+        coords.push(nx, ny);
+      }
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(coords), gl.STREAM_DRAW);
+      gl.uniform4f(this.rectColorUniform, color[0], color[1], color[2], alpha);
+      gl.lineWidth(strokeWidth);
+      gl.drawArrays(gl.LINE_STRIP, 0, coords.length / 2);
+    };
+    const drawFilledPolygonNormalized = (
+      points: Array<{ x: number; y: number }>,
+      color: [number, number, number],
+      alpha: number
+    ): void => {
+      if (alpha <= 0 || points.length < 3) return;
+      const triangles = triangulatePolygon(points);
+      if (triangles.length < 3) return;
+      ensureRectProgram();
+      const coords: number[] = [];
+      triangles.forEach((idx) => {
+        const [nx, ny] = sourceToNdc(points[idx].x, points[idx].y);
+        coords.push(nx, ny);
+      });
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(coords), gl.STREAM_DRAW);
+      gl.uniform4f(this.rectColorUniform, color[0], color[1], color[2], alpha);
+      gl.drawArrays(gl.TRIANGLES, 0, coords.length / 2);
+    };
 
     masks.forEach((mask, index) => {
       const fillHex = maskFillColor(index);
@@ -2654,42 +3305,56 @@ class WebGLTileViewer {
         }
         return;
       }
-      if (mask.kind !== "bbox") return;
-      if (!rectProgramActive) {
-        setupRectProgram();
-        rectProgramActive = true;
-        pointProgramActive = false;
-      }
-      const bw = Math.max(0, mask.w ?? 0);
-      const bh = Math.max(0, mask.h ?? 0);
-      const x0 = mask.x;
-      const y0 = mask.y;
-      const x1 = mask.x + bw;
-      const y1 = mask.y + bh;
-      const outlineColor: [number, number, number] = [outlineR, outlineG, outlineB];
-      const insetX = Math.min(rectStrokeX, bw / 2);
-      const insetY = Math.min(rectStrokeY, bh / 2);
-      const topY1 = Math.min(y1, y0 + insetY);
-      const bottomY0 = Math.max(y0, y1 - insetY);
-      const leftX1 = Math.min(x1, x0 + insetX);
-      const rightX0 = Math.max(x0, x1 - insetX);
-      drawRectNormalized(x0, y0, x1, topY1, outlineColor, strokeOpacity);
-      drawRectNormalized(x0, bottomY0, x1, y1, outlineColor, strokeOpacity);
-      drawRectNormalized(x0, topY1, leftX1, bottomY0, outlineColor, strokeOpacity);
-      drawRectNormalized(rightX0, topY1, x1, bottomY0, outlineColor, strokeOpacity);
+      if (mask.kind === "bbox") {
+        if (!rectProgramActive) {
+          setupRectProgram();
+          rectProgramActive = true;
+          pointProgramActive = false;
+        }
+        const bw = Math.max(0, mask.w ?? 0);
+        const bh = Math.max(0, mask.h ?? 0);
+        const x0 = mask.x;
+        const y0 = mask.y;
+        const x1 = mask.x + bw;
+        const y1 = mask.y + bh;
+        const outlineColor: [number, number, number] = [outlineR, outlineG, outlineB];
+        const insetX = Math.min(rectStrokeX, bw / 2);
+        const insetY = Math.min(rectStrokeY, bh / 2);
+        const topY1 = Math.min(y1, y0 + insetY);
+        const bottomY0 = Math.max(y0, y1 - insetY);
+        const leftX1 = Math.min(x1, x0 + insetX);
+        const rightX0 = Math.max(x0, x1 - insetX);
+        drawRectNormalized(x0, y0, x1, topY1, outlineColor, strokeOpacity);
+        drawRectNormalized(x0, bottomY0, x1, y1, outlineColor, strokeOpacity);
+        drawRectNormalized(x0, topY1, leftX1, bottomY0, outlineColor, strokeOpacity);
+        drawRectNormalized(rightX0, topY1, x1, bottomY0, outlineColor, strokeOpacity);
 
+        if (shouldFill) {
+          const [fillR, fillG, fillB] = cssHexToRgb01(fillHex);
+          drawRectNormalized(
+            x0 + insetX,
+            y0 + insetY,
+            x1 - insetX,
+            y1 - insetY,
+            [fillR, fillG, fillB],
+            fillOpacity
+          );
+        }
+        return;
+      }
+      if (mask.kind !== "freehand" || !Array.isArray(mask.points) || mask.points.length < 3) return;
+      const outlineColor: [number, number, number] = [outlineR, outlineG, outlineB];
       if (shouldFill) {
         const [fillR, fillG, fillB] = cssHexToRgb01(fillHex);
-        drawRectNormalized(
-          x0 + insetX,
-          y0 + insetY,
-          x1 - insetX,
-          y1 - insetY,
-          [fillR, fillG, fillB],
-          fillOpacity
-        );
+        drawFilledPolygonNormalized(mask.points, [fillR, fillG, fillB], fillOpacity);
       }
+      drawPolylineNormalized(mask.points, outlineColor, strokeOpacity, true);
     });
+
+    if (draftFreehand && draftFreehand.points.length >= 2) {
+      const previewPoints = draftFreehand.points.map((point) => ({ x: point.imageX, y: point.imageY }));
+      drawPolylineNormalized(previewPoints, [1, 0, 0], 1.0, false);
+    }
 
     gl.disable(gl.BLEND);
   }
@@ -2817,13 +3482,33 @@ class WebGLTileViewer {
         const dx = Math.max(minX - px, 0, px - maxX);
         const dy = Math.max(minY - py, 0, py - maxY);
         distSq = dx * dx + dy * dy;
-      } else {
+      } else if (mask.kind === "point") {
         const display = this.applyForwardTransformToNormalizedPoint(mask.x, mask.y);
         const mx = this.transform.x + display.x * this.transform.width;
         const my = this.transform.y + display.y * this.transform.height;
         const dx = mx - px;
         const dy = my - py;
         distSq = dx * dx + dy * dy;
+      } else if (mask.kind === "freehand" && Array.isArray(mask.points) && mask.points.length >= 2) {
+        const polygonCanvas = mask.points.map((vertex) => {
+          const display = this.applyForwardTransformToNormalizedPoint(vertex.x, vertex.y);
+          return {
+            x: this.transform.x + display.x * this.transform.width,
+            y: this.transform.y + display.y * this.transform.height,
+          };
+        });
+        if (polygonCanvas.length >= 3 && this.isPointInsidePolygon(px, py, polygonCanvas)) {
+          distSq = 0;
+        } else {
+          let bestSegmentDistSq = Number.POSITIVE_INFINITY;
+          for (let i = 0; i < polygonCanvas.length; i += 1) {
+            const a = polygonCanvas[i];
+            const b = polygonCanvas[(i + 1) % polygonCanvas.length];
+            const segDist = this.distancePointToSegment(px, py, a.x, a.y, b.x, b.y);
+            bestSegmentDistSq = Math.min(bestSegmentDistSq, segDist * segDist);
+          }
+          distSq = bestSegmentDistSq;
+        }
       }
       if (distSq > maxDistSq) return;
       if (!best || distSq < best.distSq) {
@@ -2858,6 +3543,21 @@ class WebGLTileViewer {
     const dx = px - cx;
     const dy = py - cy;
     return Math.sqrt(dx * dx + dy * dy);
+  }
+
+  /** Returns true when a canvas-space point lies inside a polygon ring. */
+  private isPointInsidePolygon(px: number, py: number, polygon: Array<{ x: number; y: number }>): boolean {
+    let inside = false;
+    for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i, i += 1) {
+      const xi = polygon[i].x;
+      const yi = polygon[i].y;
+      const xj = polygon[j].x;
+      const yj = polygon[j].y;
+      const intersects = ((yi > py) !== (yj > py)) &&
+        (px < ((xj - xi) * (py - yi)) / ((yj - yi) || 1e-12) + xi);
+      if (intersects) inside = !inside;
+    }
+    return inside;
   }
 
   /** Finds nearest editable bbox source-edge by display-space side hit-testing. */
@@ -3365,6 +4065,7 @@ function mountViewer(): void {
 
   viewer?.destroy();
   let bboxDragStart: { imageX: number; imageY: number } | null = null;
+  let freehandSamples: FreehandSample[] = [];
   viewer = new WebGLTileViewer(
     canvas,
     () => (appState.draftBboxMask ? [...appState.masks, appState.draftBboxMask] : appState.masks),
@@ -3392,7 +4093,10 @@ function mountViewer(): void {
         if (appState.selectedMaskId !== null) {
           return;
         }
-        if (appState.maskMode === "bounding box") {
+        if (appState.maskMode === "bounding box" || appState.maskMode === "freehand") {
+          return;
+        }
+        if (payload.hitMaskId) {
           return;
         }
         addMask(payload.imageX, payload.imageY);
@@ -3408,8 +4112,10 @@ function mountViewer(): void {
       }
       updateMaskContextMenuUI();
     },
-    () => appState.maskMode === "bounding box" && appState.selectedMaskId === null,
-    () => appState.maskMode === "bounding box",
+    () =>
+      (appState.maskMode === "bounding box" || appState.maskMode === "freehand") &&
+      appState.selectedMaskId === null,
+    () => appState.maskMode === "bounding box" || appState.maskMode === "freehand",
     (payload) => {
       if (payload.phase === "start") {
         const hadMenuOpen = appState.maskContextMenu.open;
@@ -3419,10 +4125,45 @@ function mountViewer(): void {
         }
         bboxDragStart = { imageX: payload.imageX, imageY: payload.imageY };
         appState.draftBboxMask = null;
+        freehandSamples = [{
+          canvasX: payload.canvasX,
+          canvasY: payload.canvasY,
+          imageX: payload.imageX,
+          imageY: payload.imageY,
+        }];
+        appState.draftFreehandStroke = appState.maskMode === "freehand" ? { points: freehandSamples.slice() } : null;
         return;
       }
-      if (!bboxDragStart || appState.maskMode !== "bounding box" || appState.selectedMaskId !== null) {
+      if (!bboxDragStart || appState.selectedMaskId !== null) {
         appState.draftBboxMask = null;
+        appState.draftFreehandStroke = null;
+        return;
+      }
+      if (appState.maskMode === "freehand") {
+        const latest = { canvasX: payload.canvasX, canvasY: payload.canvasY, imageX: payload.imageX, imageY: payload.imageY };
+        const prev = freehandSamples[freehandSamples.length - 1];
+        const distFromPrev = !prev
+          ? Number.POSITIVE_INFINITY
+          : Math.hypot(latest.canvasX - prev.canvasX, latest.canvasY - prev.canvasY);
+        if (!prev || distFromPrev >= config.freehandMinSamplePx || payload.phase === "end") {
+          freehandSamples.push(latest);
+        }
+        appState.draftFreehandStroke = { points: freehandSamples.slice() };
+        viewer?.draw();
+        if (payload.phase === "end") {
+          appState.draftFreehandStroke = null;
+          if (freehandSamples.length >= 2) {
+            finalizeFreehandStroke(freehandSamples);
+          }
+          freehandSamples = [];
+          bboxDragStart = null;
+          viewer?.draw();
+        }
+        return;
+      }
+      if (appState.maskMode !== "bounding box") {
+        appState.draftBboxMask = null;
+        appState.draftFreehandStroke = null;
         return;
       }
       if (payload.dragDistance < config.clickMaxDragPx) {
@@ -3485,7 +4226,8 @@ function mountViewer(): void {
       closeMaskContextMenu();
       updateMaskSelectionUI();
       updateMaskContextMenuUI();
-    }
+    },
+    () => appState.draftFreehandStroke
   );
 
   applyOpticsToViewer();
@@ -4508,6 +5250,8 @@ function bindTasksDialogHandlers(): void {
       appState.currentImageIndex = 0;
       appState.currentImageHash = null;
       appState.masks = [];
+      appState.draftBboxMask = null;
+      appState.draftFreehandStroke = null;
       closeMaskContextMenu();
       appState.tasksDialogOpen = false;
       render();

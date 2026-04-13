@@ -32,7 +32,7 @@
 
 - **Default label selection**: Label panel in right sidebar is a selector — clicking a row sets `activeLabelSelectedId` as the default for new masks. On task load, first leaf label is auto-selected. Label assignment via right-click context menu also updates the selection. (2026-04-07)
 
-- **Mask selection**: Double-click selects a mask; Escape cancels selection; Arrow up/down cycle through masks (cycle includes "none selected"). While a mask is selected, left-click placement is disabled (temporary restriction). (2026-04-11)
+- **Mask selection**: Double-click selects a mask; Escape cancels selection; Arrow up/down cycle through masks (cycle includes "none selected"). Delete key removes the selected mask. Clicking an annotation row in the Annotations panel selects that mask. While a mask is selected, left-click placement is disabled (temporary restriction). (2026-04-11, updated 2026-04-13)
 
 - **Mask and label colors**: Two distinct palettes — fill uses mask index with S=0.50 V=0.70 (muted); outline uses label depth-first index with S=0.75 V=0.90 (vivid). Label colors are task-level stable. Default opacity: fill 40%, outline 100%. Unlabeled masks get `#888888` outline. No selection: all masks show fill+outline. With selection: selected mask shows fill+outline, others show outline only. (2026-04-11, updated 2026-04-11)
 
@@ -50,7 +50,9 @@
 
 - **Annotation image-switch logging**: On image activation, frontend logs `image_activated` (full filename), `annotations_source` (source file path, annotation count, file format, annotation type summary) for each source file in both per-image and single-file modes, and `annotations_destination` (write target path). If no source file exists, no `annotations_source` is emitted. Annotation mutations (`mask_created`, `mask_removed`, `label_assigned`) are logged on every change. (2026-04-12)
 
-- **Mask mode selector**: A dropdown panel between Labels and Masks in the right sidebar. Modes: `point` (left-click places point mask), `bounding box` (click-drag places rectangle), `freehand` (click-drag records pointer path as polygon). Default: `point`. The active mode controls left-click placement behavior. Selecting an unimplemented mode (`bounding box`, `freehand`) shows an inline error "Mode not yet supported." (2026-04-12)
+- **Mask mode selector**: A dropdown panel between Labels and Masks in the right sidebar. Modes: `point` (left-click places point mask), `bounding box` (click-drag places rectangle), `freehand` (click-drag records pointer path as polygon). Default: `point`. The active mode controls left-click placement behavior. Selecting `bounding box` (not yet implemented) shows an inline error "Mode not yet supported." Freehand mode is implemented. (2026-04-12, updated 2026-04-13)
+
+- **Freehand mask drawing**: Shapely-based algorithm. Stroke points sampled at ≥3 px intervals. Self-intersecting strokes create a new loop (largest area from `polygonize`; rejected if >3 segments). Simple strokes edit the existing loop with highest stroke/outline overlap score (split/rejoin, keep largest polygon); near-endpoint closure (< 10 px) creates a new loop instead. All results simplified with tolerance 0.5 px. Live red stroke preview during drag. (2026-04-13)
 
 - **Menu bar restructure**: Left and right sidebar toggles are always-visible fixed buttons. The hamburger + menu items form a middle section that is invisible and `pointer-events: none` when closed (mouse events pass through to canvas). Hamburger moves inside the menu bar middle section. (2026-04-07)
 
@@ -65,5 +67,7 @@
 - **Multi-user annotation collaboration**: Backend holds one shared in-memory annotation store keyed by file path. Any user's change is merged per-mask (last write wins per mask id) and broadcast as full `annotations_data` to all other connections viewing the same file. Debounce write timer is per file path (shared). Pending dirty state is flushed on connection close. (2026-04-11)
 
 - **Annotation persistence**: Backend reads plain COCO, extended COCO, and LabelMe (auto-detected by presence of `shapes` key). Reads are fully lenient (missing arrays treated as empty). Backend writes only extended COCO. Polygons are rasterized to COCO-RLE on read and never written as polygons. RLE variant is COCO-RLE (column-major). Extended sidecar keys: `nemolab_labels`, `nemolab_comments`, `nemolab_authors`. Writes are debounced 10 s after last modification. Single-file mode writes to `nemolab.json`; per-image mode writes to `<imagename>.json`. Mode switching migrates only the current image lazily; other images are migrated when next accessed. (2026-04-11)
+
+- **Annotations panel selection indicator**: The Annotations panel highlights the row of the currently selected mask. When no mask is selected, no row is highlighted. Selecting a mask scrolls its row into view in the panel. (2026-04-13)
 
 - **On-demand image list + prefetch tiling**: Backend derives task image lists from `task.images`, computes image hash as SHA-256 of canonical absolute file path, pushes `image_list` over WS, and handles `prefetch`/`image_ready` flow. `/images/{hash}/manifest.json` and `/images/{hash}/tiles/{z}/{x}_{y}.png` are cache-only HTTP reads; tile generation happens via WS prefetch processing. (2026-04-05)
