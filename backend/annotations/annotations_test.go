@@ -78,7 +78,7 @@ func TestReadAnnotations_LenientMissingArrays(t *testing.T) {
 	}
 }
 
-func TestReadAnnotations_LabelMePolygonToRLE(t *testing.T) {
+func TestReadAnnotations_LabelMePolygonPreserved(t *testing.T) {
 	path := writeJSONFixture(t, map[string]any{
 		"imagePath":   "poly.png",
 		"imageWidth":  20,
@@ -99,18 +99,31 @@ func TestReadAnnotations_LabelMePolygonToRLE(t *testing.T) {
 		t.Fatalf("expected one annotation, got %d", len(af.Annotations))
 	}
 	ann := af.Annotations[0]
-	if ann.Area <= 0 {
-		t.Fatalf("expected polygon area > 0, got %f", ann.Area)
-	}
 	if ann.Keypoints != nil && len(ann.Keypoints) > 0 {
 		t.Fatalf("expected no keypoints for polygon, got %#v", ann.Keypoints)
 	}
-	rle, ok := ann.Segmentation.(CocoRLE)
-	if !ok {
-		t.Fatalf("expected segmentation CocoRLE, got %T", ann.Segmentation)
+	seg, ok := ann.Segmentation.([]any)
+	if !ok || len(seg) != 1 {
+		t.Fatalf("expected one polygon component, got %#v", ann.Segmentation)
 	}
-	if len(rle.Size) != 2 || rle.Counts == nil {
-		t.Fatalf("expected non-empty rle fields, got %#v", rle)
+	part, ok := seg[0].([]any)
+	if !ok {
+		t.Fatalf("expected polygon part []any, got %T", seg[0])
+	}
+	got := make([]float64, 0, len(part))
+	for _, v := range part {
+		f, ok := v.(float64)
+		if !ok {
+			t.Fatalf("expected numeric polygon coordinate, got %T", v)
+		}
+		got = append(got, f)
+	}
+	want := []float64{5, 5, 15, 5, 10, 15}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("polygon coords mismatch: got=%v want=%v", got, want)
+	}
+	if ann.Area != 50 {
+		t.Fatalf("expected shoelace area 50, got %f", ann.Area)
 	}
 }
 
@@ -166,7 +179,7 @@ func TestReadAnnotations_LabelMeRectangle(t *testing.T) {
 	}
 }
 
-func TestReadAnnotations_CocoPolygonSegmentationToRLE(t *testing.T) {
+func TestReadAnnotations_CocoPolygonSegmentationPreserved(t *testing.T) {
 	path := writeJSONFixture(t, map[string]any{
 		"images": []any{map[string]any{"id": 1, "file_name": "poly.png", "width": 30, "height": 30}},
 		"annotations": []any{
@@ -188,12 +201,68 @@ func TestReadAnnotations_CocoPolygonSegmentationToRLE(t *testing.T) {
 	if len(af.Annotations) != 1 {
 		t.Fatalf("expected one annotation, got %d", len(af.Annotations))
 	}
-	rle, ok := af.Annotations[0].Segmentation.(CocoRLE)
-	if !ok {
-		t.Fatalf("expected segmentation CocoRLE, got %T", af.Annotations[0].Segmentation)
+	ann := af.Annotations[0]
+	seg, ok := ann.Segmentation.([]any)
+	if !ok || len(seg) != 1 {
+		t.Fatalf("expected one polygon component, got %#v", ann.Segmentation)
 	}
-	if len(rle.Size) != 2 || rle.Counts == nil {
-		t.Fatalf("expected non-empty rle fields, got %#v", rle)
+	part, ok := seg[0].([]any)
+	if !ok {
+		t.Fatalf("expected polygon part []any, got %T", seg[0])
+	}
+	got := make([]float64, 0, len(part))
+	for _, v := range part {
+		f, ok := v.(float64)
+		if !ok {
+			t.Fatalf("expected numeric polygon coordinate, got %T", v)
+		}
+		got = append(got, f)
+	}
+	want := []float64{5, 5, 20, 5, 10, 20}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("polygon coords mismatch: got=%v want=%v", got, want)
+	}
+	if ann.Area != 112.5 {
+		t.Fatalf("expected shoelace area 112.5, got %f", ann.Area)
+	}
+}
+
+func TestReadAnnotations_CocoRLESegmentationConvertedToPolygon(t *testing.T) {
+	path := writeJSONFixture(t, map[string]any{
+		"images": []any{map[string]any{"id": 1, "file_name": "rle.png", "width": 5, "height": 5}},
+		"annotations": []any{
+			map[string]any{
+				"id":          1,
+				"image_id":    1,
+				"category_id": 1,
+				"segmentation": map[string]any{
+					"size":   []any{5, 5},
+					"counts": []any{6, 2, 3, 2, 12},
+				},
+			},
+		},
+		"categories": []any{map[string]any{"id": 1, "name": "A"}},
+	})
+	af, err := ReadAnnotations(path)
+	if err != nil {
+		t.Fatalf("ReadAnnotations failed: %v", err)
+	}
+	if len(af.Annotations) != 1 {
+		t.Fatalf("expected one annotation, got %d", len(af.Annotations))
+	}
+	seg, ok := af.Annotations[0].Segmentation.([]any)
+	if !ok || len(seg) != 1 {
+		t.Fatalf("expected one polygon component converted from rle, got %#v", af.Annotations[0].Segmentation)
+	}
+	part, ok := seg[0].([]any)
+	if !ok {
+		t.Fatalf("expected polygon part []any, got %T", seg[0])
+	}
+	if len(part) < 6 || len(part)%2 != 0 {
+		t.Fatalf("expected valid flat polygon coordinates, got len=%d", len(part))
+	}
+	if af.Annotations[0].Area <= 0 {
+		t.Fatalf("expected area > 0 after rle conversion, got %f", af.Annotations[0].Area)
 	}
 }
 

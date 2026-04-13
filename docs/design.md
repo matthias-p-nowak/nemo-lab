@@ -606,7 +606,12 @@ An annotation is the assignment of a label to a mask.
 - Format is auto-detected: presence of a top-level `shapes` key → LabelMe; otherwise → COCO / extended COCO.
 - Reading is fully lenient: missing top-level arrays (`images`, `annotations`, `categories`) are treated as empty.
 - The backend **writes only extended COCO**.
-- Polygons read from any source are rasterized to COCO-RLE masks on load; they are never written as polygons. Rasterization uses the original image resolution: for COCO, width/height from the matching `images` entry (by `image_id`); for LabelMe, the top-level `imageWidth`/`imageHeight` fields. Missing or zero dimensions are an error.
+- **Polygons are the preferred segmentation format.** Polygon segmentations are preserved through the read/write cycle — they are never rasterized to RLE.
+  - COCO polygon `segmentation` arrays (`[[x0,y0,x1,y1,...]]`) are kept as-is on read.
+  - LabelMe `shapes` with `shape_type: polygon` are converted to COCO polygon format on read (not rasterized).
+  - RLE segmentations from external sources are converted to contour polygons on read via border-tracing, so they become visible and editable in the frontend.
+- All annotations are written with polygon `segmentation`. RLE is no longer written.
+- Area is computed via the shoelace formula on the polygon points.
 
 #### Extended COCO sidecar fields (top-level keys)
 
@@ -620,10 +625,12 @@ An annotation is the assignment of a label to a mask.
 
 | Type | Stored as |
 |------|-----------|
+| Type | Stored as |
+|------|-----------|
 | Point | COCO keypoint |
 | Bounding box | COCO `bbox` `[x, y, w, h]` |
-| Mask | COCO-RLE (column-major run-length encoding) |
-| Polygon (input only) | Rasterized to COCO-RLE on read |
+| Freehand / Polygon | COCO polygon `segmentation` `[[x0,y0,...]]` |
+| RLE (external input) | Converted to contour polygon on read; written as polygon |
 
 #### Write timing and file naming
 

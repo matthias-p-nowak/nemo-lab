@@ -1823,7 +1823,7 @@ function editPolygonWithStroke(strokePx: GeometryPoint[], polygonPx: GeometryPoi
   const strokePartReversed = strokePart.slice().reverse();
   return chooseLargestPolygonCandidate([
     [...forwardBoundary, ...strokePartReversed],
-    [...backwardBoundary, ...strokePart],
+    [...backwardBoundary, ...strokePartReversed],
   ]);
 }
 

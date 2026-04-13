@@ -3,12 +3,9 @@ package annotations
 import (
 	"encoding/json"
 	"fmt"
-	"image"
 	"os"
 	"path/filepath"
 	"slices"
-
-	"golang.org/x/image/vector"
 )
 
 // ReadAnnotations reads one annotation file and normalizes it to AnnotationFile.
@@ -43,25 +40,33 @@ func parseCOCO(top map[string]json.RawMessage) (*AnnotationFile, error) {
 	af.NemolabComments = cloneRaw(top["nemolab_comments"])
 	af.NemolabAuthors = cloneRaw(top["nemolab_authors"])
 
-	imgSizeByID := map[int][2]int{}
-	for _, img := range af.Images {
-		imgSizeByID[img.ID] = [2]int{img.Width, img.Height}
-	}
 	for i := range af.Annotations {
 		seg := af.Annotations[i].Segmentation
-		if !isPolygonSegmentation(seg) {
+		if seg == nil {
 			continue
 		}
-		size, ok := imgSizeByID[af.Annotations[i].ImageID]
-		if !ok || size[0] <= 0 || size[1] <= 0 {
-			return nil, fmt.Errorf("polygon segmentation without image dimensions: image_id=%d", af.Annotations[i].ImageID)
+		if isPolygonSegmentation(seg) {
+			area, err := polygonSegmentationArea(seg)
+			if err != nil {
+				return nil, fmt.Errorf("compute coco polygon area annotation id=%d: %w", af.Annotations[i].ID, err)
+			}
+			af.Annotations[i].Area = area
+			continue
 		}
-		rle, area, err := polygonSegmentationToRLE(seg, size[1], size[0])
+
+		rle, ok, err := asCocoRLE(seg)
 		if err != nil {
-			return nil, fmt.Errorf("rasterize coco polygon annotation id=%d: %w", af.Annotations[i].ID, err)
+			return nil, fmt.Errorf("parse coco rle annotation id=%d: %w", af.Annotations[i].ID, err)
 		}
-		af.Annotations[i].Segmentation = rle
-		af.Annotations[i].Area = area
+		if !ok {
+			continue
+		}
+		poly, err := rleToContourPolygon(rle)
+		if err != nil {
+			return nil, fmt.Errorf("convert coco rle annotation id=%d to contour polygon: %w", af.Annotations[i].ID, err)
+		}
+		af.Annotations[i].Segmentation = []any{floatSliceToAnySlice(poly)}
+		af.Annotations[i].Area = polygonArea(poly)
 	}
 	return af, nil
 }
@@ -139,12 +144,12 @@ func parseLabelMe(path string, top map[string]json.RawMessage) (*AnnotationFile,
 
 		switch shapeType {
 		case "polygon":
-			rle, area, err := polygonPointsToRLE(shape.Points, lm.ImageHeight, lm.ImageWidth)
+			flat, err := flattenLabelMePolygonPoints(shape.Points)
 			if err != nil {
-				return nil, fmt.Errorf("rasterize labelme polygon id=%d: %w", ann.ID, err)
+				return nil, fmt.Errorf("convert labelme polygon id=%d: %w", ann.ID, err)
 			}
-			ann.Segmentation = rle
-			ann.Area = area
+			ann.Segmentation = []any{floatSliceToAnySlice(flat)}
+			ann.Area = polygonArea(flat)
 		case "point":
 			if len(shape.Points) >= 1 && len(shape.Points[0]) >= 2 {
 				ann.Keypoints = []float64{shape.Points[0][0], shape.Points[0][1], 2}
@@ -174,86 +179,308 @@ func isPolygonSegmentation(seg any) bool {
 	return ok
 }
 
-func polygonSegmentationToRLE(seg any, height, width int) (CocoRLE, float64, error) {
+func polygonSegmentationArea(seg any) (float64, error) {
 	partsAny := seg.([]any)
-	polygons := make([][]float64, 0, len(partsAny))
+	total := 0.0
 	for _, part := range partsAny {
 		rawPoints, ok := part.([]any)
 		if !ok {
-			return CocoRLE{}, 0, fmt.Errorf("invalid polygon component")
+			return 0, fmt.Errorf("invalid polygon component")
 		}
 		points := make([]float64, 0, len(rawPoints))
 		for _, p := range rawPoints {
 			v, ok := p.(float64)
 			if !ok {
-				return CocoRLE{}, 0, fmt.Errorf("polygon coordinate is not number")
+				return 0, fmt.Errorf("polygon coordinate is not number")
 			}
 			points = append(points, v)
 		}
-		polygons = append(polygons, points)
+		total += polygonArea(points)
 	}
-	return polygonsToRLE(polygons, height, width)
+	return total, nil
 }
 
-func polygonPointsToRLE(points [][]float64, height, width int) (CocoRLE, float64, error) {
+func flattenLabelMePolygonPoints(points [][]float64) ([]float64, error) {
 	if len(points) < 3 {
-		return CocoRLE{}, 0, fmt.Errorf("polygon requires at least 3 points")
+		return nil, fmt.Errorf("polygon requires at least 3 points")
 	}
 	flat := make([]float64, 0, len(points)*2)
 	for _, p := range points {
 		if len(p) < 2 {
-			return CocoRLE{}, 0, fmt.Errorf("polygon point must have x,y")
+			return nil, fmt.Errorf("polygon point must have x,y")
 		}
 		flat = append(flat, p[0], p[1])
 	}
-	return polygonsToRLE([][]float64{flat}, height, width)
+	return flat, nil
 }
 
-func polygonsToRLE(polygons [][]float64, height, width int) (CocoRLE, float64, error) {
-	if height <= 0 || width <= 0 {
-		return CocoRLE{}, 0, fmt.Errorf("invalid image size %dx%d", width, height)
+func asCocoRLE(seg any) (CocoRLE, bool, error) {
+	switch typed := seg.(type) {
+	case CocoRLE:
+		return typed, true, nil
+	case map[string]any:
+		sizeRaw, ok := typed["size"]
+		if !ok {
+			return CocoRLE{}, false, nil
+		}
+		countsRaw, ok := typed["counts"]
+		if !ok {
+			return CocoRLE{}, false, nil
+		}
+		sizeAny, ok := sizeRaw.([]any)
+		if !ok || len(sizeAny) < 2 {
+			return CocoRLE{}, false, fmt.Errorf("invalid rle size")
+		}
+		size := make([]int, 2)
+		for i := 0; i < 2; i++ {
+			v, ok := sizeAny[i].(float64)
+			if !ok {
+				return CocoRLE{}, false, fmt.Errorf("invalid rle size component")
+			}
+			size[i] = int(v)
+		}
+		return CocoRLE{Size: size, Counts: countsRaw}, true, nil
+	default:
+		return CocoRLE{}, false, nil
 	}
-	mask := image.NewAlpha(image.Rect(0, 0, width, height))
-	ras := vector.NewRasterizer(width, height)
-	for _, poly := range polygons {
-		if len(poly) < 6 || len(poly)%2 != 0 {
+}
+
+func floatSliceToAnySlice(in []float64) []any {
+	out := make([]any, 0, len(in))
+	for _, v := range in {
+		out = append(out, v)
+	}
+	return out
+}
+
+func decodeUncompressedRLECounts(counts any) ([]int, error) {
+	switch typed := counts.(type) {
+	case []int:
+		return typed, nil
+	case []float64:
+		out := make([]int, 0, len(typed))
+		for _, v := range typed {
+			out = append(out, int(v))
+		}
+		return out, nil
+	case []any:
+		out := make([]int, 0, len(typed))
+		for _, v := range typed {
+			switch x := v.(type) {
+			case float64:
+				out = append(out, int(x))
+			case int:
+				out = append(out, x)
+			default:
+				return nil, fmt.Errorf("rle count has non-numeric value")
+			}
+		}
+		return out, nil
+	case string:
+		return nil, fmt.Errorf("compressed rle counts are not supported")
+	default:
+		return nil, fmt.Errorf("invalid rle counts type %T", counts)
+	}
+}
+
+func decodeColumnMajorMaskFromRLE(rle CocoRLE) ([][]bool, error) {
+	if len(rle.Size) < 2 {
+		return nil, fmt.Errorf("rle size must have 2 entries")
+	}
+	height := rle.Size[0]
+	width := rle.Size[1]
+	if height <= 0 || width <= 0 {
+		return nil, fmt.Errorf("invalid rle size %dx%d", width, height)
+	}
+	counts, err := decodeUncompressedRLECounts(rle.Counts)
+	if err != nil {
+		return nil, err
+	}
+	total := width * height
+	flat := make([]bool, total)
+	pos := 0
+	value := 0
+	for _, run := range counts {
+		if run < 0 {
+			return nil, fmt.Errorf("negative rle run")
+		}
+		if pos+run > total {
+			return nil, fmt.Errorf("rle run exceeds mask size")
+		}
+		if value == 1 {
+			for i := pos; i < pos+run; i++ {
+				flat[i] = true
+			}
+		}
+		pos += run
+		value = 1 - value
+	}
+	if pos != total {
+		return nil, fmt.Errorf("rle runs (%d) do not cover mask size (%d)", pos, total)
+	}
+	mask := make([][]bool, height)
+	for y := 0; y < height; y++ {
+		mask[y] = make([]bool, width)
+	}
+	for idx, on := range flat {
+		if !on {
 			continue
 		}
-		ras.Reset(width, height)
-		ras.MoveTo(float32(poly[0]), float32(poly[1]))
-		for i := 2; i < len(poly); i += 2 {
-			ras.LineTo(float32(poly[i]), float32(poly[i+1]))
-		}
-		ras.ClosePath()
-		ras.Draw(mask, mask.Bounds(), image.Opaque, image.Point{})
+		x := idx / height
+		y := idx % height
+		mask[y][x] = true
 	}
-	counts, ones := alphaMaskToColumnMajorRLE(mask)
-	return CocoRLE{Size: []int{height, width}, Counts: counts}, float64(ones), nil
+	return mask, nil
 }
 
-func alphaMaskToColumnMajorRLE(mask *image.Alpha) ([]int, int) {
-	counts := make([]int, 0, 1024)
-	current := 0 // 0 background, 1 foreground
-	run := 0
-	ones := 0
-	for x := 0; x < mask.Rect.Dx(); x++ {
-		for y := 0; y < mask.Rect.Dy(); y++ {
-			v := 0
-			if mask.AlphaAt(mask.Rect.Min.X+x, mask.Rect.Min.Y+y).A > 0 {
-				v = 1
-				ones++
-			}
-			if v == current {
-				run++
+type intPoint struct {
+	X int
+	Y int
+}
+
+type intEdge struct {
+	A intPoint
+	B intPoint
+}
+
+func edgeKey(a, b intPoint) string {
+	if a.X < b.X || (a.X == b.X && a.Y <= b.Y) {
+		return fmt.Sprintf("%d,%d|%d,%d", a.X, a.Y, b.X, b.Y)
+	}
+	return fmt.Sprintf("%d,%d|%d,%d", b.X, b.Y, a.X, a.Y)
+}
+
+func appendBoundaryEdge(edges map[string]intEdge, a, b intPoint) {
+	key := edgeKey(a, b)
+	if _, exists := edges[key]; exists {
+		delete(edges, key)
+		return
+	}
+	edges[key] = intEdge{A: a, B: b}
+}
+
+func boundaryLoopsFromMask(mask [][]bool) [][]intPoint {
+	height := len(mask)
+	if height == 0 {
+		return nil
+	}
+	width := len(mask[0])
+	edges := map[string]intEdge{}
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			if !mask[y][x] {
 				continue
 			}
-			counts = append(counts, run)
-			run = 1
-			current = v
+			p00 := intPoint{X: x, Y: y}
+			p10 := intPoint{X: x + 1, Y: y}
+			p11 := intPoint{X: x + 1, Y: y + 1}
+			p01 := intPoint{X: x, Y: y + 1}
+			appendBoundaryEdge(edges, p00, p10)
+			appendBoundaryEdge(edges, p10, p11)
+			appendBoundaryEdge(edges, p11, p01)
+			appendBoundaryEdge(edges, p01, p00)
 		}
 	}
-	counts = append(counts, run)
-	return counts, ones
+	if len(edges) == 0 {
+		return nil
+	}
+	adj := map[intPoint][]intPoint{}
+	for _, edge := range edges {
+		adj[edge.A] = append(adj[edge.A], edge.B)
+		adj[edge.B] = append(adj[edge.B], edge.A)
+	}
+	remaining := map[string]struct{}{}
+	for _, edge := range edges {
+		remaining[edgeKey(edge.A, edge.B)] = struct{}{}
+	}
+	loops := [][]intPoint{}
+	for len(remaining) > 0 {
+		var startA, startB intPoint
+		for _, edge := range edges {
+			key := edgeKey(edge.A, edge.B)
+			if _, ok := remaining[key]; ok {
+				startA, startB = edge.A, edge.B
+				break
+			}
+		}
+		loop := []intPoint{startA, startB}
+		delete(remaining, edgeKey(startA, startB))
+		prev := startA
+		curr := startB
+		for {
+			neighbors := adj[curr]
+			if len(neighbors) == 0 {
+				break
+			}
+			next := neighbors[0]
+			if len(neighbors) > 1 && next == prev {
+				next = neighbors[1]
+			}
+			if next == startA {
+				loops = append(loops, loop)
+				break
+			}
+			delete(remaining, edgeKey(curr, next))
+			loop = append(loop, next)
+			prev, curr = curr, next
+			if len(loop) > len(edges)+2 {
+				break
+			}
+		}
+	}
+	return loops
+}
+
+func rleToContourPolygon(rle CocoRLE) ([]float64, error) {
+	mask, err := decodeColumnMajorMaskFromRLE(rle)
+	if err != nil {
+		return nil, err
+	}
+	loops := boundaryLoopsFromMask(mask)
+	if len(loops) == 0 {
+		return nil, fmt.Errorf("mask has no foreground contour")
+	}
+	var best []float64
+	bestArea := 0.0
+	for _, loop := range loops {
+		if len(loop) < 3 {
+			continue
+		}
+		flat := make([]float64, 0, len(loop)*2)
+		for _, p := range loop {
+			flat = append(flat, float64(p.X), float64(p.Y))
+		}
+		area := polygonArea(flat)
+		if area <= bestArea {
+			continue
+		}
+		bestArea = area
+		best = flat
+	}
+	if len(best) < 6 {
+		return nil, fmt.Errorf("failed to extract valid contour polygon")
+	}
+	return best, nil
+}
+
+func polygonArea(flat []float64) float64 {
+	if len(flat) < 6 || len(flat)%2 != 0 {
+		return 0
+	}
+	n := len(flat) / 2
+	acc := 0.0
+	for i := 0; i < n; i++ {
+		j := (i + 1) % n
+		x0 := flat[2*i]
+		y0 := flat[2*i+1]
+		x1 := flat[2*j]
+		y1 := flat[2*j+1]
+		acc += x0*y1 - x1*y0
+	}
+	if acc < 0 {
+		acc = -acc
+	}
+	return acc * 0.5
 }
 
 func decodeSlice[T any](raw json.RawMessage, out *[]T) error {
