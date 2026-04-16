@@ -1,10 +1,13 @@
 package ws
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -33,9 +36,16 @@ type connState struct {
 }
 
 type fileAnnotations struct {
-	af    *annotations.AnnotationFile
-	dirty bool
-	timer *time.Timer
+	af           *annotations.AnnotationFile
+	dirty        bool
+	timer        *time.Timer
+	hashCheckCtx *pendingHashCheck
+}
+
+type pendingHashCheck struct {
+	token     string
+	hash      string
+	imagePath string
 }
 
 var (
@@ -141,6 +151,13 @@ func NewHandler(db *sql.DB, logsDir string) http.HandlerFunc {
 					hashes := prefetchHashes(msg, entry)
 					seq := nextPrefetchSeq(cookie.Value)
 					go handlePrefetch(cookie.Value, conn, writeMu, lgr, hashes, seq)
+				case "find_first_annotated_image":
+					hashes := prefetchHashes(msg, entry)
+					currentHash, _ := msg["current_hash"].(string)
+					if currentHash == "" {
+						currentHash, _ = entry["current_hash"].(string)
+					}
+					handleFindFirstAnnotatedImage(cookie.Value, conn, writeMu, hashes, currentHash)
 				case "load_annotations":
 					hash, _ := msg["hash"].(string)
 					if hash == "" {
@@ -162,7 +179,7 @@ func NewHandler(db *sql.DB, logsDir string) http.HandlerFunc {
 					if payload == nil {
 						payload = entry["annotations"]
 					}
-					handleSaveAnnotations(cookie.Value, conn, lgr, hash, payload)
+					handleSaveAnnotations(db, cookie.Value, conn, lgr, hash, payload)
 				default:
 					if msgType == "" {
 						continue
@@ -171,6 +188,69 @@ func NewHandler(db *sql.DB, logsDir string) http.HandlerFunc {
 			}
 		}).ServeHTTP(w, r)
 	}
+}
+
+func handleFindFirstAnnotatedImage(token string, conn *websocket.Conn, writeMu *sync.Mutex, hashes []string, currentHash string) {
+	hash := firstUnannotatedHashOnDisk(token, hashes, currentHash)
+	if hash == "" {
+		return
+	}
+	_ = wsSendJSON(conn, writeMu, map[string]any{
+		"type": "first_annotated_image",
+		"hash": hash,
+	})
+}
+
+func firstUnannotatedHashOnDisk(token string, hashes []string, currentHash string) string {
+	if len(hashes) == 0 {
+		return ""
+	}
+
+	startIndex := 0
+	if currentHash != "" {
+		for i, hash := range hashes {
+			if hash != currentHash {
+				continue
+			}
+			startIndex = i + 1
+			break
+		}
+	}
+	if startIndex >= len(hashes) {
+		return ""
+	}
+
+	pathIsUnannotated := map[string]bool{}
+	pathChecked := map[string]bool{}
+	for _, hash := range hashes[startIndex:] {
+		ctx, ok := loadAnnotationContext(token, hash)
+		if !ok {
+			continue
+		}
+		path := annotationFilePath(ctx.annotationsDir, ctx.singleFile, ctx.imagePath)
+		if pathChecked[path] {
+			if pathIsUnannotated[path] {
+				return hash
+			}
+			continue
+		}
+		pathChecked[path] = true
+		af, err := annotations.ReadAnnotations(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				pathIsUnannotated[path] = true
+				return hash
+			}
+			log.Printf("ws find_first_annotated_image read failed token=%s hash=%.16s path=%s err=%v", tokenPrefix(token), hash, path, err)
+			pathIsUnannotated[path] = false
+			continue
+		}
+		pathIsUnannotated[path] = len(af.Annotations) == 0
+		if pathIsUnannotated[path] {
+			return hash
+		}
+	}
+	return ""
 }
 
 func handleSetActiveTask(
@@ -326,7 +406,7 @@ func handleLoadAnnotations(
 	sendAnnotationsData(conn, writeMu, hash, af)
 }
 
-func handleSaveAnnotations(token string, conn *websocket.Conn, lgr *logger.Logger, hash string, payload any) {
+func handleSaveAnnotations(db *sql.DB, token string, conn *websocket.Conn, lgr *logger.Logger, hash string, payload any) {
 	if payload == nil {
 		return
 	}
@@ -356,8 +436,102 @@ func handleSaveAnnotations(token string, conn *websocket.Conn, lgr *logger.Logge
 	if af.Categories == nil {
 		af.Categories = []annotations.CocoCategory{}
 	}
-	merged := mergeAndStoreSharedAnnotations(path, &af, lgr)
+	existing := getOrLoadSharedAnnotations(path, token, hash, lgr)
+	username, _ := auth.UsernameFromSessionToken(db, token)
+	applyCommentAuthorUpdate(existing, &af, username)
+	merged := mergeAndStoreSharedAnnotations(path, &af, ctx.imagePath, hash, token, lgr)
 	broadcastAnnotationsData(path, hash, merged, conn)
+}
+
+func applyCommentAuthorUpdate(existing, incoming *annotations.AnnotationFile, username string) {
+	if incoming == nil {
+		return
+	}
+
+	prevComments := decodeStringMap(existing.NemolabComments)
+	nextComments := decodeStringMap(incoming.NemolabComments)
+	prevAuthors := decodeStringMap(existing.NemolabAuthors)
+	nextAuthors := decodeStringMap(incoming.NemolabAuthors)
+
+	for key, value := range prevAuthors {
+		if _, ok := nextAuthors[key]; ok {
+			continue
+		}
+		nextAuthors[key] = value
+	}
+
+	keys := map[string]struct{}{}
+	for key := range prevComments {
+		keys[key] = struct{}{}
+	}
+	for key := range nextComments {
+		keys[key] = struct{}{}
+	}
+
+	for key := range keys {
+		prevValue := prevComments[key]
+		nextValue := nextComments[key]
+		if prevValue == nextValue {
+			continue
+		}
+		if nextValue == "" {
+			delete(nextAuthors, key)
+			continue
+		}
+		if username != "" {
+			nextAuthors[key] = username
+		}
+	}
+
+	for key := range nextAuthors {
+		if nextComments[key] != "" {
+			continue
+		}
+		delete(nextAuthors, key)
+	}
+
+	incoming.NemolabComments = encodeStringMap(nextComments)
+	incoming.NemolabAuthors = encodeStringMap(nextAuthors)
+}
+
+func decodeStringMap(raw json.RawMessage) map[string]string {
+	out := map[string]string{}
+	if len(raw) == 0 {
+		return out
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return out
+	}
+	for key, value := range parsed {
+		text, ok := value.(string)
+		if !ok || text == "" {
+			continue
+		}
+		out[key] = text
+	}
+	return out
+}
+
+func encodeStringMap(values map[string]string) json.RawMessage {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(values))
+	for key, value := range values {
+		if value == "" {
+			continue
+		}
+		out[key] = value
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		return nil
+	}
+	return json.RawMessage(raw)
 }
 
 type annotationContext struct {
@@ -504,7 +678,14 @@ func getOrLoadSharedAnnotations(path, token, hash string, lgr *logger.Logger) *a
 	return cloneAnnotationFile(entry.af)
 }
 
-func mergeAndStoreSharedAnnotations(path string, incoming *annotations.AnnotationFile, lgr *logger.Logger) *annotations.AnnotationFile {
+func mergeAndStoreSharedAnnotations(
+	path string,
+	incoming *annotations.AnnotationFile,
+	imagePath string,
+	hash string,
+	token string,
+	lgr *logger.Logger,
+) *annotations.AnnotationFile {
 	annotationStoreMu.Lock()
 	defer annotationStoreMu.Unlock()
 
@@ -517,6 +698,11 @@ func mergeAndStoreSharedAnnotations(path string, incoming *annotations.Annotatio
 		entry.af = emptyAnnotationFile()
 	}
 	entry.af = mergeAnnotationFiles(entry.af, incoming)
+	entry.hashCheckCtx = &pendingHashCheck{
+		token:     token,
+		hash:      hash,
+		imagePath: imagePath,
+	}
 	entry.dirty = true
 	if entry.timer != nil {
 		entry.timer.Stop()
@@ -548,8 +734,19 @@ func mergeAnnotationFiles(existing, incoming *annotations.AnnotationFile) *annot
 			imageOut = append(imageOut, img)
 		}
 	}
+	existingImageByID := map[int]annotations.CocoImage{}
+	for _, img := range base.Images {
+		existingImageByID[img.ID] = img
+	}
 	for _, img := range inc.Images {
 		if img.ID == targetImageID {
+			prev := existingImageByID[img.ID]
+			if img.NemolabHashSHA256 == "" {
+				img.NemolabHashSHA256 = prev.NemolabHashSHA256
+			}
+			if img.NemolabHashAlgo == "" {
+				img.NemolabHashAlgo = prev.NemolabHashAlgo
+			}
 			imageOut = append(imageOut, img)
 		}
 	}
@@ -633,6 +830,7 @@ func flushAnnotationPath(path string, lgr *logger.Logger) {
 		return
 	}
 	snapshot := cloneAnnotationFile(entry.af)
+	hashCheckCtx := clonePendingHashCheck(entry.hashCheckCtx)
 	entry.dirty = false
 	entry.timer = nil
 	annotationStoreMu.Unlock()
@@ -657,6 +855,9 @@ func flushAnnotationPath(path string, lgr *logger.Logger) {
 		"ts":   time.Now().Format(time.RFC3339),
 		"path": path,
 	})
+	if hashCheckCtx != nil {
+		go verifyImageHashAfterWrite(path, hashCheckCtx, lgr)
+	}
 }
 
 func flushAnnotationPathNow(path string, lgr *logger.Logger) {
@@ -671,6 +872,7 @@ func flushAnnotationPathNow(path string, lgr *logger.Logger) {
 		entry.timer = nil
 	}
 	snapshot := cloneAnnotationFile(entry.af)
+	hashCheckCtx := clonePendingHashCheck(entry.hashCheckCtx)
 	entry.dirty = false
 	annotationStoreMu.Unlock()
 
@@ -687,6 +889,130 @@ func flushAnnotationPathNow(path string, lgr *logger.Logger) {
 			e.dirty = true
 		}
 		annotationStoreMu.Unlock()
+		return
+	}
+	if hashCheckCtx != nil {
+		go verifyImageHashAfterWrite(path, hashCheckCtx, lgr)
+	}
+}
+
+func clonePendingHashCheck(src *pendingHashCheck) *pendingHashCheck {
+	if src == nil {
+		return nil
+	}
+	return &pendingHashCheck{
+		token:     src.token,
+		hash:      src.hash,
+		imagePath: src.imagePath,
+	}
+}
+
+func verifyImageHashAfterWrite(path string, ctx *pendingHashCheck, lgr *logger.Logger) {
+	if ctx == nil || ctx.imagePath == "" {
+		return
+	}
+
+	computedHash, err := computeImageSHA256(ctx.imagePath)
+	if err != nil {
+		log.Printf("ws image hash compute failed path=%s image=%s err=%v", path, ctx.imagePath, err)
+		return
+	}
+
+	annotationStoreMu.Lock()
+	entry := annotationStore[path]
+	if entry == nil || entry.af == nil {
+		annotationStoreMu.Unlock()
+		return
+	}
+	imageIndex := findImageIndexByPath(entry.af.Images, ctx.imagePath)
+	if imageIndex < 0 {
+		annotationStoreMu.Unlock()
+		return
+	}
+	storedHash := strings.ToLower(strings.TrimSpace(entry.af.Images[imageIndex].NemolabHashSHA256))
+	if storedHash == "" {
+		entry.af.Images[imageIndex].NemolabHashSHA256 = computedHash
+		entry.af.Images[imageIndex].NemolabHashAlgo = "sha256"
+		snapshot := cloneAnnotationFile(entry.af)
+		annotationStoreMu.Unlock()
+		if err := annotations.WriteAnnotations(path, snapshot); err != nil {
+			log.Printf("ws image hash writeback failed path=%s image=%s err=%v", path, ctx.imagePath, err)
+			logAppend(lgr, map[string]any{
+				"type":  "annotations_error",
+				"ts":    time.Now().Format(time.RFC3339),
+				"path":  path,
+				"error": err.Error(),
+			})
+		}
+		return
+	}
+	annotationStoreMu.Unlock()
+
+	if storedHash == computedHash {
+		return
+	}
+	sendImageHashMismatch(ctx.token, ctx.hash, ctx.imagePath, computedHash)
+}
+
+func findImageIndexByPath(images []annotations.CocoImage, imagePath string) int {
+	if len(images) == 0 {
+		return -1
+	}
+	cleanPath := filepath.Clean(imagePath)
+	base := filepath.Base(cleanPath)
+	for i, img := range images {
+		name := strings.TrimSpace(img.FileName)
+		if name == "" {
+			continue
+		}
+		if filepath.Clean(name) == cleanPath || filepath.Base(name) == base {
+			return i
+		}
+	}
+	if len(images) == 1 {
+		return 0
+	}
+	return -1
+}
+
+func computeImageSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	buf := make([]byte, 1024*1024)
+	if _, err := io.CopyBuffer(h, f, buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func sendImageHashMismatch(token, hash, imagePath, imageHash string) {
+	if token == "" || imagePath == "" || imageHash == "" {
+		return
+	}
+	type liveConn struct {
+		conn    *websocket.Conn
+		writeMu *sync.Mutex
+	}
+	liveConnsMu.Lock()
+	targets := make([]liveConn, 0, len(liveConns))
+	for conn, info := range liveConns {
+		if info.token != token {
+			continue
+		}
+		targets = append(targets, liveConn{conn: conn, writeMu: info.writeMu})
+	}
+	liveConnsMu.Unlock()
+	for _, target := range targets {
+		_ = wsSendJSON(target.conn, target.writeMu, map[string]any{
+			"type": "image_hash_mismatch",
+			"hash": hash,
+			"file": imagePath,
+		})
 	}
 }
 

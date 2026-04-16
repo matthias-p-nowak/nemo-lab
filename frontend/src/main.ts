@@ -12,6 +12,8 @@ const config = {
   freehandSimplifyTolerance: 0.5,
   /** Reject self-intersecting freehand strokes above this complexity. */
   freehandMaxSelfIntersectionSegments: 3,
+  /** Debounce for comment-input annotation save propagation. */
+  commentSaveDebounceMs: 500,
 };
 
 /** Applies a theme by setting data-theme on <html>. */
@@ -43,6 +45,7 @@ function persistSettingLater(key: string, value: string): void {
 
 /** Debounce timers keyed by setting key for batched setting writes while dragging sliders. */
 const settingPersistDebounceTimers = new Map<string, number>();
+let commentSaveDebounceTimer: number | null = null;
 
 /** Persists one user setting after a debounce delay, resetting per-key on repeated calls. */
 function persistSettingDebouncedLater(key: string, value: string, delayMs = 300): void {
@@ -55,6 +58,25 @@ function persistSettingDebouncedLater(key: string, value: string, delayMs = 300)
     persistSettingLater(key, value);
   }, delayMs);
   settingPersistDebounceTimers.set(key, timer);
+}
+
+/** Schedules debounced annotation save for comment-input edits only. */
+function scheduleCommentSaveAnnotations(): void {
+  if (commentSaveDebounceTimer !== null) {
+    window.clearTimeout(commentSaveDebounceTimer);
+  }
+  commentSaveDebounceTimer = window.setTimeout(() => {
+    commentSaveDebounceTimer = null;
+    sendSaveAnnotations();
+  }, config.commentSaveDebounceMs);
+}
+
+/** Flushes pending debounced comment save before changing active image context. */
+function flushPendingCommentSaveAnnotations(): void {
+  if (commentSaveDebounceTimer === null) return;
+  window.clearTimeout(commentSaveDebounceTimer);
+  commentSaveDebounceTimer = null;
+  sendSaveAnnotations();
 }
 
 /** Converts HSV color to CSS hex string. */
@@ -217,6 +239,8 @@ const appState = {
   activeTaskSingleFile: false,
   /** Hash awaiting ordered activation logging once annotations payload arrives. */
   pendingActivationLogHash: null as string | null,
+  /** Visible image hash mismatch warnings pushed from backend. */
+  imageHashWarnings: [] as ImageHashWarning[],
   leftCollapsed: false,
   rightCollapsed: false,
   rightSidebarWidth: 320,
@@ -240,6 +264,10 @@ const appState = {
     clientY: 0,
     maskId: null as string | null,
   },
+  /** Flat comment map keyed by "image" or annotation id. */
+  annotationComments: {} as AnnotationStringMap,
+  /** Flat author map keyed like annotationComments with username values. */
+  annotationAuthors: {} as AnnotationStringMap,
   /** Label tree of the currently active task, shown in the right sidebar. */
   activeLabels: [] as LabelNode[],
   /** Selected label id in the active task's label tree. */
@@ -693,6 +721,9 @@ interface WsAnnotationFile {
   nemolab_authors?: unknown;
 }
 
+type AnnotationStringMap = Record<string, string>;
+type ImageHashWarning = { key: string; hash: string; file: string };
+
 /** Converts arbitrary WS payload to a typed annotation file with array defaults. */
 function normalizeWsAnnotationFile(raw: unknown): Required<WsAnnotationFile> & { hasNemolabSidecars: boolean } {
   if (!raw || typeof raw !== "object") {
@@ -723,6 +754,31 @@ function normalizeWsAnnotationFile(raw: unknown): Required<WsAnnotationFile> & {
     nemolab_authors: src["nemolab_authors"],
     hasNemolabSidecars,
   };
+}
+
+/** Converts unknown JSON payload into a flat string map; non-string values are ignored. */
+function normalizeStringMap(raw: unknown): AnnotationStringMap {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return {};
+  }
+  const src = raw as Record<string, unknown>;
+  const out: AnnotationStringMap = {};
+  Object.entries(src).forEach(([key, value]) => {
+    if (typeof value !== "string") return;
+    if (value === "") return;
+    out[key] = value;
+  });
+  return out;
+}
+
+/** Escapes HTML-special characters for safe inline template insertion. */
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 /** Joins two server-style paths while preserving slash direction from base where possible. */
@@ -839,13 +895,8 @@ function sendSaveAnnotations(): void {
     categories.push({ id, name });
   });
 
-  const toNumericID = (mask: MaskPoint): number => {
-    const parsed = Number.parseInt(mask.id, 10);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : mask.index;
-  };
-
   const annotations: WsAnnotationRow[] = masks.map((mask) => ({
-    id: toNumericID(mask),
+    id: maskPersistedNumericID(mask),
     image_id: currentImageID,
     category_id: mask.labelName ? categoryIdByName.get(mask.labelName.trim()) : undefined,
     ...(mask.kind === "bbox"
@@ -876,8 +927,16 @@ function sendSaveAnnotations(): void {
       images: [{ id: currentImageID, file_name: fileName, width, height }],
       annotations,
       categories,
+      nemolab_comments: appState.annotationComments,
+      nemolab_authors: appState.annotationAuthors,
     },
   }));
+}
+
+/** Converts a mask id into persisted numeric COCO annotation id. */
+function maskPersistedNumericID(mask: MaskPoint): number {
+  const parsed = Number.parseInt(mask.id, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : mask.index;
 }
 
 /** Sends prefetch request for current and next nearby images. */
@@ -889,13 +948,14 @@ function sendPrefetch(images: { hash: string }[], fromIndex: number): void {
   ws.send(JSON.stringify({ type: "prefetch", hashes }));
 }
 
-/** Moves to previous image and resets mask state for the new image. */
-function goPreviousImage(): void {
+/** Activates an image list index and resets per-image annotation/view state. */
+function activateImageAtIndex(nextIndex: number): void {
   if (appState.imageList.length === 0) {
     return;
   }
-  appState.currentImageIndex =
-    (appState.currentImageIndex - 1 + appState.imageList.length) % appState.imageList.length;
+  flushPendingCommentSaveAnnotations();
+  const clamped = Math.max(0, Math.min(appState.imageList.length - 1, Math.round(nextIndex)));
+  appState.currentImageIndex = clamped;
   // Clear active hash so remount does not briefly reload the previous image
   // while waiting for the next image_ready event.
   appState.currentImageHash = null;
@@ -906,6 +966,8 @@ function goPreviousImage(): void {
   appState.draftBboxMask = null;
   appState.draftFreehandStroke = null;
   appState.selectedMaskId = null;
+  appState.annotationComments = {};
+  appState.annotationAuthors = {};
   appState.maskContextMenu.open = false;
   const current = getCurrentImageEntry();
   if (current) {
@@ -915,29 +977,32 @@ function goPreviousImage(): void {
   updateImageStateUI();
 }
 
+/** Moves to previous image and resets mask state for the new image. */
+function goPreviousImage(): void {
+  if (appState.imageList.length === 0) {
+    return;
+  }
+  activateImageAtIndex((appState.currentImageIndex - 1 + appState.imageList.length) % appState.imageList.length);
+}
+
 /** Moves to next image and resets mask state for the new image. */
 function goNextImage(): void {
   if (appState.imageList.length === 0) {
     return;
   }
-  appState.currentImageIndex = (appState.currentImageIndex + 1) % appState.imageList.length;
-  // Clear active hash so remount does not briefly reload the previous image
-  // while waiting for the next image_ready event.
-  appState.currentImageHash = null;
-  appState.pendingActivationLogHash = null;
-  appState.annotationImageWidth = 1;
-  appState.annotationImageHeight = 1;
-  appState.masks = [];
-  appState.draftBboxMask = null;
-  appState.draftFreehandStroke = null;
-  appState.selectedMaskId = null;
-  appState.maskContextMenu.open = false;
-  const current = getCurrentImageEntry();
-  if (current) {
-    logEvent("image_change", { filename: current.filename, hash: current.hash });
-  }
-  sendPrefetch(appState.imageList, appState.currentImageIndex);
-  updateImageStateUI();
+  activateImageAtIndex((appState.currentImageIndex + 1) % appState.imageList.length);
+}
+
+/** Sends a disk-based fast-forward scan request to find the next unannotated image. */
+function requestFastForwardImage(): void {
+  if (ws.readyState !== WebSocket.OPEN) return;
+  const hashes = appState.imageList.map((item) => item.hash);
+  if (hashes.length === 0) return;
+  ws.send(JSON.stringify({
+    type: "find_first_annotated_image",
+    hashes,
+    current_hash: appState.imageList[appState.currentImageIndex]?.hash ?? "",
+  }));
 }
 
 ws.addEventListener("message", (event) => {
@@ -953,6 +1018,7 @@ ws.addEventListener("message", (event) => {
   const m = msg as Record<string, unknown>;
 
   if (m["type"] === "image_list") {
+    flushPendingCommentSaveAnnotations();
     const images = Array.isArray(m["images"])
       ? (m["images"] as Array<Record<string, unknown>>)
         .filter((item) => typeof item["filename"] === "string" && typeof item["hash"] === "string")
@@ -968,6 +1034,9 @@ ws.addEventListener("message", (event) => {
     appState.draftBboxMask = null;
     appState.draftFreehandStroke = null;
     appState.selectedMaskId = null;
+    appState.annotationComments = {};
+    appState.annotationAuthors = {};
+    appState.imageHashWarnings = [];
     appState.maskContextMenu.open = false;
     updateImageStateUI();
     if (images.length > 0) {
@@ -987,12 +1056,15 @@ ws.addEventListener("message", (event) => {
     const isNewImage = appState.currentImageHash !== hash;
     // Only reset masks when the image changes.
     if (isNewImage) {
+      flushPendingCommentSaveAnnotations();
       appState.annotationImageWidth = 1;
       appState.annotationImageHeight = 1;
       appState.masks = [];
       appState.draftBboxMask = null;
       appState.draftFreehandStroke = null;
       appState.selectedMaskId = null;
+      appState.annotationComments = {};
+      appState.annotationAuthors = {};
       appState.maskContextMenu.open = false;
       appState.pendingActivationLogHash = hash;
       if (ws.readyState === WebSocket.OPEN) {
@@ -1019,8 +1091,9 @@ ws.addEventListener("message", (event) => {
     }
     const payload = normalizeWsAnnotationFile(m["annotations"]);
     emitImageActivationLogsIfPending(hash, payload);
-    const currentImageID = appState.currentImageIndex + 1;
-    const image = payload.images.find((img) => typeof img?.id === "number" && img.id === currentImageID);
+    appState.annotationComments = normalizeStringMap(payload.nemolab_comments);
+    appState.annotationAuthors = normalizeStringMap(payload.nemolab_authors);
+    const image = payload.images[0];
     const width = Math.max(1, Math.round(typeof image?.width === "number" ? image.width : appState.annotationImageWidth));
     const height = Math.max(1, Math.round(typeof image?.height === "number" ? image.height : appState.annotationImageHeight));
     appState.annotationImageWidth = width;
@@ -1035,7 +1108,6 @@ ws.addEventListener("message", (event) => {
     const masks: MaskPoint[] = [];
     payload.annotations.forEach((ann) => {
       if (!ann || typeof ann !== "object") return;
-      if (ann.image_id !== currentImageID) return;
       const segmentation = Array.isArray(ann.segmentation) ? ann.segmentation : [];
       const firstPolygon = Array.isArray(segmentation[0]) ? segmentation[0] : null;
       if (firstPolygon && firstPolygon.length >= 6) {
@@ -1118,6 +1190,26 @@ ws.addEventListener("message", (event) => {
     appState.selectedMaskId = null;
     closeMaskContextMenu();
     updateAnnotationUI();
+    return;
+  }
+
+  if (m["type"] === "image_hash_mismatch") {
+    const hash = typeof m["hash"] === "string" ? m["hash"] : "";
+    const file = typeof m["file"] === "string" ? m["file"] : "";
+    if (!hash || !file) return;
+    const key = `${hash}|${file}`;
+    if (appState.imageHashWarnings.some((warning) => warning.key === key)) return;
+    appState.imageHashWarnings = [...appState.imageHashWarnings, { key, hash, file }];
+    updateImageHashWarningsUI();
+    return;
+  }
+
+  if (m["type"] === "first_annotated_image") {
+    const hash = typeof m["hash"] === "string" ? m["hash"] : "";
+    if (!hash) return;
+    const nextIndex = appState.imageList.findIndex((item) => item.hash === hash);
+    if (nextIndex < 0) return;
+    activateImageAtIndex(nextIndex);
     return;
   }
 });
@@ -1208,7 +1300,31 @@ function bindGlobalNavHandlers(): void {
     }
     if (target.closest('[data-action="toggle-right"]')) {
       toggleRightSidebar();
+      return;
     }
+    if (target.closest('[data-action="fast-forward"]')) {
+      requestFastForwardImage();
+      return;
+    }
+    const dismissWarningBtn = target.closest<HTMLButtonElement>('[data-action="dismiss-image-hash-warning"]');
+    if (dismissWarningBtn) {
+      const warningKey = dismissWarningBtn.dataset["warningKey"] ?? "";
+      if (!warningKey) return;
+      appState.imageHashWarnings = appState.imageHashWarnings.filter((warning) => warning.key !== warningKey);
+      updateImageHashWarningsUI();
+    }
+  });
+  appRoot.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    const target = event.target as Element | null;
+    const input = target?.closest<HTMLInputElement>('input[data-action="jump-image-index"]');
+    if (!input || !appRoot.contains(input)) return;
+    if (appState.imageList.length === 0) return;
+    event.preventDefault();
+    const parsed = Number.parseInt(input.value, 10);
+    const oneBased = Number.isFinite(parsed) ? parsed : (appState.currentImageIndex + 1);
+    const clamped = Math.max(1, Math.min(appState.imageList.length, oneBased));
+    activateImageAtIndex(clamped - 1);
   });
 }
 
@@ -1925,6 +2041,9 @@ function removeMask(maskId: string): void {
   const idx = appState.masks.findIndex((mask) => mask.id === maskId);
   if (idx === -1) return;
   const [removed] = appState.masks.splice(idx, 1);
+  const removedCommentKey = String(maskPersistedNumericID(removed));
+  delete appState.annotationComments[removedCommentKey];
+  delete appState.annotationAuthors[removedCommentKey];
   if (appState.currentImageHash) {
     logEvent("mask_removed", {
       image_hash: appState.currentImageHash,
@@ -1966,6 +2085,35 @@ function renderPanel(
   `;
 }
 
+/** Renders dismissible warning banners for backend image hash mismatch events. */
+function renderImageHashWarnings(): string {
+  if (appState.imageHashWarnings.length === 0) return "";
+  const rows = appState.imageHashWarnings
+    .map((warning) => `
+      <div class="image-hash-warning" role="alert">
+        <div class="image-hash-warning__text">
+          Image file changed since hash capture: <span class="image-hash-warning__file">${escapeHtml(warning.file)}</span>
+        </div>
+        <button
+          type="button"
+          class="image-hash-warning__dismiss"
+          data-action="dismiss-image-hash-warning"
+          data-warning-key="${escapeHtml(warning.key)}"
+          aria-label="Dismiss image hash warning"
+        >Dismiss</button>
+      </div>
+    `)
+    .join("");
+  return `<div class="image-hash-warnings">${rows}</div>`;
+}
+
+/** Updates only the image-hash warning banner container without remounting the viewer. */
+function updateImageHashWarningsUI(): void {
+  const alerts = appRoot.querySelector<HTMLElement>(".image-view__alerts");
+  if (!alerts) return;
+  alerts.innerHTML = renderImageHashWarnings();
+}
+
 /** Renders mask mode selector panel body. */
 function renderMaskModeBody(): string {
   const selectedMode = appState.maskMode;
@@ -2000,6 +2148,43 @@ function renderAnnotationList(): string {
     )
     .join("");
   return `<ul class="annotation-list">${items}</ul>`;
+}
+
+/** Returns selected annotation-id key for comment mapping, or null when none is selected. */
+function getSelectedCommentKey(): string | null {
+  const selectedMaskId = appState.selectedMaskId;
+  if (!selectedMaskId) return null;
+  const selected = appState.masks.find((mask) => mask.id === selectedMaskId);
+  return selected ? String(maskPersistedNumericID(selected)) : null;
+}
+
+/** Renders read-only author helper text for a comment key, when available. */
+function renderCommentAuthorText(key: string): string {
+  const author = appState.annotationAuthors[key];
+  if (!author) return "";
+  return `<div class="comment-panel__author">Last edited by ${escapeHtml(author)}</div>`;
+}
+
+/** Renders the always-visible image-level comment panel body. */
+function renderPictureCommentBody(): string {
+  const value = appState.annotationComments["image"] ?? "";
+  return `
+    <textarea rows="3" placeholder="Image comment" data-action="image-comment-input">${escapeHtml(value)}</textarea>
+    ${renderCommentAuthorText("image")}
+  `;
+}
+
+/** Renders the selected-annotation comment panel body. */
+function renderAnnotationCommentBody(): string {
+  const key = getSelectedCommentKey();
+  if (!key) {
+    return "";
+  }
+  const value = appState.annotationComments[key] ?? "";
+  return `
+    <textarea rows="3" placeholder="Annotation comment" data-action="annotation-comment-input">${escapeHtml(value)}</textarea>
+    ${renderCommentAuthorText(key)}
+  `;
 }
 
 /** Renders the mask label-assignment context menu. */
@@ -2060,7 +2245,26 @@ function updateAnnotationUI(): void {
   if (annotationsPanelBody) {
     annotationsPanelBody.innerHTML = renderAnnotationList();
   }
+  updateCommentPanelsUI();
   viewer?.draw();
+}
+
+/** Updates comment panels in-place without remounting the viewer. */
+function updateCommentPanelsUI(): void {
+  const pictureBody = appRoot.querySelector<HTMLElement>('[data-panel="commentPicture"] .panel__body');
+  if (pictureBody) {
+    pictureBody.innerHTML = renderPictureCommentBody();
+  }
+
+  const annotationPanel = appRoot.querySelector<HTMLElement>('[data-panel="commentAnnotation"]');
+  const annotationBody = appRoot.querySelector<HTMLElement>('[data-panel="commentAnnotation"] .panel__body');
+  const selectedCommentKey = getSelectedCommentKey();
+  if (annotationPanel) {
+    annotationPanel.hidden = selectedCommentKey === null;
+  }
+  if (annotationBody) {
+    annotationBody.innerHTML = renderAnnotationCommentBody();
+  }
 }
 
 /** Refreshes selection-dependent annotation visuals without full app re-render. */
@@ -2077,12 +2281,29 @@ function updateMaskSelectionUI(): void {
 
 /** Updates image-reset UI state without remounting the viewer. */
 function updateImageStateUI(): void {
+  updateLeftSidebarImageNavUI();
   updateAnnotationUI();
   updateMaskSelectionUI();
   const canvas = appRoot.querySelector<HTMLCanvasElement>(".image-view__canvas");
   const waitingForImageReady = appState.currentImageHash === null;
   canvas?.classList.toggle("image-view__canvas--zoom-loading", waitingForImageReady);
   viewer?.draw();
+}
+
+/** Updates left-sidebar image label and 1-based index input. */
+function updateLeftSidebarImageNavUI(): void {
+  const imageMeta = appRoot.querySelector<HTMLElement>('[data-role="image-label"]');
+  if (imageMeta) {
+    imageMeta.textContent = `Image: ${getCurrentImageLabel()}`;
+  }
+  const imageIndexInput = appRoot.querySelector<HTMLInputElement>('input[data-action="jump-image-index"]');
+  if (!imageIndexInput) return;
+  const hasImages = appState.imageList.length > 0;
+  const oneBasedIndex = hasImages ? (appState.currentImageIndex + 1) : 0;
+  imageIndexInput.value = String(oneBasedIndex);
+  imageIndexInput.min = hasImages ? "1" : "0";
+  imageIndexInput.max = hasImages ? String(appState.imageList.length) : "0";
+  imageIndexInput.disabled = !hasImages;
 }
 
 /** Wires annotation list action buttons after panel-body updates. */
@@ -2109,6 +2330,36 @@ function bindAnnotationPanelHandlers(): void {
     appState.selectedMaskId = maskId;
     closeMaskContextMenu();
     updateMaskSelectionUI();
+  });
+  appRoot.addEventListener("input", (event) => {
+    const target = event.target as Element | null;
+    const imageTextarea = target?.closest<HTMLTextAreaElement>('textarea[data-action="image-comment-input"]');
+    if (imageTextarea && appRoot.contains(imageTextarea)) {
+      const nextValue = imageTextarea.value;
+      if (nextValue === "") {
+        delete appState.annotationComments["image"];
+      } else {
+        appState.annotationComments["image"] = nextValue;
+      }
+      if (appState.currentImageHash) {
+        scheduleCommentSaveAnnotations();
+      }
+      return;
+    }
+
+    const annotationTextarea = target?.closest<HTMLTextAreaElement>('textarea[data-action="annotation-comment-input"]');
+    if (!annotationTextarea || !appRoot.contains(annotationTextarea)) return;
+    const key = getSelectedCommentKey();
+    if (!key) return;
+    const nextValue = annotationTextarea.value;
+    if (nextValue === "") {
+      delete appState.annotationComments[key];
+    } else {
+      appState.annotationComments[key] = nextValue;
+    }
+    if (appState.currentImageHash) {
+      scheduleCommentSaveAnnotations();
+    }
   });
 }
 
@@ -2402,8 +2653,8 @@ class WebGLTileViewer {
   private readonly onMaskCanvasClick: (payload: MaskCanvasClick) => void;
   /** Returns true when left-button drag should be interpreted as bbox placement. */
   private readonly isBboxDragPlacementEnabled: () => boolean;
-  /** Returns true when bbox mode is active (used to suppress pan-drag). */
-  private readonly isBboxModeActive: () => boolean;
+  /** Returns true when any mask-placement mode is active (used to suppress pan-drag). */
+  private readonly isMaskModeActive: () => boolean;
   /** Callback for bbox placement drag gestures. */
   private readonly onMaskCanvasDrag: (payload: MaskCanvasDrag) => void;
   /** Returns the currently editable bbox mask, or null when side-editing is disabled. */
@@ -2537,7 +2788,7 @@ class WebGLTileViewer {
     getMasks: () => MaskPoint[],
     onMaskCanvasClick: (payload: MaskCanvasClick) => void,
     isBboxDragPlacementEnabled: () => boolean,
-    isBboxModeActive: () => boolean,
+    isMaskModeActive: () => boolean,
     onMaskCanvasDrag: (payload: MaskCanvasDrag) => void,
     getEditableBboxMask: () => MaskPoint | null,
     onMaskCanvasBboxSideDrag: (payload: MaskCanvasBboxSideDrag) => void,
@@ -2548,7 +2799,7 @@ class WebGLTileViewer {
     this.getMasks = getMasks;
     this.onMaskCanvasClick = onMaskCanvasClick;
     this.isBboxDragPlacementEnabled = isBboxDragPlacementEnabled;
-    this.isBboxModeActive = isBboxModeActive;
+    this.isMaskModeActive = isMaskModeActive;
     this.onMaskCanvasDrag = onMaskCanvasDrag;
     this.getEditableBboxMask = getEditableBboxMask;
     this.onMaskCanvasBboxSideDrag = onMaskCanvasBboxSideDrag;
@@ -3863,7 +4114,7 @@ class WebGLTileViewer {
       }
     }
 
-    if (this.isBboxModeActive()) {
+    if (this.isMaskModeActive()) {
       return;
     }
 
@@ -4115,7 +4366,7 @@ function mountViewer(): void {
     () =>
       (appState.maskMode === "bounding box" || appState.maskMode === "freehand") &&
       appState.selectedMaskId === null,
-    () => appState.maskMode === "bounding box" || appState.maskMode === "freehand",
+    () => appState.maskMode === "point" || appState.maskMode === "bounding box" || appState.maskMode === "freehand",
     (payload) => {
       if (payload.phase === "start") {
         const hadMenuOpen = appState.maskContextMenu.open;
@@ -5485,11 +5736,22 @@ function render(): void {
         <div class="sidebar__content">
           <button type="button" data-action="previous">previous</button>
           <button type="button" data-action="next">next</button>
-          <div class="meta">Image: ${getCurrentImageLabel()}</div>
+          <input
+            type="number"
+            data-action="jump-image-index"
+            aria-label="Image index"
+            value="${appState.imageList.length > 0 ? appState.currentImageIndex + 1 : 0}"
+            min="${appState.imageList.length > 0 ? 1 : 0}"
+            max="${appState.imageList.length > 0 ? appState.imageList.length : 0}"
+            ${appState.imageList.length > 0 ? "" : "disabled"}
+          />
+          <button type="button" data-action="fast-forward">fast-forward</button>
+          <div class="meta" data-role="image-label">Image: ${getCurrentImageLabel()}</div>
         </div>
       </aside>
 
       <main class="image-view">
+        <div class="image-view__alerts">${renderImageHashWarnings()}</div>
         <div class="image-view__canvas-wrap">
           <canvas class="image-view__canvas" aria-label="Tile image viewer" tabindex="0"></canvas>
         </div>
@@ -5509,12 +5771,12 @@ function render(): void {
           ${renderPanel(
             "commentAnnotation",
             "comment/annotation",
-            '<textarea rows="3" placeholder="Annotation comment"></textarea>'
+            renderAnnotationCommentBody()
           )}
           ${renderPanel(
             "commentPicture",
             "comment/picture",
-            '<textarea rows="3" placeholder="Image comment"></textarea>'
+            renderPictureCommentBody()
           )}
         </div>
       </aside>
@@ -5533,6 +5795,7 @@ function render(): void {
 
   bindRightSidebarResizeHandle();
   mountViewer();
+  updateCommentPanelsUI();
   restoreFocusFromSnapshot(focusSnapshot);
 }
 
