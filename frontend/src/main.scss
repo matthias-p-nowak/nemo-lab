@@ -160,6 +160,45 @@ button:hover {
   background: var(--bg);
 }
 
+.image-view__alerts {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px 0;
+}
+
+.image-hash-warnings {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.image-hash-warning {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid #a15f00;
+  background: rgba(161, 95, 0, 0.2);
+  color: #ffd99b;
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 0.85rem;
+}
+
+.image-hash-warning__text {
+  flex: 1;
+  min-width: 0;
+}
+
+.image-hash-warning__file {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+.image-hash-warning__dismiss {
+  padding: 4px 8px;
+  font-size: 0.8rem;
+}
+
 .image-view__canvas-wrap {
   flex: 1;
   min-height: 0;
@@ -342,6 +381,16 @@ textarea {
   background: var(--bg-panel-alt);
   color: var(--text);
   padding: 8px;
+}
+
+textarea[data-action="image-comment-input"],
+textarea[data-action="annotation-comment-input"] {
+  border: none;
+}
+
+.comment-panel__author {
+  color: var(--text-muted);
+  font-size: 0.8rem;
 }
 
 // ── Hamburger ────────────────────────────────────────────────────────────────

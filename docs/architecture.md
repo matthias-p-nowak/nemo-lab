@@ -87,11 +87,14 @@
 - `set_active_task` loads `tasks.annotations` + `tasks.checkmark` and resets per-token active annotation selection state.
 - Additional WS message types:
   - `load_annotations` (`hash`) → resolve hash to image path, choose annotation file path (`nemolab.json` for single-file mode, `<image>.json` otherwise). If target file is missing, migration/import checks run in order: opposite-mode file inside `annotationsDir` (migrate + delete old), then image-adjacent sidecar (`<image_dir>/<stem>.json`) (import only, original kept). Resolved content is read through `backend/annotations.ReadAnnotations` on first access, cached globally by path, and returned as `annotations_data`.
-  - `save_annotations` (`hash`, `annotations`) → resolve file path, merge incoming data into the shared path entry, mark path dirty, and reset a per-path 10s debounce timer.
+  - `save_annotations` (`hash`, `annotations`) → resolve file path, merge incoming data into the shared path entry, mark path dirty, and reset a per-path 10s debounce timer. Payload accepts `nemolab_comments` and `nemolab_authors` flat string maps. On each save, backend resolves the username for the current session token and atomically updates author keys for comments whose values changed in that save (and removes author keys when comments are removed). Image hash fields (`nemolab_hash_sha256`, `nemolab_hash_algo`) are preserved across merges when incoming payload omits them.
+  - `find_first_annotated_image` (`hashes`, `current_hash`) → scan annotation files from disk at click time (mode-aware path resolution per hash, single-file or per-image), starting strictly after `current_hash` in list order (no wrap). Find the first hash whose annotation file is missing or has zero annotations, and respond with `first_annotated_image` (`hash`). No response is emitted when all remaining images are annotated.
 - Save merge policy is last-write-wins per annotation id for the targeted image id; missing ids from incoming payload for that image are removed from the shared state.
 - On save, WS broadcasts updated `annotations_data` to other active connections whose `activeAnnotationPath` matches the same file path.
-- Debounce flush callback writes that dirty path via `backend/annotations.WriteAnnotations` and clears the dirty flag.
-- On disconnect, if the token has an active annotation path and that path is dirty, WS flushes it immediately and cancels its timer.
+- Debounce flush callback writes that dirty path via `backend/annotations.WriteAnnotations`, clears the dirty flag, and asynchronously computes SHA-256 for the active image file (1 MiB chunked reads).
+- First post-write hash check with missing stored value updates the matching image entry in the in-memory store (`nemolab_hash_sha256`, `nemolab_hash_algo: "sha256"`) and rewrites the file.
+- Subsequent post-write hash checks compare computed hash to stored hash; mismatch sends WS `{type:"image_hash_mismatch", hash, file}` to active connections for the saving session token.
+- On disconnect, if the token has an active annotation path and that path is dirty, WS flushes it immediately, cancels its timer, and runs the same post-write hash check flow.
 - During prefetch generation, WS forwards structured tile-generation events from `backend/tiles` into the per-session JSONL logger (`tile_generation_start`, `tile_generation_decoded`, `tile_generation_mipmap_done`, `tile_generation_level_done`, `tile_generation_complete`, `tile_generation_cache_hit`).
 - Logging messages continue to be appended from `{ "type": "log", "entry": { ... } }` payloads; `set_active_task` can arrive either top-level or as a logged event entry.
 
@@ -119,7 +122,7 @@
   - `ReadAnnotations(path)` reads JSON, auto-detects LabelMe via top-level `shapes`, otherwise treats input as COCO/extended COCO.
   - Reader is lenient for missing `images`, `annotations`, `categories` arrays (normalized to empty slices).
   - Reader normalizes polygon segmentations (LabelMe polygon shapes and COCO polygon segmentations) to COCO-RLE with uncompressed column-major counts (`[]int`).
-  - Reader preserves extended-COCO sidecar payloads (`nemolab_labels`, `nemolab_comments`, `nemolab_authors`) as `json.RawMessage`.
+  - Reader preserves extended-COCO sidecar payloads (`nemolab_labels`, `nemolab_comments`, `nemolab_authors`) as `json.RawMessage` and keeps image hash fields (`nemolab_hash_sha256`, `nemolab_hash_algo`) inside `images` entries.
   - `WriteAnnotations(path, af)` always writes extended COCO and includes sidecar keys only when present.
   - Writer uses atomic file replacement (`path.tmp` + `os.Rename`) and ensures parent directories exist.
 
@@ -186,11 +189,21 @@
 - Logged frontend events include `image_change`, document `focus` (`focusin`/`focusout`), and temporary mask interaction events (`mouse_click`, `mask_created`, `mask_removed`, `label_assigned`).
 - Left sidebar uses the same scrollable content-wrapper pattern as the right sidebar (`.sidebar__content` with vertical overflow); the left content wrapper has top margin to clear the fixed top-left controls. The hamburger button is rendered as a fixed control adjacent to the fixed left-sidebar toggle.
 - On new-image activation (`image_ready` for a new hash), frontend defers activation logging until matching `annotations_data` arrives, then emits in order: `image_activated` (full image path), optional `annotations_source` (only when loaded payload is non-empty, with count/format/type summary), and `annotations_destination` (active write-target path from task annotations mode).
+- Left sidebar includes:
+  - previous/next image buttons,
+  - a numeric image-index input (1-based, Enter to jump, clamped to valid range),
+  - and a fast-forward button that requests `find_first_annotated_image` with `current_hash` and jumps to the returned hash (first unannotated image after current in list order; no wrap).
 - Canvas left-click adds a mask point only if total pointer travel since `pointerdown` is ≤ `config.clickMaxDragPx` (default 10 CSS px); longer drags are treated as pan gestures and suppressed. `Shift+left-click` removes nearest mask within 10 CSS px. Right-click near a mask opens a floating label assignment menu.
 - Right sidebar includes a mask-mode selector panel between Labels and Masks. `appState.maskMode` is the active mode (`point`, `bounding box`, `freehand`) and defaults to `point` on task activation. Selecting `bounding box` or `freehand` shows inline `Mode not yet supported.` feedback and immediately reverts selection back to `point`.
 - On `image_ready` for a newly selected hash, frontend sends `load_annotations` for that hash.
 - Frontend applies `annotations_data` only when `hash === appState.currentImageHash`, updates stored image dimensions, and reconstructs masks from either COCO keypoints (`point`) or COCO `bbox` (`bounding box`) annotations with category-id label lookup.
-- Frontend sends `save_annotations` after mask create/remove/label-assign by rebuilding a COCO-like payload from current masks, using current image filename and last-known image width/height.
+- Frontend handles `image_hash_mismatch` WS messages by rendering a visible dismissible warning banner that includes the affected image file path.
+- Frontend keeps comment/author sidecars in app state as flat maps (`annotationComments`, `annotationAuthors`), loading both from incoming `annotations_data` (`nemolab_comments`, `nemolab_authors`).
+- Right sidebar includes two comment panels:
+  - `comment/picture`: always visible, textarea bound to `annotationComments["image"]`.
+  - `comment/annotation`: visible only when a mask is selected, textarea bound to the selected annotation-id key.
+  - both panels show read-only helper text `Last edited by <username>` when the corresponding author key exists.
+- Frontend sends `save_annotations` after mask create/remove/label-assign immediately; comment-input saves are debounced client-side (~500 ms) to avoid per-keystroke WS propagation flooding. Payload is rebuilt from current masks plus `nemolab_comments`/`nemolab_authors`, using current image filename and last-known image width/height.
 - Mask rendering palettes are split: fill uses `maskFillColor` (bit-reversed hue, S=0.50 V=0.70); outline uses label-based `labelColor` (S=0.75 V=0.90) or gray for unlabeled masks.
 - Optics panel includes persisted mask-render controls (`mask_stroke_opacity`, `mask_fill_opacity`, `mask_stroke_width`, `mask_marker_size`) that drive point alpha/size in the WebGL mask draw pass.
 - Mask outline pass is rendered as an annulus (ring) via shader uniform thresholding; fill pass remains a solid circle. This avoids label-color solid dots when fill opacity is set to zero.

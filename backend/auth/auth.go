@@ -83,6 +83,24 @@ func ValidSessionToken(token string) bool {
 	return ok
 }
 
+// UsernameFromSessionToken resolves username for an in-memory session token.
+func UsernameFromSessionToken(db *sql.DB, token string) (string, bool) {
+	if token == "" {
+		return "", false
+	}
+	sessionsMu.RLock()
+	userID, ok := sessions[token]
+	sessionsMu.RUnlock()
+	if !ok {
+		return "", false
+	}
+	var username string
+	if err := db.QueryRow("SELECT username FROM users WHERE id = ?", userID).Scan(&username); err != nil {
+		return "", false
+	}
+	return username, true
+}
+
 func withUsername(ctx context.Context, username string) context.Context {
 	return context.WithValue(ctx, usernameContextKey, username)
 }

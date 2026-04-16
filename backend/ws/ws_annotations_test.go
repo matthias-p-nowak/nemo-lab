@@ -132,6 +132,105 @@ func TestMergeAnnotationFiles_SidecarPreservedWhenIncomingNil(t *testing.T) {
 	}
 }
 
+func TestMergeAnnotationFiles_PreservesImageHashFieldsWhenIncomingMissing(t *testing.T) {
+	existing := &annotations.AnnotationFile{
+		Images: []annotations.CocoImage{{
+			ID:                1,
+			FileName:          "img.png",
+			Width:             10,
+			Height:            10,
+			NemolabHashSHA256: "cafebabe",
+			NemolabHashAlgo:   "sha256",
+		}},
+	}
+	incoming := &annotations.AnnotationFile{
+		Images: []annotations.CocoImage{{
+			ID:       1,
+			FileName: "img.png",
+			Width:    20,
+			Height:   20,
+		}},
+	}
+
+	got := mergeAnnotationFiles(existing, incoming)
+	if len(got.Images) != 1 {
+		t.Fatalf("expected one image, got %#v", got.Images)
+	}
+	if got.Images[0].NemolabHashSHA256 != "cafebabe" || got.Images[0].NemolabHashAlgo != "sha256" {
+		t.Fatalf("expected hash fields to be preserved, got %#v", got.Images[0])
+	}
+}
+
+func TestFindImageIndexByPath(t *testing.T) {
+	images := []annotations.CocoImage{
+		{ID: 1, FileName: "a.png"},
+		{ID: 2, FileName: "b.png"},
+	}
+	if got := findImageIndexByPath(images, "/tmp/x/b.png"); got != 1 {
+		t.Fatalf("expected basename match index=1, got %d", got)
+	}
+	if got := findImageIndexByPath(images, "/tmp/x/c.png"); got != -1 {
+		t.Fatalf("expected no match, got %d", got)
+	}
+}
+
+func TestApplyCommentAuthorUpdate_ChangedCommentSetsAuthor(t *testing.T) {
+	existing := &annotations.AnnotationFile{
+		NemolabComments: json.RawMessage(`{"image":"old"}`),
+		NemolabAuthors:  json.RawMessage(`{"image":"alice"}`),
+	}
+	incoming := &annotations.AnnotationFile{
+		NemolabComments: json.RawMessage(`{"image":"new"}`),
+		NemolabAuthors:  json.RawMessage(`{"image":"alice"}`),
+	}
+
+	applyCommentAuthorUpdate(existing, incoming, "bob")
+
+	if got := decodeStringMap(incoming.NemolabComments)["image"]; got != "new" {
+		t.Fatalf("expected updated comment, got %q", got)
+	}
+	if got := decodeStringMap(incoming.NemolabAuthors)["image"]; got != "bob" {
+		t.Fatalf("expected author update to bob, got %q", got)
+	}
+}
+
+func TestApplyCommentAuthorUpdate_RemovedCommentClearsAuthor(t *testing.T) {
+	existing := &annotations.AnnotationFile{
+		NemolabComments: json.RawMessage(`{"42":"needs review"}`),
+		NemolabAuthors:  json.RawMessage(`{"42":"alice"}`),
+	}
+	incoming := &annotations.AnnotationFile{
+		NemolabComments: json.RawMessage(`{}`),
+		NemolabAuthors:  json.RawMessage(`{"42":"alice"}`),
+	}
+
+	applyCommentAuthorUpdate(existing, incoming, "bob")
+
+	if got := decodeStringMap(incoming.NemolabComments)["42"]; got != "" {
+		t.Fatalf("expected comment key removed, got %q", got)
+	}
+	if got := decodeStringMap(incoming.NemolabAuthors)["42"]; got != "" {
+		t.Fatalf("expected author key removed, got %q", got)
+	}
+}
+
+func TestApplyCommentAuthorUpdate_UnchangedCommentKeepsAuthor(t *testing.T) {
+	existing := &annotations.AnnotationFile{
+		NemolabComments: json.RawMessage(`{"42":"stable"}`),
+		NemolabAuthors:  json.RawMessage(`{"42":"alice"}`),
+	}
+	incoming := &annotations.AnnotationFile{
+		NemolabComments: json.RawMessage(`{"42":"stable"}`),
+		NemolabAuthors:  json.RawMessage(`{}`),
+	}
+
+	applyCommentAuthorUpdate(existing, incoming, "bob")
+
+	if got := decodeStringMap(incoming.NemolabAuthors)["42"]; got != "alice" {
+		t.Fatalf("expected unchanged comment to keep existing author, got %q", got)
+	}
+}
+
 func TestMigrateAnnotationFileIfNeeded_NoOpWhenTargetExists(t *testing.T) {
 	dir := t.TempDir()
 	imagePath := filepath.Join(dir, "img.png")
@@ -213,4 +312,3 @@ func writeAnnotationFixture(t *testing.T, path, fileName string) {
 		t.Fatalf("write fixture failed: %v", err)
 	}
 }
-

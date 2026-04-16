@@ -14,10 +14,12 @@ type AnnotationFile struct {
 }
 
 type CocoImage struct {
-	ID       int    `json:"id"`
-	FileName string `json:"file_name,omitempty"`
-	Width    int    `json:"width,omitempty"`
-	Height   int    `json:"height,omitempty"`
+	ID                int    `json:"id"`
+	FileName          string `json:"file_name,omitempty"`
+	Width             int    `json:"width,omitempty"`
+	Height            int    `json:"height,omitempty"`
+	NemolabHashSHA256 string `json:"nemolab_hash_sha256,omitempty"`
+	NemolabHashAlgo   string `json:"nemolab_hash_algo,omitempty"`
 }
 
 type CocoCategory struct {

@@ -11,7 +11,14 @@ import (
 func TestReadAnnotations_PlainCOCO(t *testing.T) {
 	path := writeJSONFixture(t, map[string]any{
 		"images": []any{
-			map[string]any{"id": 1, "file_name": "img.png", "width": 100, "height": 50},
+			map[string]any{
+				"id":                  1,
+				"file_name":           "img.png",
+				"width":               100,
+				"height":              50,
+				"nemolab_hash_sha256": "abc123",
+				"nemolab_hash_algo":   "sha256",
+			},
 		},
 		"annotations": []any{
 			map[string]any{"id": 10, "image_id": 1, "category_id": 7, "keypoints": []any{12.0, 8.0, 2.0}, "num_keypoints": 1},
@@ -26,6 +33,9 @@ func TestReadAnnotations_PlainCOCO(t *testing.T) {
 	}
 	if len(af.Images) != 1 || af.Images[0].FileName != "img.png" {
 		t.Fatalf("unexpected images: %#v", af.Images)
+	}
+	if af.Images[0].NemolabHashSHA256 != "abc123" || af.Images[0].NemolabHashAlgo != "sha256" {
+		t.Fatalf("expected image hash fields preserved, got %#v", af.Images[0])
 	}
 	if len(af.Annotations) != 1 || af.Annotations[0].NumKeypoints != 1 {
 		t.Fatalf("unexpected annotations: %#v", af.Annotations)
@@ -277,7 +287,7 @@ func TestWriteAnnotations_RoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "roundtrip.json")
 	in := &AnnotationFile{
-		Images:      []CocoImage{{ID: 1, FileName: "x.png", Width: 10, Height: 11}},
+		Images:      []CocoImage{{ID: 1, FileName: "x.png", Width: 10, Height: 11, NemolabHashSHA256: "deadbeef", NemolabHashAlgo: "sha256"}},
 		Annotations: []CocoAnnotation{{ID: 1, ImageID: 1, CategoryID: 2, Keypoints: []float64{3, 4, 2}, NumKeypoints: 1}},
 		Categories:  []CocoCategory{{ID: 2, Name: "Cell"}},
 	}

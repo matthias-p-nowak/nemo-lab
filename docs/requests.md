@@ -68,6 +68,18 @@
 
 - **Annotation persistence**: Backend reads plain COCO, extended COCO, and LabelMe (auto-detected by presence of `shapes` key). Reads are fully lenient (missing arrays treated as empty). Backend writes only extended COCO. Polygons are the preferred segmentation format — COCO and LabelMe polygon segmentations are preserved as-is (not rasterized); RLE segmentations from external sources are converted to contour polygons via border-tracing on read. All annotations are written as polygon segmentation; RLE is no longer written. Area computed via shoelace formula. Extended sidecar keys: `nemolab_labels`, `nemolab_comments`, `nemolab_authors`. Writes are debounced 10 s after last modification. Single-file mode writes to `nemolab.json`; per-image mode writes to `<imagename>.json`. Mode switching migrates only the current image lazily; other images are migrated when next accessed. (2026-04-11, updated 2026-04-13)
 
+- **Comment authors**: `nemolab_authors` mirrors `nemolab_comments` — same keys, value = username string of the last editor. Updated atomically with the comment on each edit. Displayed read-only alongside the comment textarea ("Last edited by <user>"). Missing key means no author recorded. (2026-04-16)
+
+- **Image content hash**: On annotation write, nemo-lab stores `nemolab_hash_sha256` (lowercase hex SHA-256 of image file bytes) and `nemolab_hash_algo: "sha256"` in the image entry. Hash is computed asynchronously post-write. First write: hash is computed and stored. Subsequent writes: stored hash is re-verified asynchronously; mismatch pushes `image_hash_mismatch` WS message to frontend, which shows a visible warning banner. External files without these fields are silently accepted. (2026-04-16)
+
+- **Left sidebar image navigation controls**: Image index field (1-based numeric input, Enter to jump, clamped to valid range) and fast-forward button (jumps to first image after the current one whose annotation file on disk does not exist or contains zero masks; checks file system at click time; no-op if all remaining images are annotated). (2026-04-16)
+
+- **Comment textarea styling**: Comment textareas in the right sidebar have no border (`border: none`). (2026-04-16)
+
+- **Comment panels**: Two independent right-sidebar panels. "Comment/Picture" is always visible — single textarea for the image-level comment (`"image"` key in `nemolab_comments`). "Comment/Annotation" shows only when a mask is selected — single textarea for that mask's comment (annotation id as string key); hidden/cleared on deselection. Both write to the shared annotation store on `input` and follow the normal debounce/propagation cycle. (2026-04-16)
+
+- **Annotation comment persistence**: `nemolab_comments` is a flat string map — key `"image"` for the image-level comment, annotation `id` as string for per-annotation comments. Missing or empty string means no comment. Comments are persisted in the same debounced write cycle as masks/labels and propagated live to other connected users. (2026-04-16)
+
 - **Annotations panel selection indicator**: The Annotations panel highlights the row of the currently selected mask. When no mask is selected, no row is highlighted. Selecting a mask scrolls its row into view in the panel. (2026-04-13)
 
 - **On-demand image list + prefetch tiling**: Backend derives task image lists from `task.images`, computes image hash as SHA-256 of canonical absolute file path, pushes `image_list` over WS, and handles `prefetch`/`image_ready` flow. `/images/{hash}/manifest.json` and `/images/{hash}/tiles/{z}/{x}_{y}.png` are cache-only HTTP reads; tile generation happens via WS prefetch processing. (2026-04-05)

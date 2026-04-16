@@ -185,7 +185,7 @@ CREATE TABLE users (
 
 ### Layout
 
-- Left collapsible sidebar: previous / next image buttons
+- Left collapsible sidebar: previous / next image buttons, image index field, fast-forward button
 - Center image view: single WebGL canvas fills the area
 - Right collapsible sidebar: collapsible panels — [Optics](#optics-panel), masks, labels, annotations, comment/annotation, comment/picture. Width is user-resizable (drag left edge); see [Right Sidebar](#right-sidebar).
 
@@ -441,6 +441,19 @@ The menu bar is restructured so that sidebar toggle buttons are always visible a
 - The hamburger button is positioned adjacent to (next to) the left-sidebar show/hide toggle button, both fixed at the top-left corner.
 - `.sidebar__content` on the left sidebar has `overflow-y: auto` so its panels scroll vertically and are never clipped.
 
+#### Image index field
+
+- A numeric input showing the 1-based index of the current image in the image list (e.g. `3` when viewing the third image).
+- Editable: user can type a number and press Enter to jump directly to that image (clamped to valid range).
+- Updated whenever the active image changes.
+
+#### Fast-forward button
+
+- Jumps to the first image (by list order, starting after the current image) whose annotation file on disk does **not** exist or contains zero masks.
+- "Annotation file on disk" follows the current mode: single-file (`nemolab.json`) or per-image sidecar.
+- If no such image exists (all remaining images are annotated), the button does nothing (no navigation).
+- The check is performed against the file system at the moment the button is clicked (not cached state).
+
 ### Mask Mode Selector
 
 A dropdown panel in the right sidebar, placed between the Labels panel and the Masks panel. It shows the currently active mask mode and allows the user to switch between modes.
@@ -598,6 +611,29 @@ An annotation is the assignment of a label to a mask.
   - Clicking a list item assigns that label to the mask.
 - The **last assigned label** is the default for the next placed mask (auto-assigned on placement).
 
+### Comment Panels
+
+Two independent collapsible panels in the right sidebar:
+
+#### Comment/Picture panel
+
+- Always visible (not gated on mask selection).
+- Contains a single multi-line `<textarea>` for the image-level comment (`"image"` key in `nemolab_comments`).
+- Loaded from the annotation store when the active image changes; cleared when no image is active.
+- Changes are written to the shared annotation store immediately on `input` and trigger the normal debounced file write and live propagation.
+
+#### Comment/Annotation panel
+
+- Visible only when a mask is selected; shows a placeholder or is collapsed when no mask is selected.
+- Contains a single multi-line `<textarea>` for the selected mask's comment (key = annotation `id` as string in `nemolab_comments`).
+- Updated when mask selection changes: textarea is repopulated from the store for the newly selected mask.
+- Changes are written to the shared annotation store immediately on `input`, same debounce/propagation as above.
+- When the mask is deselected (Escape or selection cleared), the textarea is cleared/hidden.
+
+#### Comment textarea styling
+
+- Comment textareas have `border: none` — no visible border.
+
 ### Annotation Persistence
 
 #### File format
@@ -613,13 +649,65 @@ An annotation is the assignment of a label to a mask.
 - All annotations are written with polygon `segmentation`. RLE is no longer written.
 - Area is computed via the shoelace formula on the polygon points.
 
+#### Image content hash
+
+Each image entry in the `images` array written by nemo-lab includes two extra fields:
+
+| Field | Content |
+|-------|---------|
+| `nemolab_hash_sha256` | Lowercase hex SHA-256 digest of the image file's raw bytes |
+| `nemolab_hash_algo` | Always `"sha256"` |
+
+- The hash is computed **asynchronously after the annotation file is written** (does not block the save path).
+- On first write (no hash stored yet): the hash is computed, then the annotation file is updated with the hash value.
+- On subsequent writes: the previously stored hash is preserved in the file as-is; a background goroutine re-computes the hash and compares it to the stored value.
+  - If they match: no action.
+  - If they differ: a warning WS message is pushed to the frontend (`type: "image_hash_mismatch"`, `hash`: image hash, `file`: image path).
+- The frontend displays a visible warning banner when it receives `image_hash_mismatch`, identifying the affected image.
+- External annotation files (not written by nemo-lab) will not have these fields; missing fields are silently ignored on read.
+
 #### Extended COCO sidecar fields (top-level keys)
 
 | Key | Content |
 |-----|---------|
 | `nemolab_labels` | Full hierarchical label tree for the task |
-| `nemolab_comments` | Per-annotation and per-image comments |
-| `nemolab_authors` | Author of each comment and annotation |
+| `nemolab_comments` | Per-annotation and per-image comments (flat string map) |
+| `nemolab_authors` | Last editor of each comment (flat string map, mirrors `nemolab_comments`) |
+
+#### Comment schema
+
+`nemolab_comments` is a flat JSON object mapping string keys to single comment strings:
+
+- Key `"image"` → comment for the image itself.
+- Key `"<annotation_id>"` (annotation `id` as string) → comment for that annotation.
+
+Example:
+```json
+"nemolab_comments": {
+  "image": "Blurry in top-left corner.",
+  "42": "Uncertain boundary — needs review."
+}
+```
+
+- Missing key means no comment. Empty string is treated the same as missing.
+- Comments are persisted as part of the normal debounced annotation write cycle (same timing as masks and labels).
+- Comment changes by any user trigger live propagation to other connections viewing the same file, identical to mask changes.
+
+#### Author schema
+
+`nemolab_authors` is a flat JSON object with the same keys as `nemolab_comments`, mapping each key to the username (string) of the user who last edited that comment.
+
+Example:
+```json
+"nemolab_authors": {
+  "image": "alice",
+  "42": "bob"
+}
+```
+
+- When a user edits a comment, the corresponding author entry is updated to that user's username atomically with the comment update.
+- Missing key means no author recorded (comment was never edited in nemo-lab, e.g. imported from external file).
+- Author is displayed read-only alongside the comment textarea in the sidebar (e.g. `"Last edited by alice"`); it is never user-editable.
 
 #### Annotation types
 
