@@ -55,6 +55,9 @@ func TestReadAnnotations_ExtendedCOCOSidecarPreserved(t *testing.T) {
 		"nemolab_labels": map[string]any{
 			"root": []any{"A", "B"},
 		},
+		"nemolab_mask_authors": map[string]any{
+			"1": "alice",
+		},
 	})
 	af, err := ReadAnnotations(path)
 	if err != nil {
@@ -69,6 +72,9 @@ func TestReadAnnotations_ExtendedCOCOSidecarPreserved(t *testing.T) {
 	}
 	if _, ok := got["root"]; !ok {
 		t.Fatalf("unexpected sidecar content: %#v", got)
+	}
+	if gotMaskAuthor := decodeStringMapForTest(t, af.NemolabMaskAuthors)["1"]; gotMaskAuthor != "alice" {
+		t.Fatalf("expected mask author sidecar to be preserved, got %#v", gotMaskAuthor)
 	}
 }
 
@@ -287,9 +293,10 @@ func TestWriteAnnotations_RoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "roundtrip.json")
 	in := &AnnotationFile{
-		Images:      []CocoImage{{ID: 1, FileName: "x.png", Width: 10, Height: 11, NemolabHashSHA256: "deadbeef", NemolabHashAlgo: "sha256"}},
-		Annotations: []CocoAnnotation{{ID: 1, ImageID: 1, CategoryID: 2, Keypoints: []float64{3, 4, 2}, NumKeypoints: 1}},
-		Categories:  []CocoCategory{{ID: 2, Name: "Cell"}},
+		Images:             []CocoImage{{ID: 1, FileName: "x.png", Width: 10, Height: 11, NemolabHashSHA256: "deadbeef", NemolabHashAlgo: "sha256"}},
+		Annotations:        []CocoAnnotation{{ID: 1, ImageID: 1, CategoryID: 2, Keypoints: []float64{3, 4, 2}, NumKeypoints: 1}},
+		Categories:         []CocoCategory{{ID: 2, Name: "Cell"}},
+		NemolabMaskAuthors: json.RawMessage(`{"1":"alice"}`),
 	}
 	if err := WriteAnnotations(path, in); err != nil {
 		t.Fatalf("WriteAnnotations failed: %v", err)
@@ -306,6 +313,9 @@ func TestWriteAnnotations_RoundTrip(t *testing.T) {
 	}
 	if len(out.Annotations) != 1 || out.Annotations[0].NumKeypoints != 1 {
 		t.Fatalf("unexpected annotations after roundtrip: %#v", out.Annotations)
+	}
+	if gotMaskAuthor := decodeStringMapForTest(t, out.NemolabMaskAuthors)["1"]; gotMaskAuthor != "alice" {
+		t.Fatalf("expected round-trip mask author, got %q", gotMaskAuthor)
 	}
 }
 
@@ -373,4 +383,16 @@ func writeJSONFixture(t *testing.T, payload any) string {
 		t.Fatalf("write fixture failed: %v", err)
 	}
 	return path
+}
+
+func decodeStringMapForTest(t *testing.T, raw json.RawMessage) map[string]string {
+	t.Helper()
+	if len(raw) == 0 {
+		return map[string]string{}
+	}
+	var parsed map[string]string
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		t.Fatalf("unmarshal map failed: %v", err)
+	}
+	return parsed
 }

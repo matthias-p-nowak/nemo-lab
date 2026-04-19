@@ -8,9 +8,10 @@ type AnnotationFile struct {
 	Annotations []CocoAnnotation `json:"annotations"`
 	Categories  []CocoCategory   `json:"categories"`
 
-	NemolabLabels   json.RawMessage `json:"nemolab_labels,omitempty"`
-	NemolabComments json.RawMessage `json:"nemolab_comments,omitempty"`
-	NemolabAuthors  json.RawMessage `json:"nemolab_authors,omitempty"`
+	NemolabLabels      json.RawMessage `json:"nemolab_labels,omitempty"`
+	NemolabComments    json.RawMessage `json:"nemolab_comments,omitempty"`
+	NemolabAuthors     json.RawMessage `json:"nemolab_authors,omitempty"`
+	NemolabMaskAuthors json.RawMessage `json:"nemolab_mask_authors,omitempty"`
 }
 
 type CocoImage struct {

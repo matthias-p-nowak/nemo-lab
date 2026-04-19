@@ -46,6 +46,7 @@ function persistSettingLater(key: string, value: string): void {
 /** Debounce timers keyed by setting key for batched setting writes while dragging sliders. */
 const settingPersistDebounceTimers = new Map<string, number>();
 let commentSaveDebounceTimer: number | null = null;
+let modeToastTimer: number | null = null;
 
 /** Persists one user setting after a debounce delay, resetting per-key on repeated calls. */
 function persistSettingDebouncedLater(key: string, value: string, delayMs = 300): void {
@@ -139,28 +140,39 @@ function logEvent(type: string, data: Record<string, unknown> = {}): void {
   ws.send(JSON.stringify({ type: "log", entry: { type, ts: new Date().toISOString(), ...data } }));
 }
 
+/** Timeout handles for shortcut-scope focus flash cleanup. */
+const scopeFocusFlashTimeouts = new WeakMap<HTMLElement, number>();
+
+/** Tracks direct scope focus events for visual flash + telemetry. */
+function handleFocusIn(event: FocusEvent): void {
+  const target = event.target;
+  if (!(target instanceof Element)) return;
+  const scope = target.closest<HTMLElement>("[data-shortcut-scope]");
+  if (!scope || scope !== target) return;
+  const scopeName = scope.dataset["shortcutScope"];
+  if (!scopeName) return;
+  const previousTimeout = scopeFocusFlashTimeouts.get(scope);
+  if (previousTimeout !== undefined) {
+    window.clearTimeout(previousTimeout);
+  }
+  scope.classList.remove("scope-focus-flash");
+  void scope.offsetWidth;
+  scope.classList.add("scope-focus-flash");
+  const timeoutId = window.setTimeout(() => {
+    scope.classList.remove("scope-focus-flash");
+    scopeFocusFlashTimeouts.delete(scope);
+  }, 500);
+  scopeFocusFlashTimeouts.set(scope, timeoutId);
+  logEvent("focus_scope", { scope: scopeName });
+}
 
 document.addEventListener("focusin", (e) =>
   logEvent("focus", { action: "in", target: (e.target as Element | null)?.tagName ?? "unknown" })
 );
+document.addEventListener("focusin", handleFocusIn);
 document.addEventListener("focusout", (e) =>
   logEvent("focus", { action: "out", target: (e.target as Element | null)?.tagName ?? "unknown" })
 );
-
-/** Global PageUp/PageDown handler guard for editable targets. */
-function isEditableKeyTarget(target: EventTarget | null): boolean {
-  if (!(target instanceof HTMLElement)) return false;
-  const tag = target.tagName;
-  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target.isContentEditable;
-}
-
-/** Handles document-level optics transform cycling hotkeys. */
-function handleDocumentPageCycleKeydown(e: KeyboardEvent): void {
-  if (e.key !== "PageUp" && e.key !== "PageDown") return;
-  if (isEditableKeyTarget(e.target)) return;
-  e.preventDefault();
-  cycleOpticsTransform(e.key === "PageUp" ? 1 : -1);
-}
 
 /** Closes the floating mask label context menu. */
 function closeMaskContextMenu(): void {
@@ -168,8 +180,45 @@ function closeMaskContextMenu(): void {
   appState.maskContextMenu.maskId = null;
 }
 
-/** Handles Escape for closing mask context menu (guarded, global listener). */
-function handleDocumentMaskMenuEscape(e: KeyboardEvent): void {
+/** Handles canvas-scope keyboard shortcuts. */
+function handleCanvasScopeKeydown(e: KeyboardEvent): void {
+  if (e.key === "PageUp" || e.key === "PageDown") {
+    e.preventDefault();
+    cycleOpticsTransform(e.key === "PageUp" ? 1 : -1);
+    return;
+  }
+  if (e.key === "Delete") {
+    if (appState.selectedMaskId === null) return;
+    e.preventDefault();
+    removeMask(appState.selectedMaskId);
+    appState.selectedMaskId = null;
+    updateMaskSelectionUI();
+    return;
+  }
+  if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+    if (appState.masks.length === 0) return;
+    e.preventDefault();
+    cycleSelectedMask(e.key === "ArrowDown" ? 1 : -1);
+    return;
+  }
+  if (!e.ctrlKey && !e.altKey && !e.metaKey) {
+    const key = e.key.toLowerCase();
+    if (key === "p") {
+      e.preventDefault();
+      setMaskMode("point");
+      return;
+    }
+    if (key === "r") {
+      e.preventDefault();
+      setMaskMode("bounding box");
+      return;
+    }
+    if (key === "f") {
+      e.preventDefault();
+      setMaskMode("freehand");
+      return;
+    }
+  }
   if (e.key !== "Escape") return;
   if (appState.selectedMaskId !== null) {
     e.preventDefault();
@@ -183,17 +232,6 @@ function handleDocumentMaskMenuEscape(e: KeyboardEvent): void {
   e.preventDefault();
   closeMaskContextMenu();
   updateMaskContextMenuUI();
-}
-
-/** Handles Delete for removing currently selected mask (guarded, global listener). */
-function handleDocumentSelectedMaskDeleteKeydown(e: KeyboardEvent): void {
-  if (e.key !== "Delete") return;
-  if (isEditableKeyTarget(e.target)) return;
-  if (appState.selectedMaskId === null) return;
-  e.preventDefault();
-  removeMask(appState.selectedMaskId);
-  appState.selectedMaskId = null;
-  updateMaskSelectionUI();
 }
 
 /** Cycles selected mask through index order, including the "none selected" state. */
@@ -210,19 +248,169 @@ function cycleSelectedMask(step: 1 | -1): void {
   updateMaskSelectionUI();
 }
 
-/** Handles global ArrowUp/ArrowDown for mask selection cycling. */
-function handleDocumentMaskSelectionCycleKeydown(e: KeyboardEvent): void {
-  if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
-  if (isEditableKeyTarget(e.target)) return;
-  if (appState.masks.length === 0) return;
-  e.preventDefault();
-  cycleSelectedMask(e.key === "ArrowDown" ? 1 : -1);
+/** Handles navigation-scope keyboard shortcuts. */
+function handleNavigationScopeKeydown(event: KeyboardEvent): void {
+  if (event.key !== "Enter") return;
+  const target = event.target as Element | null;
+  const input = target?.closest<HTMLInputElement>('input[data-action="jump-image-index"]');
+  if (!input || !appRoot.contains(input)) return;
+  if (appState.imageList.length === 0) return;
+  event.preventDefault();
+  const parsed = Number.parseInt(input.value, 10);
+  const oneBased = Number.isFinite(parsed) ? parsed : (appState.currentImageIndex + 1);
+  const clamped = Math.max(1, Math.min(appState.imageList.length, oneBased));
+  activateImageAtIndex(clamped - 1);
 }
 
-document.addEventListener("keydown", handleDocumentPageCycleKeydown);
-document.addEventListener("keydown", handleDocumentMaskMenuEscape);
-document.addEventListener("keydown", handleDocumentSelectedMaskDeleteKeydown);
-document.addEventListener("keydown", handleDocumentMaskSelectionCycleKeydown);
+/** Handles task-dialog Enter shortcuts (tags, field commit, and new labels). */
+function handleTaskDialogScopeKeydown(event: KeyboardEvent): void {
+  if (event.key !== "Enter") return;
+  const target = event.target as Element | null;
+  if (!target) return;
+  const addTagInput = target.closest<HTMLInputElement>('[data-action="add-tag"]');
+  if (addTagInput) {
+    event.preventDefault();
+    const val = addTagInput.value.trim();
+    if (!val) return;
+    const task = appState.tasks.find((t) => t.id === addTagInput.getAttribute("data-task-id")) ?? null;
+    if (!task) return;
+    task.tags.push(val);
+    addTagInput.value = "";
+    const card = appRoot.querySelector<HTMLElement>(`.task-card[data-task-id="${task.id}"]`);
+    if (card) {
+      const wrap = card.querySelector<HTMLElement>(".task-tags-wrap");
+      if (wrap) wrap.outerHTML = buildTagsWrapHtml(task);
+      updateTaskSummaryTags(card, task);
+    }
+    void runTaskSave(() => persistTaskTags(task), "Failed to save task tags.", "tasks: save tags failed");
+    return;
+  }
+
+  const fieldInput = target.closest<HTMLInputElement | HTMLTextAreaElement>(".task-field-input[data-field]");
+  if (fieldInput && fieldInput.tagName !== "TEXTAREA") {
+    event.preventDefault();
+    commitTaskFieldInput(fieldInput);
+    return;
+  }
+
+  const newLabelInput = target.closest<HTMLInputElement>(".label-tree[data-task-id] .label-tree__new");
+  if (!newLabelInput) return;
+  event.preventDefault();
+  const val = newLabelInput.value.trim();
+  if (!val) return;
+  const tree = newLabelInput.closest<HTMLElement>(".label-tree[data-task-id]");
+  const task = appState.tasks.find((t) => t.id === (tree?.dataset["taskId"] ?? "")) ?? null;
+  if (!task || !tree) return;
+  const newId = labelNodeId();
+  task.labels.push({ id: newId, text: val, children: [] });
+  task.selectedLabelId = newId;
+  refreshLabelTree(tree, task, newId);
+  void runTaskSave(() => persistTaskLabels(task), "Failed to save labels.", "tasks: save labels failed");
+}
+
+/** Handles task label-tree row shortcuts. */
+function handleTaskLabelTreeScopeKeydown(event: KeyboardEvent): void {
+  if (event.key === "Enter") {
+    handleTaskDialogScopeKeydown(event);
+    return;
+  }
+  if (!appState.isAdmin) return;
+  if (
+    event.key !== "Tab" &&
+    event.key !== "ArrowUp" &&
+    event.key !== "ArrowDown" &&
+    event.key !== "ArrowLeft" &&
+    event.key !== "ArrowRight"
+  ) {
+    return;
+  }
+  const target = event.target as Element | null;
+  const row = target?.closest<HTMLElement>(".label-tree__row");
+  const tree = row?.closest<HTMLElement>('.label-tree[data-task-id][data-shortcut-scope="taskLabelTree"]');
+  if (!row || !tree) return;
+  const task = appState.tasks.find((t) => t.id === (tree.dataset["taskId"] ?? "")) ?? null;
+  if (!task) return;
+  const rowNodeId = row.dataset["nodeId"] ?? null;
+  if (rowNodeId && task.selectedLabelId !== rowNodeId) {
+    task.selectedLabelId = rowNodeId;
+    tree.querySelectorAll(".label-tree__row").forEach((labelRow) => {
+      labelRow.classList.toggle("is-selected", (labelRow as HTMLElement).dataset["nodeId"] === rowNodeId);
+    });
+  }
+  const persistLabels = () => {
+    void runTaskSave(() => persistTaskLabels(task), "Failed to save labels.", "tasks: save labels failed");
+  };
+  const moveSelectedWithinParent = (delta: number) => {
+    if (!task.selectedLabelId) return;
+    const meta = findLabelNodeMeta(task.selectedLabelId, task.labels);
+    if (!meta) return;
+    const nextIdx = meta.index + delta;
+    if (nextIdx < 0 || nextIdx >= meta.parentArr.length) return;
+    meta.parentArr.splice(meta.index, 1);
+    meta.parentArr.splice(nextIdx, 0, meta.node);
+    refreshLabelTree(tree, task, task.selectedLabelId);
+    persistLabels();
+  };
+  const promoteSelected = () => {
+    if (!task.selectedLabelId) return;
+    const meta = findLabelNodeMeta(task.selectedLabelId, task.labels);
+    if (!meta || !meta.parentNode || !meta.grandParentArr) return;
+    meta.parentArr.splice(meta.index, 1);
+    const parentIdx = meta.grandParentArr.findIndex((n) => n.id === meta.parentNode!.id);
+    meta.grandParentArr.splice(parentIdx + 1, 0, meta.node);
+    refreshLabelTree(tree, task, task.selectedLabelId);
+    persistLabels();
+  };
+  const demoteSelected = () => {
+    if (!task.selectedLabelId) return;
+    const meta = findLabelNodeMeta(task.selectedLabelId, task.labels);
+    if (!meta || meta.index === 0) return;
+    const prevSibling = meta.parentArr[meta.index - 1];
+    meta.parentArr.splice(meta.index, 1);
+    prevSibling.children.push(meta.node);
+    refreshLabelTree(tree, task, task.selectedLabelId);
+    persistLabels();
+  };
+  if (event.key === "Tab") {
+    const rows = Array.from(tree.querySelectorAll<HTMLElement>(".label-tree__row"));
+    if (!rows.length) return;
+    event.preventDefault();
+    const idx = rows.indexOf(row);
+    const step = event.shiftKey ? -1 : 1;
+    rows[(idx + step + rows.length) % rows.length].focus();
+    return;
+  }
+  if (event.key === "ArrowUp")   { event.preventDefault(); moveSelectedWithinParent(-1); return; }
+  if (event.key === "ArrowDown") { event.preventDefault(); moveSelectedWithinParent(1); return; }
+  if (event.key === "ArrowLeft") { event.preventDefault(); promoteSelected(); return; }
+  if (event.key === "ArrowRight"){ event.preventDefault(); demoteSelected(); }
+}
+
+/** Dispatches keyboard shortcuts by innermost [data-shortcut-scope]. */
+function handleKeydown(event: KeyboardEvent): void {
+  const target = event.target;
+  if (!(target instanceof Element)) return;
+  const scope = target.closest<HTMLElement>("[data-shortcut-scope]");
+  const scopeName = scope?.dataset["shortcutScope"];
+  if (!scope || !scopeName) return;
+  if (scopeName === "canvas") {
+    handleCanvasScopeKeydown(event);
+    return;
+  }
+  if (scopeName === "navigation") {
+    handleNavigationScopeKeydown(event);
+    return;
+  }
+  if (scopeName === "taskLabelTree") {
+    handleTaskLabelTreeScopeKeydown(event);
+    return;
+  }
+  if (scopeName === "taskDialog") {
+    handleTaskDialogScopeKeydown(event);
+  }
+}
+
+document.addEventListener("keydown", handleKeydown);
 
 /** Mutable prototype application state. */
 const appState = {
@@ -268,6 +456,8 @@ const appState = {
   annotationComments: {} as AnnotationStringMap,
   /** Flat author map keyed like annotationComments with username values. */
   annotationAuthors: {} as AnnotationStringMap,
+  /** Flat mask-creator map keyed by annotation id. */
+  annotationMaskAuthors: {} as AnnotationStringMap,
   /** Label tree of the currently active task, shown in the right sidebar. */
   activeLabels: [] as LabelNode[],
   /** Selected label id in the active task's label tree. */
@@ -276,6 +466,10 @@ const appState = {
   menuOpen: false,
   /** Whether the Tasks modal is open. */
   tasksDialogOpen: false,
+  /** Whether the Help modal is open. */
+  helpDialogOpen: false,
+  /** Active Help-dialog tab. */
+  helpDialogTab: "shortcuts" as HelpDialogTab,
   /** Whether the current Tasks session is in admin mode (toggled per open). */
   isAdmin: false,
   /** Monotonic token for in-flight tasks fetches. */
@@ -461,6 +655,10 @@ const PURE_TRANSFORM_MATRICES: ReadonlyArray<Float32Array> = [
 let dirBrowserPath = "/";
 /** Callback invoked when the user confirms a directory selection. */
 let dirBrowserCallback: ((path: string) => void) | null = null;
+/** Cached app version loaded from GET /api/version on first Help-dialog open. */
+let helpDialogVersion: string | null = null;
+/** Ensures Help-dialog version fetch runs only once. */
+let helpDialogVersionFetchAttempted = false;
 
 /** A node in the hierarchical label tree. */
 interface LabelNode {
@@ -550,6 +748,7 @@ interface MaskPoint {
 /** Supported mask placement modes shown in the sidebar selector. */
 type MaskMode = "point" | "bounding box" | "freehand";
 type BboxEdge = "x0" | "x1" | "y0" | "y1";
+type HelpDialogTab = "shortcuts" | "annotations" | "navigation" | "about";
 
 /** Tile manifest produced by the tiling script. */
 interface TileManifest {
@@ -719,6 +918,7 @@ interface WsAnnotationFile {
   nemolab_labels?: unknown;
   nemolab_comments?: unknown;
   nemolab_authors?: unknown;
+  nemolab_mask_authors?: unknown;
 }
 
 type AnnotationStringMap = Record<string, string>;
@@ -734,6 +934,7 @@ function normalizeWsAnnotationFile(raw: unknown): Required<WsAnnotationFile> & {
       nemolab_labels: undefined,
       nemolab_comments: undefined,
       nemolab_authors: undefined,
+      nemolab_mask_authors: undefined,
       hasNemolabSidecars: false,
     };
   }
@@ -744,7 +945,8 @@ function normalizeWsAnnotationFile(raw: unknown): Required<WsAnnotationFile> & {
   const hasNemolabSidecars =
     src["nemolab_labels"] !== undefined ||
     src["nemolab_comments"] !== undefined ||
-    src["nemolab_authors"] !== undefined;
+    src["nemolab_authors"] !== undefined ||
+    src["nemolab_mask_authors"] !== undefined;
   return {
     images,
     annotations,
@@ -752,6 +954,7 @@ function normalizeWsAnnotationFile(raw: unknown): Required<WsAnnotationFile> & {
     nemolab_labels: src["nemolab_labels"],
     nemolab_comments: src["nemolab_comments"],
     nemolab_authors: src["nemolab_authors"],
+    nemolab_mask_authors: src["nemolab_mask_authors"],
     hasNemolabSidecars,
   };
 }
@@ -929,6 +1132,7 @@ function sendSaveAnnotations(): void {
       categories,
       nemolab_comments: appState.annotationComments,
       nemolab_authors: appState.annotationAuthors,
+      nemolab_mask_authors: appState.annotationMaskAuthors,
     },
   }));
 }
@@ -968,6 +1172,7 @@ function activateImageAtIndex(nextIndex: number): void {
   appState.selectedMaskId = null;
   appState.annotationComments = {};
   appState.annotationAuthors = {};
+  appState.annotationMaskAuthors = {};
   appState.maskContextMenu.open = false;
   const current = getCurrentImageEntry();
   if (current) {
@@ -1036,6 +1241,7 @@ ws.addEventListener("message", (event) => {
     appState.selectedMaskId = null;
     appState.annotationComments = {};
     appState.annotationAuthors = {};
+    appState.annotationMaskAuthors = {};
     appState.imageHashWarnings = [];
     appState.maskContextMenu.open = false;
     updateImageStateUI();
@@ -1065,6 +1271,7 @@ ws.addEventListener("message", (event) => {
       appState.selectedMaskId = null;
       appState.annotationComments = {};
       appState.annotationAuthors = {};
+      appState.annotationMaskAuthors = {};
       appState.maskContextMenu.open = false;
       appState.pendingActivationLogHash = hash;
       if (ws.readyState === WebSocket.OPEN) {
@@ -1093,6 +1300,7 @@ ws.addEventListener("message", (event) => {
     emitImageActivationLogsIfPending(hash, payload);
     appState.annotationComments = normalizeStringMap(payload.nemolab_comments);
     appState.annotationAuthors = normalizeStringMap(payload.nemolab_authors);
+    appState.annotationMaskAuthors = normalizeStringMap(payload.nemolab_mask_authors);
     const image = payload.images[0];
     const width = Math.max(1, Math.round(typeof image?.width === "number" ? image.width : appState.annotationImageWidth));
     const height = Math.max(1, Math.round(typeof image?.height === "number" ? image.height : appState.annotationImageHeight));
@@ -1286,6 +1494,10 @@ function bindGlobalNavHandlers(): void {
   appRoot.addEventListener("click", (event) => {
     const target = event.target as Element | null;
     if (!target) return;
+    const imageView = target.closest<HTMLElement>(".image-view");
+    if (imageView && appRoot.contains(imageView)) {
+      imageView.focus();
+    }
     if (target.closest('[data-action="previous"]')) {
       goPreviousImage();
       return;
@@ -1313,18 +1525,6 @@ function bindGlobalNavHandlers(): void {
       appState.imageHashWarnings = appState.imageHashWarnings.filter((warning) => warning.key !== warningKey);
       updateImageHashWarningsUI();
     }
-  });
-  appRoot.addEventListener("keydown", (event) => {
-    if (event.key !== "Enter") return;
-    const target = event.target as Element | null;
-    const input = target?.closest<HTMLInputElement>('input[data-action="jump-image-index"]');
-    if (!input || !appRoot.contains(input)) return;
-    if (appState.imageList.length === 0) return;
-    event.preventDefault();
-    const parsed = Number.parseInt(input.value, 10);
-    const oneBased = Number.isFinite(parsed) ? parsed : (appState.currentImageIndex + 1);
-    const clamped = Math.max(1, Math.min(appState.imageList.length, oneBased));
-    activateImageAtIndex(clamped - 1);
   });
 }
 
@@ -1750,6 +1950,30 @@ function extractLargestLoopFromSelfIntersectingStroke(strokePx: GeometryPoint[])
       }
     }
   });
+  if (best) return best;
+
+  // Fallback: build loop candidates directly from each intersection pair on the
+  // original stroke path. This avoids relying on rounded augmented-point keys.
+  intersections.forEach((hit) => {
+    if (hit.segB - hit.segA < 1) return;
+    const candidate = dedupeConsecutivePoints(
+      [
+        { x: hit.point.x, y: hit.point.y },
+        ...strokePx.slice(hit.segA + 1, hit.segB + 1),
+        { x: hit.point.x, y: hit.point.y },
+      ],
+      1e-4
+    );
+    if (candidate.length < 4) return;
+    const simplified = simplifyClosedPolygon(candidate, config.freehandSimplifyTolerance);
+    if (simplified.length < 3) return;
+    const area = polygonArea(simplified);
+    if (area <= 0) return;
+    if (area > bestArea) {
+      bestArea = area;
+      best = simplified;
+    }
+  });
   return best;
 }
 
@@ -1986,12 +2210,25 @@ function updateFreehandMask(mask: MaskPoint, points: Array<{ x: number; y: numbe
 }
 
 /** Finalizes a sampled freehand stroke into either a new loop or an edited existing loop. */
-function finalizeFreehandStroke(samples: FreehandSample[]): void {
+function finalizeFreehandStroke(samples: FreehandSample[]): {
+  outcome: string;
+  sampled_points: number;
+  self_intersections: number;
+  is_near_closure: boolean;
+  edited_mask_id?: string;
+} {
   const sampled = dedupeConsecutivePoints(
     samples.map((sample) => ({ x: sample.imageX, y: sample.imageY })),
     1e-6
   );
-  if (sampled.length < 2) return;
+  if (sampled.length < 2) {
+    return {
+      outcome: "drop_too_few_points",
+      sampled_points: sampled.length,
+      self_intersections: 0,
+      is_near_closure: false,
+    };
+  }
   const strokePx = sampled.map((point) => normalizedToImagePx(point));
   const isNearClosure =
     distancePx(
@@ -2001,20 +2238,50 @@ function finalizeFreehandStroke(samples: FreehandSample[]): void {
 
   const selfIntersections = findStrokeSelfIntersections(strokePx);
   const treatAsNewLoop = selfIntersections.length > 0 || isNearClosure;
+  let selfIntersectionLoopExtractionFailed = false;
   if (treatAsNewLoop) {
     const closedStroke = isNearClosure ? [...strokePx, strokePx[0]] : strokePx;
     const loopPx =
       selfIntersections.length > 0
         ? extractLargestLoopFromSelfIntersectingStroke(closedStroke)
         : simplifyClosedPolygon(closedStroke, config.freehandSimplifyTolerance);
-    if (!loopPx || loopPx.length < 3) return;
-    const points = loopPx.map((point) => imagePxToNormalized(point));
-    addFreehandMask(points);
-    return;
+    if (loopPx && loopPx.length >= 3) {
+      const points = loopPx.map((point) => imagePxToNormalized(point));
+      addFreehandMask(points);
+      return {
+        outcome: "new_loop_created",
+        sampled_points: sampled.length,
+        self_intersections: selfIntersections.length,
+        is_near_closure: isNearClosure,
+      };
+    }
+    // If self-intersection extraction fails, continue with the normal fallback
+    // path below (edit existing loop or create a closed loop) instead of drop.
+    selfIntersectionLoopExtractionFailed = selfIntersections.length > 0 && !isNearClosure;
   }
 
   const freehandMasks = appState.masks.filter((mask) => mask.kind === "freehand" && Array.isArray(mask.points) && (mask.points?.length ?? 0) >= 3);
-  if (freehandMasks.length === 0) return;
+  if (freehandMasks.length === 0) {
+    // No existing freehand loop to edit: close the stroke and create a new loop.
+    const closedStroke = [...strokePx, strokePx[0]];
+    const loopPx = simplifyClosedPolygon(closedStroke, config.freehandSimplifyTolerance);
+    if (loopPx.length < 3) {
+      return {
+        outcome: "drop_no_existing_mask_invalid",
+        sampled_points: sampled.length,
+        self_intersections: selfIntersections.length,
+        is_near_closure: isNearClosure,
+      };
+    }
+    const points = loopPx.map((point) => imagePxToNormalized(point));
+    addFreehandMask(points);
+    return {
+      outcome: selfIntersectionLoopExtractionFailed ? "new_loop_created_after_self_intersection_fallback_no_existing_mask" : "new_loop_created_no_existing_mask",
+      sampled_points: sampled.length,
+      self_intersections: selfIntersections.length,
+      is_near_closure: isNearClosure,
+    };
+  }
   const ranked = freehandMasks
     .map((mask) => {
       const polygonPx = (mask.points ?? []).map((point) => normalizedToImagePx(point));
@@ -2027,13 +2294,60 @@ function finalizeFreehandStroke(samples: FreehandSample[]): void {
     })
     .filter((item) => item.score > 0)
     .sort((a, b) => (b.score - a.score) || (b.area - a.area) || (a.mask.index - b.mask.index));
-  if (ranked.length === 0) return;
+  if (ranked.length === 0) {
+    // No loop overlap to edit: treat as creating a new freehand loop.
+    const closedStroke = [...strokePx, strokePx[0]];
+    const loopPx = simplifyClosedPolygon(closedStroke, config.freehandSimplifyTolerance);
+    if (loopPx.length < 3) {
+      return {
+        outcome: "drop_no_overlap_invalid",
+        sampled_points: sampled.length,
+        self_intersections: selfIntersections.length,
+        is_near_closure: isNearClosure,
+      };
+    }
+    const points = loopPx.map((point) => imagePxToNormalized(point));
+    addFreehandMask(points);
+    return {
+      outcome: selfIntersectionLoopExtractionFailed ? "new_loop_created_after_self_intersection_fallback_no_overlap" : "new_loop_created_no_overlap",
+      sampled_points: sampled.length,
+      self_intersections: selfIntersections.length,
+      is_near_closure: isNearClosure,
+    };
+  }
 
   const target = ranked[0];
   const editedPx = editPolygonWithStroke(strokePx, target.polygonPx);
-  if (!editedPx || editedPx.length < 3) return;
+  if (!editedPx || editedPx.length < 3) {
+    // Edit attempt failed: preserve the stroke as a new loop rather than dropping it.
+    const closedStroke = [...strokePx, strokePx[0]];
+    const loopPx = simplifyClosedPolygon(closedStroke, config.freehandSimplifyTolerance);
+    if (loopPx.length < 3) {
+      return {
+        outcome: "drop_edit_failed_invalid",
+        sampled_points: sampled.length,
+        self_intersections: selfIntersections.length,
+        is_near_closure: isNearClosure,
+      };
+    }
+    const points = loopPx.map((point) => imagePxToNormalized(point));
+    addFreehandMask(points);
+    return {
+      outcome: selfIntersectionLoopExtractionFailed ? "new_loop_created_after_self_intersection_fallback_edit_failed" : "new_loop_created_edit_failed",
+      sampled_points: sampled.length,
+      self_intersections: selfIntersections.length,
+      is_near_closure: isNearClosure,
+    };
+  }
   const normalized = editedPx.map((point) => imagePxToNormalized(point));
   updateFreehandMask(target.mask, normalized);
+  return {
+    outcome: "existing_mask_edited",
+    sampled_points: sampled.length,
+    self_intersections: selfIntersections.length,
+    is_near_closure: isNearClosure,
+    edited_mask_id: target.mask.id,
+  };
 }
 
 /** Removes one mask by id and emits logging. */
@@ -2044,6 +2358,7 @@ function removeMask(maskId: string): void {
   const removedCommentKey = String(maskPersistedNumericID(removed));
   delete appState.annotationComments[removedCommentKey];
   delete appState.annotationAuthors[removedCommentKey];
+  delete appState.annotationMaskAuthors[removedCommentKey];
   if (appState.currentImageHash) {
     logEvent("mask_removed", {
       image_hash: appState.currentImageHash,
@@ -2078,9 +2393,17 @@ function renderPanel(
   _title: string,
   contentHtml: string
 ): string {
+  const shortcutScope =
+    panelName === "optics" ? "optics"
+    : panelName === "labels" ? "labels"
+    : panelName === "annotations" ? "annotations"
+    : panelName === "commentPicture" ? "commentImage"
+    : panelName === "commentAnnotation" ? "commentAnnotation"
+    : null;
+  const shortcutScopeAttr = shortcutScope ? ` data-shortcut-scope="${shortcutScope}"` : "";
   return `
     <section class="panel" data-panel="${panelName}">
-      <div class="panel__body">${contentHtml}</div>
+      <div class="panel__body"${shortcutScopeAttr}>${contentHtml}</div>
     </section>
   `;
 }
@@ -2142,7 +2465,10 @@ function renderAnnotationList(): string {
     .map(
       (mask) => {
         const selectedClass = appState.selectedMaskId === mask.id ? " is-selected" : "";
-        return `<li class="annotation-list__item${selectedClass}" data-mask-id="${mask.id}">#${mask.index} <span class="mask-label-chip">${mask.labelName ? mask.labelName.replace(/</g, "&lt;") : "unlabeled"}</span>` +
+        const persistedID = String(maskPersistedNumericID(mask));
+        const maskAuthor = appState.annotationMaskAuthors[persistedID];
+        const maskAuthorHtml = maskAuthor ? ` <span class="comment-panel__author">by ${escapeHtml(maskAuthor)}</span>` : "";
+        return `<li class="annotation-list__item${selectedClass}" data-mask-id="${mask.id}">#${mask.index}${maskAuthorHtml} <span class="mask-label-chip">${mask.labelName ? mask.labelName.replace(/</g, "&lt;") : "unlabeled"}</span>` +
         ` <button type="button" class="task-pin__remove" data-action="remove-mask" data-id="${mask.id}" title="Remove mask">✕</button></li>`
       }
     )
@@ -2228,6 +2554,48 @@ function updateMaskModePanelUI(): void {
   const panelBody = appRoot.querySelector<HTMLElement>('[data-panel="maskMode"] .panel__body');
   if (!panelBody) return;
   panelBody.innerHTML = renderMaskModeBody();
+}
+
+/** Shows a transient toast for mode changes inside the image canvas wrapper. */
+function showModeToast(label: string): void {
+  const canvasWrap = appRoot.querySelector<HTMLElement>(".image-view__canvas-wrap");
+  if (!canvasWrap) return;
+  let toast = canvasWrap.querySelector<HTMLElement>(".mode-toast");
+  if (!toast) {
+    toast = document.createElement("div");
+    toast.className = "mode-toast";
+    canvasWrap.appendChild(toast);
+  }
+  toast.textContent = `Mode: ${label}`;
+  toast.classList.add("mode-toast--visible");
+  if (modeToastTimer !== null) {
+    window.clearTimeout(modeToastTimer);
+  }
+  modeToastTimer = window.setTimeout(() => {
+    toast?.classList.remove("mode-toast--visible");
+    modeToastTimer = null;
+  }, 2000);
+}
+
+/** Applies mask mode state change from keyboard/dropdown and updates related UI. */
+function setMaskMode(mode: MaskMode): void {
+  const previousMode = appState.maskMode;
+  appState.maskMode = mode;
+  appState.maskModeError = null;
+  appState.draftBboxMask = null;
+  appState.draftFreehandStroke = null;
+  if (mode === "freehand" && appState.selectedMaskId !== null) {
+    appState.selectedMaskId = null;
+    closeMaskContextMenu();
+    updateMaskSelectionUI();
+    updateMaskContextMenuUI();
+  }
+  if (previousMode !== mode) {
+    logEvent("mask_mode_changed", { from: previousMode, to: mode });
+  }
+  updateMaskModePanelUI();
+  showModeToast(appState.maskMode);
+  viewer?.draw();
 }
 
 /** Updates only the optics panel body DOM without remounting the viewer. */
@@ -2373,18 +2741,10 @@ function bindMaskModePanelHandlers(): void {
     if (!select || !appRoot.contains(select)) return;
     const selected = select.value as MaskMode;
     if (selected === "point" || selected === "bounding box" || selected === "freehand") {
-      appState.maskMode = selected;
-      appState.maskModeError = null;
-      appState.draftBboxMask = null;
-      appState.draftFreehandStroke = null;
+      setMaskMode(selected);
     } else {
-      appState.maskModeError = null;
-      appState.maskMode = "point";
-      appState.draftBboxMask = null;
-      appState.draftFreehandStroke = null;
+      setMaskMode("point");
     }
-    updateMaskModePanelUI();
-    viewer?.draw();
   });
 }
 
@@ -3310,7 +3670,7 @@ class WebGLTileViewer {
       ),
       1e-6
     );
-    this.zoom = Math.max(minZoom, Math.min(2, this.zoom));
+    this.zoom = Math.max(minZoom, Math.min(4, this.zoom));
 
     const imgW = this.zoom * displayed.width;
     const imgH = this.zoom * displayed.height;
@@ -3524,12 +3884,20 @@ class WebGLTileViewer {
       gl.drawArrays(gl.TRIANGLES, 0, coords.length / 2);
     };
 
-    masks.forEach((mask, index) => {
-      const fillHex = maskFillColor(index);
+    const haloStrokeWidth = strokeWidth * 2.5;
+    const haloRectStrokeX = this.baseTransform.width > 0 ? haloStrokeWidth / this.baseTransform.width : 0;
+    const haloRectStrokeY = this.baseTransform.height > 0 ? haloStrokeWidth / this.baseTransform.height : 0;
+    const haloOutlineSize = markerSize + haloStrokeWidth * 2;
+    const haloRingInnerRadius = Math.max(0, 0.5 - haloStrokeWidth / haloOutlineSize);
+    const haloRingThreshold = haloRingInnerRadius * haloRingInnerRadius;
+
+    masks.forEach((mask) => {
+      const fillHex = maskFillColor(mask.index);
       const labelIndex = mask.labelName ? (labelDepthFirstIndex.get(mask.labelName) ?? null) : null;
       const outlineHex = labelIndex === null ? "#888888" : labelColor(labelIndex);
       const [outlineR, outlineG, outlineB] = cssHexToRgb01(outlineHex);
       const shouldFill = !hasSelectedMask || mask.id === selectedMaskId;
+      const isSelected = mask.id === selectedMaskId;
       if (mask.kind === "point") {
         if (!pointProgramActive) {
           setupPointProgram();
@@ -3542,6 +3910,12 @@ class WebGLTileViewer {
         point[1] = 1 - (y / this.canvas.clientHeight) * 2;
         gl.bufferData(gl.ARRAY_BUFFER, point, gl.STREAM_DRAW);
 
+        if (isSelected) {
+          gl.uniform4f(this.pointColorUniform, 1, 1, 1, strokeOpacity);
+          gl.uniform1f(this.pointSizeUniform, haloOutlineSize);
+          gl.uniform1f(this.pointRingUniform, haloRingThreshold);
+          gl.drawArrays(gl.POINTS, 0, 1);
+        }
         gl.uniform4f(this.pointColorUniform, outlineR, outlineG, outlineB, strokeOpacity);
         gl.uniform1f(this.pointSizeUniform, outlineSize);
         gl.uniform1f(this.pointRingUniform, ringThreshold);
@@ -3569,6 +3943,16 @@ class WebGLTileViewer {
         const x1 = mask.x + bw;
         const y1 = mask.y + bh;
         const outlineColor: [number, number, number] = [outlineR, outlineG, outlineB];
+
+        if (isSelected) {
+          const hInsetX = Math.min(haloRectStrokeX, bw / 2);
+          const hInsetY = Math.min(haloRectStrokeY, bh / 2);
+          drawRectNormalized(x0, y0, x1, Math.min(y1, y0 + hInsetY), [1, 1, 1], strokeOpacity);
+          drawRectNormalized(x0, Math.max(y0, y1 - hInsetY), x1, y1, [1, 1, 1], strokeOpacity);
+          drawRectNormalized(x0, Math.min(y1, y0 + hInsetY), Math.min(x1, x0 + hInsetX), Math.max(y0, y1 - hInsetY), [1, 1, 1], strokeOpacity);
+          drawRectNormalized(Math.max(x0, x1 - hInsetX), Math.min(y1, y0 + hInsetY), x1, Math.max(y0, y1 - hInsetY), [1, 1, 1], strokeOpacity);
+        }
+
         const insetX = Math.min(rectStrokeX, bw / 2);
         const insetY = Math.min(rectStrokeY, bh / 2);
         const topY1 = Math.min(y1, y0 + insetY);
@@ -3598,6 +3982,11 @@ class WebGLTileViewer {
       if (shouldFill) {
         const [fillR, fillG, fillB] = cssHexToRgb01(fillHex);
         drawFilledPolygonNormalized(mask.points, [fillR, fillG, fillB], fillOpacity);
+      }
+      if (isSelected) {
+        gl.lineWidth(haloStrokeWidth);
+        drawPolylineNormalized(mask.points, [1, 1, 1], strokeOpacity, true);
+        gl.lineWidth(strokeWidth);
       }
       drawPolylineNormalized(mask.points, outlineColor, strokeOpacity, true);
     });
@@ -3838,7 +4227,24 @@ class WebGLTileViewer {
     ];
     candidates.sort((a, b) => a.dist - b.dist);
     const nearest = candidates[0];
-    if (!nearest || nearest.dist > radiusPx) return null;
+    if (!nearest) return null;
+    if (nearest.dist > radiusPx) {
+      logEvent("bbox_edge_hit_test", {
+        result: "miss",
+        mask_id: mask.id,
+        nearest_edge: nearest.edge,
+        nearest_dist_px: Number(nearest.dist.toFixed(2)),
+        threshold_px: radiusPx,
+      });
+      return null;
+    }
+    logEvent("bbox_edge_hit_test", {
+      result: "hit",
+      mask_id: mask.id,
+      nearest_edge: nearest.edge,
+      nearest_dist_px: Number(nearest.dist.toFixed(2)),
+      threshold_px: radiusPx,
+    });
     return nearest.edge;
   }
 
@@ -4091,9 +4497,18 @@ class WebGLTileViewer {
           editableBbox,
           mapped.canvasX,
           mapped.canvasY,
-          config.bboxSideHitPx
+          Number.POSITIVE_INFINITY
         );
         if (edge) {
+          logEvent("bbox_edit_pointerdown", {
+            result: "start",
+            mask_id: editableBbox.id,
+            edge,
+            canvas_x: mapped.canvasX,
+            canvas_y: mapped.canvasY,
+            image_x: mapped.imageX,
+            image_y: mapped.imageY,
+          });
           this.isBboxSideEditing = true;
           this.bboxSideEditPointerId = event.pointerId;
           this.bboxSideEditMaskId = editableBbox.id;
@@ -4111,6 +4526,21 @@ class WebGLTileViewer {
           });
           return;
         }
+        logEvent("bbox_edit_pointerdown", {
+          result: "blocked",
+          reason: "edge_not_hit",
+          mask_id: editableBbox.id,
+          canvas_x: mapped.canvasX,
+          canvas_y: mapped.canvasY,
+          image_x: mapped.imageX,
+          image_y: mapped.imageY,
+        });
+      } else {
+        logEvent("bbox_edit_pointerdown", {
+          result: "blocked",
+          reason: "pointer_outside_image",
+          mask_id: editableBbox.id,
+        });
       }
     }
 
@@ -4382,12 +4812,30 @@ function mountViewer(): void {
           imageX: payload.imageX,
           imageY: payload.imageY,
         }];
+        if (appState.maskMode === "freehand") {
+          logEvent("freehand_drag", {
+            phase: "start",
+            canvas_x: payload.canvasX,
+            canvas_y: payload.canvasY,
+            image_x: payload.imageX,
+            image_y: payload.imageY,
+          });
+        }
         appState.draftFreehandStroke = appState.maskMode === "freehand" ? { points: freehandSamples.slice() } : null;
         return;
       }
       if (!bboxDragStart || appState.selectedMaskId !== null) {
+        if (appState.maskMode === "freehand" && freehandSamples.length > 0) {
+          logEvent("freehand_drag", {
+            phase: "cancel",
+            reason: !bboxDragStart ? "missing_drag_start" : "selected_mask",
+            sampled_points: freehandSamples.length,
+          });
+        }
         appState.draftBboxMask = null;
         appState.draftFreehandStroke = null;
+        freehandSamples = [];
+        bboxDragStart = null;
         return;
       }
       if (appState.maskMode === "freehand") {
@@ -4402,9 +4850,26 @@ function mountViewer(): void {
         appState.draftFreehandStroke = { points: freehandSamples.slice() };
         viewer?.draw();
         if (payload.phase === "end") {
+          logEvent("freehand_drag", {
+            phase: "end",
+            canvas_x: payload.canvasX,
+            canvas_y: payload.canvasY,
+            image_x: payload.imageX,
+            image_y: payload.imageY,
+            drag_distance: payload.dragDistance,
+            sampled_points: freehandSamples.length,
+          });
           appState.draftFreehandStroke = null;
           if (freehandSamples.length >= 2) {
-            finalizeFreehandStroke(freehandSamples);
+            const result = finalizeFreehandStroke(freehandSamples);
+            logEvent("freehand_finalize", result);
+          } else {
+            logEvent("freehand_finalize", {
+              outcome: "drop_too_few_points",
+              sampled_points: freehandSamples.length,
+              self_intersections: 0,
+              is_near_closure: false,
+            });
           }
           freehandSamples = [];
           bboxDragStart = null;
@@ -4453,15 +4918,53 @@ function mountViewer(): void {
     },
     () => {
       if (appState.maskMode !== "bounding box") return null;
-      if (!appState.selectedMaskId) return null;
+      if (!appState.selectedMaskId) {
+        logEvent("bbox_edit_selection_gate", {
+          result: "blocked",
+          reason: "no_selected_mask",
+          mask_mode: appState.maskMode,
+        });
+        return null;
+      }
       const selected = appState.masks.find((mask) => mask.id === appState.selectedMaskId) ?? null;
-      if (!selected || selected.kind !== "bbox") return null;
+      if (!selected) {
+        logEvent("bbox_edit_selection_gate", {
+          result: "blocked",
+          reason: "selected_mask_not_found",
+          selected_mask_id: appState.selectedMaskId,
+          mask_mode: appState.maskMode,
+        });
+        return null;
+      }
+      if (selected.kind !== "bbox") {
+        logEvent("bbox_edit_selection_gate", {
+          result: "blocked",
+          reason: "selected_mask_not_bbox",
+          selected_mask_id: selected.id,
+          selected_kind: selected.kind,
+          mask_mode: appState.maskMode,
+        });
+        return null;
+      }
+      logEvent("bbox_edit_selection_gate", {
+        result: "eligible",
+        selected_mask_id: selected.id,
+        selected_kind: selected.kind,
+        mask_mode: appState.maskMode,
+      });
       return selected;
     },
     (payload) => {
-      if (appState.maskMode !== "bounding box") return;
       const mask = appState.masks.find((m) => m.id === payload.maskId);
       if (!mask || mask.kind !== "bbox") return;
+      logEvent("bbox_edit", {
+        phase: payload.phase,
+        mask_id: payload.maskId,
+        edge: payload.edge,
+        image_x: payload.imageX,
+        image_y: payload.imageY,
+        mask_mode: appState.maskMode,
+      });
       applyDraggedBboxEdge(mask, payload.edge, payload.imageX, payload.imageY);
       if (payload.phase === "end") {
         if (appState.currentImageHash) {
@@ -4474,6 +4977,15 @@ function mountViewer(): void {
     },
     (maskId) => {
       appState.selectedMaskId = maskId;
+      const selectedMask = appState.masks.find((m) => m.id === maskId);
+      if (selectedMask) {
+        const modeForKind: Record<MaskPoint["kind"], MaskMode> = {
+          point: "point",
+          bbox: "bounding box",
+          freehand: "freehand",
+        };
+        setMaskMode(modeForKind[selectedMask.kind]);
+      }
       closeMaskContextMenu();
       updateMaskSelectionUI();
       updateMaskContextMenuUI();
@@ -4875,7 +5387,7 @@ function renderMenuBar(): string {
           </div>
         </div>
         <div class="menu-bar__item" data-menu="help">
-          <button type="button" class="menu-bar__btn">Help</button>
+          <button type="button" class="menu-bar__btn" data-action="open-help">Help</button>
         </div>
       </nav>
     </div>
@@ -4933,6 +5445,167 @@ function closeMenuDropdowns(): void {
   appRoot.querySelectorAll(".menu-bar__item--active").forEach((el) =>
     el.classList.remove("menu-bar__item--active")
   );
+}
+
+/** Loads app version once for Help/About tab; keeps null on failures. */
+async function ensureHelpDialogVersionLoaded(): Promise<void> {
+  if (helpDialogVersionFetchAttempted) return;
+  helpDialogVersionFetchAttempted = true;
+  try {
+    const response = await fetch("/api/version");
+    if (!response.ok) return;
+    const version = await response.json();
+    if (typeof version === "string" && version.trim() !== "") {
+      helpDialogVersion = version.trim();
+      if (appState.helpDialogOpen && appState.helpDialogTab === "about") {
+        updateHelpDialogBodyUI();
+      }
+    }
+  } catch {
+    // Ignore version fetch failures; About tab simply omits the version row.
+  }
+}
+
+/** Opens the Help dialog and starts one-time About-version loading. */
+function openHelpDialog(): void {
+  appState.helpDialogOpen = true;
+  void ensureHelpDialogVersionLoaded();
+  render();
+}
+
+/** Closes the Help dialog. */
+function closeHelpDialog(): void {
+  appState.helpDialogOpen = false;
+  render();
+}
+
+/** Renders tab-strip + tab-content for the Help dialog body. */
+function renderHelpDialogBody(): string {
+  const tab = appState.helpDialogTab;
+  const tabButton = (id: HelpDialogTab, label: string) =>
+    `<button type="button" class="help-dialog__tab${tab === id ? " is-active" : ""}" data-action="help-tab" data-tab="${id}">${label}</button>`;
+
+  let content = "";
+  if (tab === "shortcuts") {
+    content = `
+      <p class="help-dialog__note"><em>Shortcuts are active only when the relevant UI area has focus.</em></p>
+      <table class="help-dialog__table">
+        <thead><tr><th>Scope</th><th>Key</th><th>Action</th></tr></thead>
+        <tbody>
+          <tr><td><code>canvas</code></td><td><code>PageUp</code></td><td>Cycle optics transform forward</td></tr>
+          <tr><td><code>canvas</code></td><td><code>PageDown</code></td><td>Cycle optics transform backward</td></tr>
+          <tr><td><code>canvas</code></td><td><code>Escape</code></td><td>Deselect selected mask; close context menu</td></tr>
+          <tr><td><code>canvas</code></td><td><code>Delete</code></td><td>Remove selected mask</td></tr>
+          <tr><td><code>canvas</code></td><td><code>ArrowUp</code></td><td>Cycle mask selection backward</td></tr>
+          <tr><td><code>canvas</code></td><td><code>ArrowDown</code></td><td>Cycle mask selection forward</td></tr>
+          <tr><td><code>navigation</code></td><td><code>Enter</code></td><td>Jump to typed image index</td></tr>
+          <tr><td><code>taskDialog</code></td><td><code>Enter</code></td><td>Add tag / commit field / add label (by target selector)</td></tr>
+          <tr><td><code>taskLabelTree</code></td><td><code>ArrowUp</code> / <code>ArrowDown</code></td><td>Reorder label within parent</td></tr>
+          <tr><td><code>taskLabelTree</code></td><td><code>ArrowLeft</code> / <code>ArrowRight</code></td><td>Promote / demote label in hierarchy</td></tr>
+          <tr><td><code>taskLabelTree</code></td><td><code>Tab</code> / <code>Shift+Tab</code></td><td>Move focus between label rows</td></tr>
+        </tbody>
+      </table>
+    `;
+  } else if (tab === "annotations") {
+    content = `
+      <ul class="help-dialog__list">
+        <li>Point mode: left-click places a mask; shift+left-click removes the nearest mask.</li>
+        <li>Double-click selects one mask. Escape clears selection. Arrow keys cycle selection.</li>
+        <li>Right-click near a mask opens label assignment with recent labels first.</li>
+        <li>Annotations list mirrors current masks and highlights the selected mask row.</li>
+        <li>Image and annotation comments sync live across users with author metadata.</li>
+      </ul>
+    `;
+  } else if (tab === "navigation") {
+    content = `
+      <ul class="help-dialog__list">
+        <li>Use previous/next buttons in the left sidebar to switch images.</li>
+        <li>Type a 1-based image index and press Enter to jump directly.</li>
+        <li>Fast-forward jumps to the next image whose annotation file is missing or empty.</li>
+        <li>The top menu includes Tasks, Views, and Help.</li>
+      </ul>
+    `;
+  } else {
+    const versionLine = helpDialogVersion
+      ? `<div><strong>Version:</strong> ${escapeHtml(helpDialogVersion)}</div>`
+      : "";
+    content = `
+      <div class="help-dialog__about">
+        <div><strong>App:</strong> Nemo-Lab</div>
+        ${versionLine}
+      </div>
+    `;
+  }
+
+  return `
+    <div class="help-dialog__tabs" role="tablist" aria-label="Help sections">
+      ${tabButton("shortcuts", "Shortcuts")}
+      ${tabButton("annotations", "Annotations & Masks")}
+      ${tabButton("navigation", "Navigation")}
+      ${tabButton("about", "About")}
+    </div>
+    <div class="help-dialog__content">${content}</div>
+  `;
+}
+
+/** Produces the full Help modal HTML. */
+function renderHelpDialog(): string {
+  if (!appState.helpDialogOpen) return "";
+  return `
+    <div class="help-backdrop" data-action="close-help-backdrop">
+      <div class="help-dialog" role="dialog" aria-modal="true" aria-label="Help">
+        <div class="help-dialog__header">
+          <h2 class="help-dialog__title">Help</h2>
+          <button type="button" class="help-dialog__close" data-action="close-help">✕</button>
+        </div>
+        <div class="help-dialog__body">${renderHelpDialogBody()}</div>
+      </div>
+    </div>
+  `;
+}
+
+/** Updates only the Help-dialog body, preserving the rest of the modal tree. */
+function updateHelpDialogBodyUI(): void {
+  const body = appRoot.querySelector<HTMLElement>(".help-dialog__body");
+  if (!body) return;
+  body.innerHTML = renderHelpDialogBody();
+}
+
+/** Wires delegated handlers for Help dialog open/close/tab actions. */
+function bindHelpDialogHandlers(): void {
+  if ((bindHelpDialogHandlers as { _bound?: boolean })._bound) return;
+  (bindHelpDialogHandlers as { _bound?: boolean })._bound = true;
+  appRoot.addEventListener("click", (event) => {
+    const target = event.target as Element | null;
+    if (!target) return;
+    if (target.closest('[data-action="open-help"]')) {
+      appState.menuOpen = false;
+      openHelpDialog();
+      return;
+    }
+    if (target.closest('[data-action="close-help"]')) {
+      closeHelpDialog();
+      return;
+    }
+    const backdrop = target.closest<HTMLElement>('[data-action="close-help-backdrop"]');
+    if (backdrop && target === backdrop) {
+      closeHelpDialog();
+      return;
+    }
+    const tabButton = target.closest<HTMLButtonElement>('[data-action="help-tab"]');
+    if (!tabButton) return;
+    const nextTab = tabButton.dataset["tab"] as HelpDialogTab | undefined;
+    if (
+      nextTab !== "shortcuts" &&
+      nextTab !== "annotations" &&
+      nextTab !== "navigation" &&
+      nextTab !== "about"
+    ) {
+      return;
+    }
+    appState.helpDialogTab = nextTab;
+    updateHelpDialogBodyUI();
+  });
 }
 
 // ── Tasks dialog ──────────────────────────────────────────────────────────────
@@ -5142,15 +5815,6 @@ function refreshLabelTree(treeEl: HTMLElement, task: Task, focusNodeId?: string)
 
 /** Binds all label tree interaction handlers. */
 function bindLabelTree(treeEl: HTMLElement, task: Task): void {
-  const editable = appState.isAdmin;
-  const persistLabels = () => {
-    void runTaskSave(
-      () => persistTaskLabels(task),
-      "Failed to save labels.",
-      "tasks: save labels failed"
-    );
-  };
-
   const selectNode = (nodeId: string) => {
     task.selectedLabelId = nodeId;
     treeEl.querySelectorAll(".label-tree__row").forEach((row) => {
@@ -5158,62 +5822,11 @@ function bindLabelTree(treeEl: HTMLElement, task: Task): void {
     });
   };
 
-  const moveSelectedWithinParent = (delta: number) => {
-    if (!task.selectedLabelId) return;
-    const meta = findLabelNodeMeta(task.selectedLabelId, task.labels);
-    if (!meta) return;
-    const nextIdx = meta.index + delta;
-    if (nextIdx < 0 || nextIdx >= meta.parentArr.length) return;
-    meta.parentArr.splice(meta.index, 1);
-    meta.parentArr.splice(nextIdx, 0, meta.node);
-    refreshLabelTree(treeEl, task, task.selectedLabelId);
-    persistLabels();
-  };
-
-  const promoteSelected = () => {
-    if (!task.selectedLabelId) return;
-    const meta = findLabelNodeMeta(task.selectedLabelId, task.labels);
-    if (!meta || !meta.parentNode || !meta.grandParentArr) return;
-    meta.parentArr.splice(meta.index, 1);
-    const parentIdx = meta.grandParentArr.findIndex((n) => n.id === meta.parentNode!.id);
-    meta.grandParentArr.splice(parentIdx + 1, 0, meta.node);
-    refreshLabelTree(treeEl, task, task.selectedLabelId);
-    persistLabels();
-  };
-
-  const demoteSelected = () => {
-    if (!task.selectedLabelId) return;
-    const meta = findLabelNodeMeta(task.selectedLabelId, task.labels);
-    if (!meta || meta.index === 0) return;
-    const prevSibling = meta.parentArr[meta.index - 1];
-    meta.parentArr.splice(meta.index, 1);
-    prevSibling.children.push(meta.node);
-    refreshLabelTree(treeEl, task, task.selectedLabelId);
-    persistLabels();
-  };
-
   treeEl.querySelectorAll<HTMLElement>(".label-tree__row").forEach((row) => {
     if (row.dataset["boundLabelRow"] === "1") return;
     row.dataset["boundLabelRow"] = "1";
     row.addEventListener("click", () => selectNode(row.dataset["nodeId"]!));
     row.addEventListener("focus", () => selectNode(row.dataset["nodeId"]!));
-    if (!editable) return;
-    row.addEventListener("keydown", (e) => {
-      const ke = e as KeyboardEvent;
-      if (ke.key === "Tab") {
-        const rows = Array.from(treeEl.querySelectorAll<HTMLElement>(".label-tree__row"));
-        if (!rows.length) return;
-        ke.preventDefault();
-        const idx = rows.indexOf(row);
-        const step = ke.shiftKey ? -1 : 1;
-        rows[(idx + step + rows.length) % rows.length].focus();
-        return;
-      }
-      if (ke.key === "ArrowUp")   { ke.preventDefault(); moveSelectedWithinParent(-1); return; }
-      if (ke.key === "ArrowDown") { ke.preventDefault(); moveSelectedWithinParent(1);  return; }
-      if (ke.key === "ArrowLeft") { ke.preventDefault(); promoteSelected();            return; }
-      if (ke.key === "ArrowRight"){ ke.preventDefault(); demoteSelected();             }
-    });
   });
 
   treeEl.querySelectorAll<HTMLButtonElement>("[data-action='remove-label']").forEach((btn) => {
@@ -5225,26 +5838,14 @@ function bindLabelTree(treeEl: HTMLElement, task: Task): void {
       removeLabelNode(removedId, task.labels);
       if (task.selectedLabelId === removedId) task.selectedLabelId = null;
       refreshLabelTree(treeEl, task);
-      persistLabels();
+      void runTaskSave(
+        () => persistTaskLabels(task),
+        "Failed to save labels.",
+        "tasks: save labels failed"
+      );
     });
   });
 
-  const addInput = treeEl.querySelector<HTMLInputElement>(".label-tree__new");
-  if (addInput) {
-    if (addInput.dataset["boundLabelNew"] === "1") return;
-    addInput.dataset["boundLabelNew"] = "1";
-    addInput.addEventListener("keydown", (e) => {
-      if ((e as KeyboardEvent).key !== "Enter") return;
-      e.preventDefault();
-      const val = addInput.value.trim();
-      if (!val) return;
-      const newId = labelNodeId();
-      task.labels.push({ id: newId, text: val, children: [] });
-      task.selectedLabelId = newId;
-      refreshLabelTree(treeEl, task, newId);
-      persistLabels();
-    });
-  }
 }
 
 /** Produces the expanded body for one task card. */
@@ -5318,7 +5919,7 @@ function renderTaskCardBody(task: Task): string {
       </div>
       <div class="task-field-row">
         <span class="task-field-label">labels</span>
-        <div class="label-tree" data-task-id="${task.id}">
+        <div class="label-tree" data-task-id="${task.id}"${admin ? ' data-shortcut-scope="taskLabelTree"' : ""}>
           ${renderLabelTree(task.labels, task.selectedLabelId, admin)}
           ${admin ? `<input class="label-tree__new" type="text" placeholder="new label" />` : ""}
         </div>
@@ -5366,7 +5967,7 @@ function renderTasksDialog(): string {
     : "";
   return `
     <div class="tasks-backdrop" data-action="close-tasks-backdrop">
-      <div class="tasks-dialog" role="dialog" aria-modal="true" aria-label="Tasks">
+      <div class="tasks-dialog" role="dialog" aria-modal="true" aria-label="Tasks" data-shortcut-scope="taskDialog">
         <div class="tasks-dialog__header">
           <h2 class="tasks-dialog__title">Tasks</h2>
           ${badge}
@@ -5383,31 +5984,33 @@ function renderTasksDialog(): string {
   `;
 }
 
+/** Commits one editable task field and persists it. */
+function commitTaskFieldInput(input: HTMLInputElement | HTMLTextAreaElement): void {
+  const id = input.getAttribute("data-task-id");
+  const field = input.getAttribute("data-field") as keyof Pick<Task, "description" | "images" | "annotations" | "comment"> | null;
+  const task = id ? (appState.tasks.find((t) => t.id === id) ?? null) : null;
+  if (!task || !field) return;
+  task[field] = input.value;
+  input.classList.remove("task-field--dirty");
+  input.classList.add("task-field--saved");
+  setTimeout(() => input.classList.remove("task-field--saved"), 1000);
+  if (field === "description") {
+    const card = appRoot.querySelector<HTMLElement>(`.task-card[data-task-id="${id}"]`);
+    if (card) updateTaskSummaryDesc(card, task);
+  }
+  void runTaskSave(
+    () => persistTaskScalars(task),
+    "Failed to save task field.",
+    "tasks: save field failed"
+  );
+}
+
 /** Wires all Tasks dialog handlers after render. */
 function bindTasksDialogHandlers(): void {
   if ((bindTasksDialogHandlers as { _bound?: boolean })._bound) return;
   (bindTasksDialogHandlers as { _bound?: boolean })._bound = true;
   const getTask = (taskId: string | null): Task | null =>
     taskId ? (appState.tasks.find((t) => t.id === taskId) ?? null) : null;
-  const commitTaskField = (input: HTMLInputElement | HTMLTextAreaElement): void => {
-    const id = input.getAttribute("data-task-id");
-    const field = input.getAttribute("data-field") as keyof Pick<Task, "description" | "images" | "annotations" | "comment"> | null;
-    const task = getTask(id);
-    if (!task || !field) return;
-    task[field] = input.value;
-    input.classList.remove("task-field--dirty");
-    input.classList.add("task-field--saved");
-    setTimeout(() => input.classList.remove("task-field--saved"), 1000);
-    if (field === "description") {
-      const card = appRoot.querySelector<HTMLElement>(`.task-card[data-task-id="${id}"]`);
-      if (card) updateTaskSummaryDesc(card, task);
-    }
-    void runTaskSave(
-      () => persistTaskScalars(task),
-      "Failed to save task field.",
-      "tasks: save field failed"
-    );
-  };
 
   appRoot.addEventListener("click", (event) => {
     const target = event.target as Element | null;
@@ -5508,18 +6111,6 @@ function bindTasksDialogHandlers(): void {
       render();
       return;
     }
-    const labelRow = target.closest<HTMLElement>(".label-tree[data-task-id] .label-tree__row");
-    if (labelRow) {
-      const tree = labelRow.closest<HTMLElement>(".label-tree[data-task-id]");
-      const task = getTask(tree?.dataset["taskId"] ?? null);
-      const nodeId = labelRow.dataset["nodeId"];
-      if (!task || !nodeId) return;
-      task.selectedLabelId = nodeId;
-      tree?.querySelectorAll(".label-tree__row").forEach((row) => {
-        row.classList.toggle("is-selected", (row as HTMLElement).dataset["nodeId"] === nodeId);
-      });
-      return;
-    }
     const removeLabelBtn = target.closest<HTMLButtonElement>(".label-tree [data-action='remove-label']");
     if (removeLabelBtn) {
       event.stopPropagation();
@@ -5531,6 +6122,19 @@ function bindTasksDialogHandlers(): void {
       if (task.selectedLabelId === removedId) task.selectedLabelId = null;
       refreshLabelTree(tree, task);
       void runTaskSave(() => persistTaskLabels(task), "Failed to save labels.", "tasks: save labels failed");
+      return;
+    }
+    const labelRow = target.closest<HTMLElement>(".label-tree[data-task-id] .label-tree__row");
+    if (labelRow) {
+      const tree = labelRow.closest<HTMLElement>(".label-tree[data-task-id]");
+      const task = getTask(tree?.dataset["taskId"] ?? null);
+      const nodeId = labelRow.dataset["nodeId"];
+      if (!task || !nodeId) return;
+      task.selectedLabelId = nodeId;
+      tree?.querySelectorAll(".label-tree__row").forEach((row) => {
+        row.classList.toggle("is-selected", (row as HTMLElement).dataset["nodeId"] === nodeId);
+      });
+      return;
     }
   });
 
@@ -5568,50 +6172,7 @@ function bindTasksDialogHandlers(): void {
     const target = event.target as Element | null;
     const input = target?.closest<HTMLInputElement | HTMLTextAreaElement>(".task-field-input[data-field]");
     if (!input || (input as HTMLInputElement).readOnly) return;
-    commitTaskField(input);
-  });
-
-  appRoot.addEventListener("keydown", (event) => {
-    const target = event.target as Element | null;
-    if (!target) return;
-    const addTagInput = target.closest<HTMLInputElement>('[data-action="add-tag"]');
-    if (addTagInput && event.key === "Enter") {
-      event.preventDefault();
-      const val = addTagInput.value.trim();
-      if (!val) return;
-      const task = getTask(addTagInput.getAttribute("data-task-id"));
-      if (!task) return;
-      task.tags.push(val);
-      addTagInput.value = "";
-      const card = appRoot.querySelector<HTMLElement>(`.task-card[data-task-id="${task.id}"]`);
-      if (card) {
-        const wrap = card.querySelector<HTMLElement>(".task-tags-wrap");
-        if (wrap) wrap.outerHTML = buildTagsWrapHtml(task);
-        updateTaskSummaryTags(card, task);
-      }
-      void runTaskSave(() => persistTaskTags(task), "Failed to save task tags.", "tasks: save tags failed");
-      return;
-    }
-    const fieldInput = target.closest<HTMLInputElement | HTMLTextAreaElement>(".task-field-input[data-field]");
-    if (fieldInput && event.key === "Enter" && fieldInput.tagName !== "TEXTAREA") {
-      event.preventDefault();
-      commitTaskField(fieldInput);
-      return;
-    }
-    const newLabelInput = target.closest<HTMLInputElement>(".label-tree[data-task-id] .label-tree__new");
-    if (newLabelInput && event.key === "Enter") {
-      event.preventDefault();
-      const val = newLabelInput.value.trim();
-      if (!val) return;
-      const tree = newLabelInput.closest<HTMLElement>(".label-tree[data-task-id]");
-      const task = getTask(tree?.dataset["taskId"] ?? null);
-      if (!task || !tree) return;
-      const newId = labelNodeId();
-      task.labels.push({ id: newId, text: val, children: [] });
-      task.selectedLabelId = newId;
-      refreshLabelTree(tree, task, newId);
-      void runTaskSave(() => persistTaskLabels(task), "Failed to save labels.", "tasks: save labels failed");
-    }
+    commitTaskFieldInput(input);
   });
 }
 
@@ -5647,27 +6208,6 @@ function rebindTagsWrap(card: HTMLElement, task: Task): void {
         "tasks: save tags failed"
       );
     });
-  });
-  const addInput = card.querySelector<HTMLInputElement>('[data-action="add-tag"]');
-  if (!addInput) return;
-  if (addInput.dataset["boundAddTag"] === "1") return;
-  addInput.dataset["boundAddTag"] = "1";
-  addInput.addEventListener("keydown", (e) => {
-    if (e.key !== "Enter") return;
-    const input = e.currentTarget as HTMLInputElement;
-    const val = input.value.trim();
-    if (!val) return;
-    task.tags.push(val);
-    input.value = "";
-    const wrap = card.querySelector<HTMLElement>(".task-tags-wrap");
-    if (wrap) wrap.outerHTML = buildTagsWrapHtml(task);
-    rebindTagsWrap(card, task);
-    updateTaskSummaryTags(card, task);
-    void runTaskSave(
-      () => persistTaskTags(task),
-      "Failed to save task tags.",
-      "tasks: save tags failed"
-    );
   });
 }
 
@@ -5733,7 +6273,7 @@ function render(): void {
       appState.rightCollapsed ? "right-collapsed" : ""
     }" style="--sidebar-right-width: ${appState.rightSidebarWidth}px;">
       <aside class="sidebar sidebar--left">
-        <div class="sidebar__content">
+        <div class="sidebar__content" data-shortcut-scope="navigation">
           <button type="button" data-action="previous">previous</button>
           <button type="button" data-action="next">next</button>
           <input
@@ -5750,10 +6290,10 @@ function render(): void {
         </div>
       </aside>
 
-      <main class="image-view">
+      <main class="image-view" tabindex="0" data-shortcut-scope="canvas">
         <div class="image-view__alerts">${renderImageHashWarnings()}</div>
         <div class="image-view__canvas-wrap">
-          <canvas class="image-view__canvas" aria-label="Tile image viewer" tabindex="0"></canvas>
+          <canvas class="image-view__canvas" aria-label="Tile image viewer"></canvas>
         </div>
       </main>
 
@@ -5789,6 +6329,7 @@ function render(): void {
       ${appState.rightCollapsed ? "<" : ">"}
     </button>
     ${renderMaskContextMenu()}
+    ${renderHelpDialog()}
     ${renderTasksDialog()}
     ${renderDirBrowserOverlay()}
   `;
@@ -5804,6 +6345,7 @@ void (async () => {
   bindAnnotationPanelHandlers();
   bindOpticsPanelHandlers();
   bindMenuHandlers();
+  bindHelpDialogHandlers();
   bindGlobalNavHandlers();
   bindActiveLabelPanelHandlers();
   bindMaskModePanelHandlers();

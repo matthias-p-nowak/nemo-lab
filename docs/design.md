@@ -31,7 +31,7 @@ nemo-lab/
 
 | Field         | Type     | Default   | Description                              |
 |---------------|----------|-----------|------------------------------------------|
-| `listen_addr` | string   | `:7255`   | Address the HTTP server listens on       |
+| `listen_addr` | string   | `:7033`   | Address the HTTP server listens on       |
 | `static_dir`  | string   | `dist`    | Path to compiled frontend assets         |
 | `db_path`     | string   | `nemo.db` | Path to the SQLite database file         |
 | `logs_dir`    | string   | `logs`    | Path for per-session JSONL log files     |
@@ -42,7 +42,7 @@ nemo-lab/
 
 Example `nemo.toml`:
 ```toml
-listen_addr = ":7255"
+listen_addr = ":7033"
 static_dir  = "dist"
 db_path     = "nemo.db"
 logs_dir    = "logs"
@@ -200,7 +200,38 @@ Items (left to right):
   - Right sidebar (checkmark = visible)
   - ── separator ──
   - Light theme / Dark theme (checkmark = active)
-- **Help** — right-aligned
+- **Help** — right-aligned; opens the Help dialog
+
+### Help Dialog
+
+Modal dialog opened from the Help menu item. Contains four tabs: **Shortcuts**, **Annotations & Masks**, **Navigation**, **About**. Only one tab is visible at a time; clicking a tab header switches content without closing the dialog. Closed by an ✕ button or clicking the backdrop.
+
+#### Tab: Shortcuts
+
+A table listing all keyboard shortcuts grouped by scope. Columns: Scope | Key | Action. Content is derived from the canonical shortcut table in this document. A short note at the top: *"Shortcuts are active only when the relevant UI area has focus."*
+
+#### Tab: Annotations & Masks
+
+Explanatory text covering:
+- **Mask types**: point (left-click), bounding box (click-drag), freehand (click-drag, self-intersecting stroke closes a loop, simple stroke edits the nearest existing mask).
+- **Placement**: left-click (point mode); click-drag (bbox / freehand mode). Placement is suppressed while a mask is selected.
+- **Selection**: double-click a mask to select it; Escape to deselect; Arrow Up/Down to cycle.
+- **Removal**: Shift+left-click removes the nearest mask; Delete removes the selected mask.
+- **Labels**: one label is always active (shown highlighted in the Labels panel). Newly placed masks inherit the active label. Right-click near a mask to reassign its label.
+
+#### Tab: Navigation
+
+Explanatory text covering:
+- **Prev / Next buttons** in the left sidebar step through the image list one at a time.
+- **Index field**: type a number and press Enter to jump directly to that image.
+- **Fast-forward button**: jumps to the first image (after the current one) whose annotation file does not exist or contains zero masks.
+
+#### Tab: About
+
+Static content:
+- App name: **Nemo-Lab**
+- Brief one-line description: *"Image annotation tool for large images."*
+- Version string: read from a `/api/version` endpoint (returns a plain JSON string); display as `v<version>`. If the endpoint is unavailable, omit the version line.
 
 ### Tasks Dialog
 
@@ -331,9 +362,8 @@ Three checkmark controls below the sliders, laid out in the same column grid (ch
 
 1. Fetch `manifest.json`
 2. Fetch level-0 tile (`tiles/0/0_0.png`) — small, arrives fast
-3. Upload level-0 tile as a WebGL texture; render at natural size centered in canvas
-4. Over **0.2 s** animate it growing to fit-to-screen
-5. In parallel, fetch all tiles for the appropriate fit-to-screen level
+3. Upload level-0 tile as a WebGL texture; render fit-to-screen centered in canvas
+4. In parallel, fetch all tiles for the appropriate fit-to-screen level
 6. As each tile arrives, upload as WebGL texture and blit at correct position — replacing the corresponding region of the level-0 texture
 7. On resize: clamp pan/zoom for new viewport, recompute fit level, re-fetch tiles for new level if it changed, redraw
 
@@ -385,6 +415,78 @@ Certain UI preferences are persisted per user in the backend and restored on nex
 - On login/page load, frontend fetches `GET /api/settings` and applies each setting before first render.
 - Each setting is written via `PUT /api/settings` immediately when it changes in the UI.
 - `theme` is no longer sourced from `nemo.toml`; the server-side default is `light` when no setting exists.
+
+### Focus Scope Tracking
+
+When a `[data-shortcut-scope]` element itself receives focus (not a child inside it), two things happen:
+
+- **Visual flash**: a CSS class `scope-focus-flash` is added to the element and removed after 500 ms. The class applies `box-shadow: 0 0 0 3px lightblue` with a `transition: box-shadow 0.5s ease-out` so the shadow fades out smoothly.
+- **Backend log**: `logEvent("focus_scope", { scope: scopeName })` is sent over WS, where `scopeName` is the element's `data-shortcut-scope` value.
+
+Implementation:
+- One `document.addEventListener("focusin", handleFocusIn)` registered at startup.
+- `handleFocusIn` checks `event.target.closest('[data-shortcut-scope]') === event.target`; if not, ignore.
+- No persistent state change in `appState` — purely observational.
+
+### Shortcut Scope System
+
+Keyboard shortcuts are scoped to UI regions. A `keydown` event only triggers a shortcut if `event.target.closest('[data-shortcut-scope]')` resolves to a scope that owns that shortcut.
+
+- **Innermost scope wins**: `closest` returns the nearest ancestor with `data-shortcut-scope`; only that scope's shortcuts are evaluated.
+- **No bubbling**: a shortcut never fires in an outer scope when an inner scope is matched.
+- **No fallback**: if no `[data-shortcut-scope]` ancestor exists, all shortcuts are suppressed.
+
+#### Scopes
+
+| Scope | Element | Notes |
+|---|---|---|
+| `canvas` | `.image-view` wrapper div | `tabindex="0"`; receives focus on click; canvas element stays a pure rendering surface |
+| `navigation` | Image navigation section in the left sidebar | |
+| `optics` | Optics panel body | |
+| `labels` | Labels panel body | |
+| `annotations` | Annotations panel body | |
+| `commentImage` | Comment/picture panel body | |
+| `commentAnnotation` | Comment/annotation panel body | |
+| `taskDialog` | Tasks modal dialog root | |
+| `taskLabelTree` | Label tree container within a task card (editable, admin only) | Innermost inside `taskDialog` |
+
+#### Shortcut table
+
+| Scope | Key | Action |
+|---|---|---|
+| `canvas` | `PageUp` | Cycle optics transform forward |
+| `canvas` | `PageDown` | Cycle optics transform backward |
+| `canvas` | `Escape` | Deselect selected mask; close context menu |
+| `canvas` | `Delete` | Remove selected mask |
+| `canvas` | `ArrowUp` | Cycle mask selection backward |
+| `canvas` | `ArrowDown` | Cycle mask selection forward |
+| `canvas` | `p` | Switch mask mode to **point** |
+| `canvas` | `r` | Switch mask mode to **bounding box** |
+| `canvas` | `f` | Switch mask mode to **freehand** |
+| `navigation` | `Enter` | Jump to typed image index |
+| `taskDialog` | `Enter` | Add tag / commit field / add label (by target selector) |
+| `taskLabelTree` | `ArrowUp` / `ArrowDown` | Reorder label within parent |
+| `taskLabelTree` | `ArrowLeft` / `ArrowRight` | Promote / demote label in hierarchy |
+| `taskLabelTree` | `Tab` / `Shift+Tab` | Move focus between label rows |
+
+#### Toast Notification on Mode Change
+
+When the mask mode changes (via shortcut or dropdown), a small toast notification appears briefly in the canvas area:
+
+- Content: the new mode name, e.g. `point`, `bounding box`, `freehand`.
+- Position: bottom-center of the `.image-view__canvas-wrap`.
+- Duration: visible for 2 seconds, then fades out (CSS opacity transition 0.3 s).
+- Implementation: a single `<div class="mode-toast">` element appended to `.image-view__canvas-wrap`, shown by adding `.mode-toast--visible` and removed after 2 s via `setTimeout`.
+- Only one toast is shown at a time; a new mode change resets the timer.
+
+#### Implementation
+
+- A single `document.addEventListener("keydown", handleKeydown)` replaces all current global keydown handlers.
+- `handleKeydown` resolves the scope via `event.target.closest('[data-shortcut-scope]')`; if none → return early.
+- Dispatches to a per-scope handler based on `scope.dataset.shortcutScope`.
+- The editable-element guard (`INPUT/TEXTAREA/SELECT`) is dropped — scope placement makes it redundant.
+- The `.image-view` wrapper gets `tabindex="0"` and `data-shortcut-scope="canvas"`. Clicking anywhere in the image view calls `.focus()` on the wrapper.
+- Canvas wheel events remain bound directly on the canvas element (`{ passive: false }`); unaffected by this system.
 
 ### DOM Update Strategy
 
@@ -602,6 +704,7 @@ An annotation is the assignment of a label to a mask.
 #### Annotations panel selection indicator
 
 - The Annotations panel in the right sidebar lists all masks for the current image.
+- Each row may show a small read-only creator/editor byline (`by <username>`) when `nemolab_mask_authors["<annotation_id>"]` exists.
 - The row corresponding to the currently selected mask is visually highlighted (e.g. distinct background or border).
 - When no mask is selected, no row is highlighted.
 - Selecting a mask (via double-click or Arrow up/down) scrolls its row into view in the panel.
@@ -673,6 +776,7 @@ Each image entry in the `images` array written by nemo-lab includes two extra fi
 | `nemolab_labels` | Full hierarchical label tree for the task |
 | `nemolab_comments` | Per-annotation and per-image comments (flat string map) |
 | `nemolab_authors` | Last editor of each comment (flat string map, mirrors `nemolab_comments`) |
+| `nemolab_mask_authors` | Last editor of each mask (flat string map keyed by annotation id string) |
 
 #### Comment schema
 
@@ -708,6 +812,22 @@ Example:
 - When a user edits a comment, the corresponding author entry is updated to that user's username atomically with the comment update.
 - Missing key means no author recorded (comment was never edited in nemo-lab, e.g. imported from external file).
 - Author is displayed read-only alongside the comment textarea in the sidebar (e.g. `"Last edited by alice"`); it is never user-editable.
+
+#### Mask author schema
+
+`nemolab_mask_authors` is a flat JSON object mapping annotation id strings to usernames.
+
+Example:
+```json
+"nemolab_mask_authors": {
+  "42": "bob"
+}
+```
+
+- On each `save_annotations`, backend compares incoming masks to the currently stored version for that image id.
+- For masks that changed (new mask, geometry change, or label/category change), the corresponding author key is set to the current user's username (last writer wins).
+- Author keys for masks removed from the current image are deleted.
+- Frontend renders this as read-only `by <username>` text in each row of the Annotations panel when the key exists.
 
 #### Annotation types
 

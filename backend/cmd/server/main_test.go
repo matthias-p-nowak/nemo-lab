@@ -53,6 +53,32 @@ func TestMeEndpointReflectsServerAdminFlag(t *testing.T) {
 	}
 }
 
+func TestVersionEndpointRequiresAuthAndReturnsJSONString(t *testing.T) {
+	db := openTestDB(t)
+	t.Cleanup(func() { _ = db.Close() })
+
+	handler := withAuthTasksMux(db)
+
+	unauthReq := httptest.NewRequest(http.MethodGet, "/api/version", nil)
+	unauthResp := httptest.NewRecorder()
+	handler.ServeHTTP(unauthResp, unauthReq)
+	if unauthResp.Code != http.StatusUnauthorized {
+		t.Fatalf("expected unauthorized without credentials, got=%d", unauthResp.Code)
+	}
+
+	authResp := doJSONRequest(t, handler, http.MethodGet, "/api/version", "alice", "pw", nil)
+	if authResp.Code != http.StatusOK {
+		t.Fatalf("expected version endpoint success, got=%d", authResp.Code)
+	}
+	var got string
+	if err := json.Unmarshal(authResp.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode version response: %v", err)
+	}
+	if got != apiVersion {
+		t.Fatalf("unexpected version: got=%q want=%q", got, apiVersion)
+	}
+}
+
 func TestTaskUpsertNonAdminOnlyChangesStatusAndComment(t *testing.T) {
 	db := openTestDB(t)
 	t.Cleanup(func() { _ = db.Close() })
@@ -183,6 +209,7 @@ func TestTaskDeleteEndpointAdminOnly(t *testing.T) {
 func withAuthTasksMux(db *sql.DB) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/me", makeMeHandler(db))
+	mux.HandleFunc("GET /api/version", makeVersionHandler())
 	mux.HandleFunc("GET /api/tasks", makeTasksListHandler(db))
 	mux.HandleFunc("PUT /api/tasks/{id}", makeTaskUpsertHandler(db))
 	mux.HandleFunc("DELETE /api/tasks/{id}", makeTaskDeleteHandler(db))

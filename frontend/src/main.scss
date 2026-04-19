@@ -160,6 +160,11 @@ button:hover {
   background: var(--bg);
 }
 
+.scope-focus-flash {
+  box-shadow: 0 0 0 3px lightblue;
+  transition: box-shadow 0.5s ease-out;
+}
+
 .image-view__alerts {
   display: flex;
   flex-direction: column;
@@ -204,6 +209,7 @@ button:hover {
   min-height: 0;
   overflow: hidden;
   display: flex;
+  position: relative;
 }
 
 .image-view__canvas {
@@ -227,6 +233,26 @@ button:hover {
 
 .image-view__canvas--zoom-loading {
   border-color: #fbc02d;
+}
+
+.mode-toast {
+  position: absolute;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(0, 0, 0, 0.65);
+  color: #fff;
+  padding: 6px 16px;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.3s;
+  z-index: 10;
+
+  &.mode-toast--visible {
+    opacity: 1;
+  }
 }
 
 .panels {
@@ -546,7 +572,8 @@ textarea[data-action="annotation-comment-input"] {
 
 // ── Tasks dialog ─────────────────────────────────────────────────────────────
 
-.tasks-backdrop {
+.tasks-backdrop,
+.help-backdrop {
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.55);
@@ -557,7 +584,8 @@ textarea[data-action="annotation-comment-input"] {
   padding: 60px 0 20px;
 }
 
-.tasks-dialog {
+.tasks-dialog,
+.help-dialog {
   background: var(--bg-panel);
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -566,6 +594,11 @@ textarea[data-action="annotation-comment-input"] {
   display: flex;
   flex-direction: column;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+}
+
+.help-dialog {
+  max-height: calc(100vh - 80px);
+  height: auto;
 }
 
 .tasks-dialog__header {
@@ -583,6 +616,15 @@ textarea[data-action="annotation-comment-input"] {
   }
 }
 
+.help-dialog__header {
+  display: flex;
+  align-items: center;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--line);
+  gap: 10px;
+  flex-shrink: 0;
+}
+
 .tasks-dialog__body {
   overflow-y: auto;
   padding: 12px;
@@ -594,6 +636,12 @@ textarea[data-action="annotation-comment-input"] {
 }
 
 .tasks-dialog__title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.help-dialog__title {
   margin: 0;
   font-size: 1rem;
   font-weight: 600;
@@ -614,6 +662,86 @@ textarea[data-action="annotation-comment-input"] {
     background: var(--button-bg);
     color: var(--text);
   }
+}
+
+.help-dialog__close {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 1.1rem;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 4px;
+
+  &:hover {
+    background: var(--button-bg);
+    color: var(--text);
+  }
+}
+
+.help-dialog__body {
+  overflow-y: auto;
+  padding: 12px;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.help-dialog__tabs {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.help-dialog__tab {
+  border: 1px solid var(--line);
+  background: var(--bg-toolbar);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: 0.85rem;
+
+  &.is-active {
+    background: var(--button-bg);
+    border-color: var(--accent);
+  }
+}
+
+.help-dialog__content {
+  font-size: 0.9rem;
+}
+
+.help-dialog__note {
+  margin: 0 0 8px;
+  color: var(--text-muted);
+}
+
+.help-dialog__table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.84rem;
+
+  th, td {
+    border: 1px solid var(--line);
+    padding: 6px 8px;
+    text-align: left;
+    vertical-align: top;
+  }
+}
+
+.help-dialog__list {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.help-dialog__about {
+  display: grid;
+  gap: 4px;
 }
 
 .tasks-admin-badge {
@@ -1080,8 +1208,8 @@ textarea[data-action="annotation-comment-input"] {
   align-items: center;
   gap: 6px;
   padding: 2px 4px;
+  border-left: 3px solid transparent;
   border-radius: 4px;
-  outline: 1px solid transparent;
   cursor: default;
 
   &:hover {
@@ -1093,8 +1221,9 @@ textarea[data-action="annotation-comment-input"] {
   }
 
   &.is-selected {
-    outline-color: var(--accent);
-    background: rgba(109, 211, 255, 0.08);
+    background: rgba(109, 211, 255, 0.22);
+    border-left-color: var(--accent);
+    padding-left: 1px;
   }
 }
 

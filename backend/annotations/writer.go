@@ -14,21 +14,23 @@ func WriteAnnotations(path string, af *AnnotationFile) error {
 	}
 
 	type outFile struct {
-		Images          []CocoImage      `json:"images"`
-		Annotations     []CocoAnnotation `json:"annotations"`
-		Categories      []CocoCategory   `json:"categories"`
-		NemolabLabels   json.RawMessage  `json:"nemolab_labels,omitempty"`
-		NemolabComments json.RawMessage  `json:"nemolab_comments,omitempty"`
-		NemolabAuthors  json.RawMessage  `json:"nemolab_authors,omitempty"`
+		Images             []CocoImage      `json:"images"`
+		Annotations        []CocoAnnotation `json:"annotations"`
+		Categories         []CocoCategory   `json:"categories"`
+		NemolabLabels      json.RawMessage  `json:"nemolab_labels,omitempty"`
+		NemolabComments    json.RawMessage  `json:"nemolab_comments,omitempty"`
+		NemolabAuthors     json.RawMessage  `json:"nemolab_authors,omitempty"`
+		NemolabMaskAuthors json.RawMessage  `json:"nemolab_mask_authors,omitempty"`
 	}
 
 	out := outFile{
-		Images:          af.Images,
-		Annotations:     af.Annotations,
-		Categories:      af.Categories,
-		NemolabLabels:   af.NemolabLabels,
-		NemolabComments: af.NemolabComments,
-		NemolabAuthors:  af.NemolabAuthors,
+		Images:             af.Images,
+		Annotations:        af.Annotations,
+		Categories:         af.Categories,
+		NemolabLabels:      af.NemolabLabels,
+		NemolabComments:    af.NemolabComments,
+		NemolabAuthors:     af.NemolabAuthors,
+		NemolabMaskAuthors: af.NemolabMaskAuthors,
 	}
 
 	data, err := json.MarshalIndent(out, "", "  ")

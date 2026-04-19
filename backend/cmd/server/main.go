@@ -21,6 +21,8 @@ import (
 	"github.com/matthias-p-nowak/nemo-lab/ws"
 )
 
+const apiVersion = "0.1.0"
+
 func main() {
 	cfg, err := config.Load("nemo.toml")
 	if err != nil {
@@ -40,6 +42,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/me", makeMeHandler(sqlDB))
+	mux.HandleFunc("GET /api/version", makeVersionHandler())
 	mux.HandleFunc("GET /api/settings", makeSettingsGetHandler(sqlDB))
 	mux.HandleFunc("PUT /api/settings", makeSettingsPutHandler(sqlDB))
 	mux.HandleFunc("GET /api/tasks", makeTasksListHandler(sqlDB))
@@ -56,6 +59,12 @@ func main() {
 	log.Printf("listening on %s", cfg.ListenAddr)
 	if err := http.ListenAndServe(cfg.ListenAddr, handler); err != nil {
 		log.Fatalf("server error: %v", err)
+	}
+}
+
+func makeVersionHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, apiVersion)
 	}
 }
 

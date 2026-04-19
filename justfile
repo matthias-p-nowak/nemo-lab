@@ -1,6 +1,6 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-default_port := "7255"
+default_port := "7033"
 config_file := "nemo.toml"
 binary_name := "nemo"
 
