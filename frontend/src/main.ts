@@ -2215,6 +2215,8 @@ function finalizeFreehandStroke(samples: FreehandSample[]): {
   sampled_points: number;
   self_intersections: number;
   is_near_closure: boolean;
+  loop_extracted?: boolean;
+  existing_freehand_masks?: number;
   edited_mask_id?: string;
 } {
   const sampled = dedupeConsecutivePoints(
@@ -2253,6 +2255,7 @@ function finalizeFreehandStroke(samples: FreehandSample[]): {
         sampled_points: sampled.length,
         self_intersections: selfIntersections.length,
         is_near_closure: isNearClosure,
+        loop_extracted: true,
       };
     }
     // If self-intersection extraction fails, continue with the normal fallback
@@ -2261,6 +2264,7 @@ function finalizeFreehandStroke(samples: FreehandSample[]): {
   }
 
   const freehandMasks = appState.masks.filter((mask) => mask.kind === "freehand" && Array.isArray(mask.points) && (mask.points?.length ?? 0) >= 3);
+  const existingFreehandCount = freehandMasks.length;
   if (freehandMasks.length === 0) {
     // No existing freehand loop to edit: close the stroke and create a new loop.
     const closedStroke = [...strokePx, strokePx[0]];
@@ -2271,6 +2275,7 @@ function finalizeFreehandStroke(samples: FreehandSample[]): {
         sampled_points: sampled.length,
         self_intersections: selfIntersections.length,
         is_near_closure: isNearClosure,
+        existing_freehand_masks: existingFreehandCount,
       };
     }
     const points = loopPx.map((point) => imagePxToNormalized(point));
@@ -2280,6 +2285,7 @@ function finalizeFreehandStroke(samples: FreehandSample[]): {
       sampled_points: sampled.length,
       self_intersections: selfIntersections.length,
       is_near_closure: isNearClosure,
+      existing_freehand_masks: existingFreehandCount,
     };
   }
   const ranked = freehandMasks
@@ -2304,6 +2310,7 @@ function finalizeFreehandStroke(samples: FreehandSample[]): {
         sampled_points: sampled.length,
         self_intersections: selfIntersections.length,
         is_near_closure: isNearClosure,
+        existing_freehand_masks: existingFreehandCount,
       };
     }
     const points = loopPx.map((point) => imagePxToNormalized(point));
@@ -2313,6 +2320,7 @@ function finalizeFreehandStroke(samples: FreehandSample[]): {
       sampled_points: sampled.length,
       self_intersections: selfIntersections.length,
       is_near_closure: isNearClosure,
+      existing_freehand_masks: existingFreehandCount,
     };
   }
 
@@ -2328,6 +2336,7 @@ function finalizeFreehandStroke(samples: FreehandSample[]): {
         sampled_points: sampled.length,
         self_intersections: selfIntersections.length,
         is_near_closure: isNearClosure,
+        existing_freehand_masks: existingFreehandCount,
       };
     }
     const points = loopPx.map((point) => imagePxToNormalized(point));
@@ -2337,6 +2346,7 @@ function finalizeFreehandStroke(samples: FreehandSample[]): {
       sampled_points: sampled.length,
       self_intersections: selfIntersections.length,
       is_near_closure: isNearClosure,
+      existing_freehand_masks: existingFreehandCount,
     };
   }
   const normalized = editedPx.map((point) => imagePxToNormalized(point));
@@ -2346,6 +2356,7 @@ function finalizeFreehandStroke(samples: FreehandSample[]): {
     sampled_points: sampled.length,
     self_intersections: selfIntersections.length,
     is_near_closure: isNearClosure,
+    existing_freehand_masks: existingFreehandCount,
     edited_mask_id: target.mask.id,
   };
 }
