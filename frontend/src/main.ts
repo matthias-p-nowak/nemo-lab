@@ -2029,10 +2029,12 @@ function findStrokePolygonIntersections(
   return deduped;
 }
 
-/** Returns overlap score between a stroke and polygon outline for loop selection. */
+/** Returns overlap score between a stroke and polygon outline for loop selection.
+ *  Score = number of intersection points; 0 means no overlap. */
 function strokePolygonOverlapScore(strokePx: GeometryPoint[], polygonPx: GeometryPoint[]): number {
   const hits = findStrokePolygonIntersections(strokePx, polygonPx);
-  return hits.length;
+  // Require at least 2 crossings (stroke enters and exits polygon boundary)
+  return hits.length >= 2 ? hits.length : 0;
 }
 
 /** Returns stroke subpath between two intersection samples, inclusive of endpoints. */
@@ -2060,7 +2062,17 @@ function polygonBoundaryPathBetween(
 ): GeometryPoint[] {
   const n = polygonPx.length;
   const out: GeometryPoint[] = [{ x: startPoint.x, y: startPoint.y }];
-  if (forward) {
+  if (startEdge === endEdge) {
+    // Both intersections on the same edge: one direction traverses the full perimeter,
+    // the other is just the direct segment between the two points on that edge.
+    if (forward) {
+      // Traverse full perimeter (all polygon vertices)
+      for (let i = 1; i <= n; i += 1) {
+        out.push(polygonPx[(startEdge + i) % n]);
+      }
+    }
+    // backward: direct segment — nothing to add between start and end points
+  } else if (forward) {
     let edge = startEdge;
     while (edge !== endEdge) {
       out.push(polygonPx[(edge + 1) % n]);
@@ -2233,6 +2245,8 @@ function finalizeFreehandStroke(samples: FreehandSample[]): {
   self_intersections: number;
   is_near_closure: boolean;
   existing_freehand_masks: number;
+  target_intersections?: number;
+  target_score?: number;
   edited_mask_id?: string;
 } {
   const sampled = dedupeConsecutivePoints(
@@ -2337,6 +2351,7 @@ function finalizeFreehandStroke(samples: FreehandSample[]): {
   }
 
   const target = ranked[0];
+  const targetIntersections = findStrokePolygonIntersections(strokePx, target.polygonPx);
   const editedPx = editPolygonWithStroke(strokePx, target.polygonPx);
   if (!editedPx || editedPx.length < 3) {
     return {
@@ -2345,6 +2360,8 @@ function finalizeFreehandStroke(samples: FreehandSample[]): {
       self_intersections: 0,
       is_near_closure: isNearClosure,
       existing_freehand_masks: existingFreehandCount,
+      target_intersections: targetIntersections.length,
+      target_score: target.score,
     };
   }
   const normalized = editedPx.map((point) => imagePxToNormalized(point));
