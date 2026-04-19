@@ -8,3 +8,7 @@ __debug_bin*
 wt/
 images/
 logs/
+node_modules/
+package-lock.json
+.python-version
+uv.lock

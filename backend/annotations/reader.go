@@ -39,6 +39,7 @@ func parseCOCO(top map[string]json.RawMessage) (*AnnotationFile, error) {
 	af.NemolabLabels = cloneRaw(top["nemolab_labels"])
 	af.NemolabComments = cloneRaw(top["nemolab_comments"])
 	af.NemolabAuthors = cloneRaw(top["nemolab_authors"])
+	af.NemolabMaskAuthors = cloneRaw(top["nemolab_mask_authors"])
 
 	for i := range af.Annotations {
 		seg := af.Annotations[i].Segmentation

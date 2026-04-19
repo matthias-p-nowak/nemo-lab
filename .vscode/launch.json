@@ -15,8 +15,18 @@
       "name": "Firefox: Launch localhost",
       "type": "firefox",
       "request": "launch",
-      "url": "http://127.0.0.1:7255",
+      "url": "http://127.0.0.1:7033",
       "webRoot": "${workspaceFolder}",
+      "pathMappings": [
+        {
+          "url": "/js/",
+          "path": "${workspaceFolder}/dist/js/"
+        },
+        {
+          "url": "/frontend/src/",
+          "path": "${workspaceFolder}/frontend/src/"
+        }
+      ],
       "profile": "devel"
     }
   ],
@@ -24,7 +34,7 @@
     {
       "name": "Go + Firefox",
       "configurations": ["Go: Launch server", "Firefox: Launch localhost"],
-      "preLaunchTask": "start-all",
+      "preLaunchTask": "start-all-debug",
       "stopAll": true
     }
   ]

@@ -3,7 +3,7 @@ package config
 import "github.com/BurntSushi/toml"
 
 const (
-	defaultListenAddr  = ":7255"
+	defaultListenAddr  = ":7033"
 	defaultStaticDir   = "dist"
 	defaultDBPath      = "nemo.db"
 	defaultLogsDir     = "logs"

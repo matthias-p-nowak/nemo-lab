@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -439,6 +440,7 @@ func handleSaveAnnotations(db *sql.DB, token string, conn *websocket.Conn, lgr *
 	existing := getOrLoadSharedAnnotations(path, token, hash, lgr)
 	username, _ := auth.UsernameFromSessionToken(db, token)
 	applyCommentAuthorUpdate(existing, &af, username)
+	applyMaskAuthorUpdate(existing, &af, username)
 	merged := mergeAndStoreSharedAnnotations(path, &af, ctx.imagePath, hash, token, lgr)
 	broadcastAnnotationsData(path, hash, merged, conn)
 }
@@ -492,6 +494,58 @@ func applyCommentAuthorUpdate(existing, incoming *annotations.AnnotationFile, us
 
 	incoming.NemolabComments = encodeStringMap(nextComments)
 	incoming.NemolabAuthors = encodeStringMap(nextAuthors)
+}
+
+func applyMaskAuthorUpdate(existing, incoming *annotations.AnnotationFile, username string) {
+	if incoming == nil || username == "" {
+		return
+	}
+
+	targetImageID := 1
+	if len(incoming.Images) > 0 && incoming.Images[0].ID != 0 {
+		targetImageID = incoming.Images[0].ID
+	}
+
+	existingByID := map[int]annotations.CocoAnnotation{}
+	for _, ann := range existing.Annotations {
+		if ann.ImageID != targetImageID {
+			continue
+		}
+		existingByID[ann.ID] = ann
+	}
+	incomingByID := map[int]annotations.CocoAnnotation{}
+	for _, ann := range incoming.Annotations {
+		if ann.ImageID != targetImageID {
+			continue
+		}
+		incomingByID[ann.ID] = ann
+	}
+
+	maskAuthors := decodeStringMap(existing.NemolabMaskAuthors)
+	incomingMaskAuthors := decodeStringMap(incoming.NemolabMaskAuthors)
+	for key, value := range incomingMaskAuthors {
+		if _, ok := maskAuthors[key]; ok {
+			continue
+		}
+		maskAuthors[key] = value
+	}
+
+	for annID, ann := range incomingByID {
+		existingAnn, alreadyExisting := existingByID[annID]
+		if alreadyExisting && reflect.DeepEqual(existingAnn, ann) {
+			continue
+		}
+		key := fmt.Sprintf("%d", ann.ID)
+		maskAuthors[key] = username
+	}
+	for annID := range existingByID {
+		if _, stillPresent := incomingByID[annID]; stillPresent {
+			continue
+		}
+		delete(maskAuthors, fmt.Sprintf("%d", annID))
+	}
+
+	incoming.NemolabMaskAuthors = encodeStringMap(maskAuthors)
 }
 
 func decodeStringMap(raw json.RawMessage) map[string]string {
@@ -794,6 +848,9 @@ func mergeAnnotationFiles(existing, incoming *annotations.AnnotationFile) *annot
 	if len(inc.NemolabAuthors) > 0 {
 		base.NemolabAuthors = append([]byte(nil), inc.NemolabAuthors...)
 	}
+	if len(inc.NemolabMaskAuthors) > 0 {
+		base.NemolabMaskAuthors = append([]byte(nil), inc.NemolabMaskAuthors...)
+	}
 
 	return base
 }
@@ -803,12 +860,13 @@ func cloneAnnotationFile(src *annotations.AnnotationFile) *annotations.Annotatio
 		return nil
 	}
 	out := &annotations.AnnotationFile{
-		Images:          append([]annotations.CocoImage{}, src.Images...),
-		Annotations:     append([]annotations.CocoAnnotation{}, src.Annotations...),
-		Categories:      append([]annotations.CocoCategory{}, src.Categories...),
-		NemolabLabels:   append([]byte(nil), src.NemolabLabels...),
-		NemolabComments: append([]byte(nil), src.NemolabComments...),
-		NemolabAuthors:  append([]byte(nil), src.NemolabAuthors...),
+		Images:             append([]annotations.CocoImage{}, src.Images...),
+		Annotations:        append([]annotations.CocoAnnotation{}, src.Annotations...),
+		Categories:         append([]annotations.CocoCategory{}, src.Categories...),
+		NemolabLabels:      append([]byte(nil), src.NemolabLabels...),
+		NemolabComments:    append([]byte(nil), src.NemolabComments...),
+		NemolabAuthors:     append([]byte(nil), src.NemolabAuthors...),
+		NemolabMaskAuthors: append([]byte(nil), src.NemolabMaskAuthors...),
 	}
 	for i := range out.Annotations {
 		out.Annotations[i].BBox = append([]float64{}, out.Annotations[i].BBox...)

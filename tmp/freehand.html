@@ -1,0 +1,901 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Freehand Trial</title>
+<style>
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; }
+body {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: #16181d;
+  color: #e4e8f0;
+}
+#toolbar {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid #2b2f39;
+  background: #1e222b;
+  font-size: 12px;
+}
+#toolbar b { color: #9ec5ff; }
+#toolbar kbd {
+  border: 1px solid #454d5f;
+  background: #252b36;
+  border-radius: 4px;
+  padding: 0 0.3rem;
+}
+canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: crosshair;
+  background: #101218;
+}
+#status {
+  min-height: 1.8rem;
+  padding: 0.4rem 0.75rem;
+  border-top: 1px solid #2b2f39;
+  color: #adb6c7;
+  background: #1e222b;
+  font-size: 12px;
+}
+</style>
+</head>
+<body>
+<div id="toolbar">
+  <span>Freehand Trial</span>
+  <span><kbd>[</kbd><kbd>]</kbd> min_dist: <b id="minDist">3.0</b> px</span>
+  <span><kbd>-</kbd><kbd>=</kbd> simplify: <b id="simplify">0.5</b></span>
+  <span><kbd>C</kbd> clear</span>
+</div>
+<canvas id="canvas"></canvas>
+<div id="status">Ready</div>
+
+<script>
+(() => {
+  "use strict";
+
+  const EPS = 1e-7;
+  const SNAP = 1e-3;
+
+  const cfg = {
+    minDist: 3.0,
+    simplifyTol: 0.5,
+    maxSelfIntersectionSegments: 3,
+  };
+
+  const state = {
+    masks: /** @type {Array<Array<{x:number,y:number}>>} */ ([]), // open loops (first not repeated)
+    stroke: /** @type {Array<{x:number,y:number}>} */ ([]),
+    drawing: false,
+  };
+
+  const canvas = document.getElementById("canvas");
+  const ctx = canvas.getContext("2d");
+  const statusEl = document.getElementById("status");
+  const minDistEl = document.getElementById("minDist");
+  const simplifyEl = document.getElementById("simplify");
+
+  function setStatus(msg) {
+    statusEl.textContent = msg;
+  }
+
+  function updateToolbar() {
+    minDistEl.textContent = cfg.minDist.toFixed(1);
+    simplifyEl.textContent = cfg.simplifyTol.toFixed(2);
+  }
+
+  function resizeCanvas() {
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    const w = Math.floor(canvas.clientWidth * dpr);
+    const h = Math.floor(canvas.clientHeight * dpr);
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    redraw();
+  }
+
+  function p(x, y) { return { x, y }; }
+  function sub(a, b) { return p(a.x - b.x, a.y - b.y); }
+  function dot(a, b) { return a.x * b.x + a.y * b.y; }
+  function cross(a, b) { return a.x * b.y - a.y * b.x; }
+  function len(a) { return Math.hypot(a.x, a.y); }
+  function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+  function lerp(a, b, t) { return p(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t); }
+
+  function signedArea(poly) {
+    if (poly.length < 3) return 0;
+    let acc = 0;
+    for (let i = 0; i < poly.length; i += 1) {
+      const a = poly[i];
+      const b = poly[(i + 1) % poly.length];
+      acc += a.x * b.y - b.x * a.y;
+    }
+    return 0.5 * acc;
+  }
+
+  function polygonArea(poly) {
+    return Math.abs(signedArea(poly));
+  }
+
+  function ensureCCW(poly) {
+    return signedArea(poly) < 0 ? poly.slice().reverse() : poly;
+  }
+
+  function dedupeConsecutive(points, eps = 1e-6) {
+    const out = [];
+    for (const pt of points) {
+      if (out.length > 0 && dist(out[out.length - 1], pt) <= eps) continue;
+      out.push(p(pt.x, pt.y));
+    }
+    return out;
+  }
+
+  function segParam(point, a, b) {
+    const ab = sub(b, a);
+    const denom = dot(ab, ab);
+    if (denom <= EPS) return 0;
+    return dot(sub(point, a), ab) / denom;
+  }
+
+  /**
+   * Returns either:
+   * - { kind: "point", tA, tB, point }
+   * - { kind: "overlap", a0, a1, b0, b1, p0, p1, length }
+   * - null
+   */
+  function segmentIntersectionDetailed(a0, a1, b0, b1) {
+    const r = sub(a1, a0);
+    const s = sub(b1, b0);
+    const rxs = cross(r, s);
+    const qmp = sub(b0, a0);
+    const qmpxr = cross(qmp, r);
+
+    if (Math.abs(rxs) <= EPS && Math.abs(qmpxr) <= EPS) {
+      // Collinear overlap
+      const rr = dot(r, r);
+      if (rr <= EPS) return null;
+      const t0 = dot(sub(b0, a0), r) / rr;
+      const t1 = dot(sub(b1, a0), r) / rr;
+      const lo = Math.max(0, Math.min(t0, t1));
+      const hi = Math.min(1, Math.max(t0, t1));
+      if (hi - lo <= EPS) return null;
+      const p0 = lerp(a0, a1, lo);
+      const p1 = lerp(a0, a1, hi);
+      const length = dist(p0, p1);
+      if (length <= EPS) return null;
+      return {
+        kind: "overlap",
+        a0: lo,
+        a1: hi,
+        b0: segParam(p0, b0, b1),
+        b1: segParam(p1, b0, b1),
+        p0,
+        p1,
+        length,
+      };
+    }
+
+    if (Math.abs(rxs) <= EPS) return null;
+
+    const t = cross(qmp, s) / rxs;
+    const u = cross(qmp, r) / rxs;
+    if (t < -EPS || t > 1 + EPS || u < -EPS || u > 1 + EPS) return null;
+
+    const tt = Math.max(0, Math.min(1, t));
+    const uu = Math.max(0, Math.min(1, u));
+    return {
+      kind: "point",
+      tA: tt,
+      tB: uu,
+      point: lerp(a0, a1, tt),
+    };
+  }
+
+  function pushUniqueNumber(arr, value, eps = 1e-8) {
+    for (const v of arr) {
+      if (Math.abs(v - value) <= eps) return;
+    }
+    arr.push(value);
+  }
+
+  function buildSegmentsFromParams(polyline, params) {
+    /** @type {Array<Array<{x:number,y:number}>>} */
+    const out = [];
+    for (let i = 0; i < polyline.length - 1; i += 1) {
+      const a = polyline[i];
+      const b = polyline[i + 1];
+      const tVals = params[i].slice().sort((x, y) => x - y);
+      const uniq = [];
+      for (const t of tVals) {
+        if (uniq.length === 0 || Math.abs(t - uniq[uniq.length - 1]) > 1e-8) uniq.push(t);
+      }
+      for (let k = 0; k < uniq.length - 1; k += 1) {
+        const t0 = uniq[k];
+        const t1 = uniq[k + 1];
+        if (t1 - t0 <= 1e-8) continue;
+        const s0 = lerp(a, b, t0);
+        const s1 = lerp(a, b, t1);
+        if (dist(s0, s1) <= 1e-6) continue;
+        out.push([s0, s1]);
+      }
+    }
+    return out;
+  }
+
+  function splitPolyline(subject, cutter) {
+    if (subject.length < 2) return [];
+    if (cutter.length < 2) return [subject.map((pt) => p(pt.x, pt.y))];
+
+    const cuts = [];
+    const subjectMaxT = subject.length - 1;
+    const shouldKeepGlobalT = (gt) => gt > 1e-8 && gt < subjectMaxT - 1e-8;
+    for (let i = 0; i < subject.length - 1; i += 1) {
+      const a0 = subject[i];
+      const a1 = subject[i + 1];
+      for (let j = 0; j < cutter.length - 1; j += 1) {
+        const b0 = cutter[j];
+        const b1 = cutter[j + 1];
+        const hit = segmentIntersectionDetailed(a0, a1, b0, b1);
+        if (!hit) continue;
+        if (hit.kind === "point") {
+          let gt = i + hit.tA;
+          if (hit.tA <= 1e-8) gt = i;
+          if (hit.tA >= 1 - 1e-8) gt = i + 1;
+          if (!shouldKeepGlobalT(gt)) continue;
+          cuts.push({ globalT: gt, point: gt === i + 1 ? p(a1.x, a1.y) : p(hit.point.x, hit.point.y) });
+        } else {
+          let gt0 = i + hit.a0;
+          if (hit.a0 <= 1e-8) gt0 = i;
+          if (hit.a0 >= 1 - 1e-8) gt0 = i + 1;
+          if (shouldKeepGlobalT(gt0)) {
+            cuts.push({ globalT: gt0, point: gt0 === i + 1 ? p(a1.x, a1.y) : p(hit.p0.x, hit.p0.y) });
+          }
+          if (Math.abs(hit.a1 - hit.a0) > 1e-8) {
+            let gt1 = i + hit.a1;
+            if (hit.a1 <= 1e-8) gt1 = i;
+            if (hit.a1 >= 1 - 1e-8) gt1 = i + 1;
+            if (shouldKeepGlobalT(gt1)) {
+              cuts.push({ globalT: gt1, point: gt1 === i + 1 ? p(a1.x, a1.y) : p(hit.p1.x, hit.p1.y) });
+            }
+          }
+        }
+      }
+    }
+
+    cuts.sort((a, b) => a.globalT - b.globalT);
+    const deduped = [];
+    for (const cut of cuts) {
+      const prev = deduped[deduped.length - 1];
+      if (!prev || Math.abs(cut.globalT - prev.globalT) > 1e-8) {
+        deduped.push(cut);
+      }
+    }
+
+    if (deduped.length === 0) {
+      return [subject.map((pt) => p(pt.x, pt.y))];
+    }
+
+    const result = [];
+    let current = [p(subject[0].x, subject[0].y)];
+    let cutIdx = 0;
+
+    for (let i = 0; i < subject.length - 1; i += 1) {
+      const segEndT = i + 1;
+      while (cutIdx < deduped.length && deduped[cutIdx].globalT < segEndT - 1e-8) {
+        const cut = deduped[cutIdx];
+        if (cut.globalT > i + 1e-8) {
+          const last = current[current.length - 1];
+          if (!last || dist(last, cut.point) > 1e-7) current.push(p(cut.point.x, cut.point.y));
+          if (current.length >= 2) result.push(current);
+          current = [p(cut.point.x, cut.point.y)];
+        }
+        cutIdx += 1;
+      }
+      const segEnd = subject[i + 1];
+      const last = current[current.length - 1];
+      if (!last || dist(last, segEnd) > 1e-7) current.push(p(segEnd.x, segEnd.y));
+      while (cutIdx < deduped.length && Math.abs(deduped[cutIdx].globalT - segEndT) <= 1e-8) {
+        if (current.length >= 2) result.push(current);
+        current = [p(segEnd.x, segEnd.y)];
+        cutIdx += 1;
+      }
+    }
+
+    if (current.length >= 2) result.push(current);
+    return result.filter((poly) => poly.length >= 2 && dist(poly[0], poly[poly.length - 1]) > 1e-7);
+  }
+
+  function splitSelfIntersecting(stroke) {
+    /** @type {Array<Array<number>>} */
+    const params = Array.from({ length: stroke.length - 1 }, () => [0, 1]);
+    let intersections = 0;
+
+    for (let i = 0; i < stroke.length - 1; i += 1) {
+      const a0 = stroke[i];
+      const a1 = stroke[i + 1];
+      for (let j = i + 2; j < stroke.length - 1; j += 1) {
+        const b0 = stroke[j];
+        const b1 = stroke[j + 1];
+        const hit = segmentIntersectionDetailed(a0, a1, b0, b1);
+        if (!hit || hit.kind !== "point") continue;
+        if (hit.tA <= 1e-6 || hit.tA >= 1 - 1e-6) continue;
+        if (hit.tB <= 1e-6 || hit.tB >= 1 - 1e-6) continue;
+        intersections += 1;
+        pushUniqueNumber(params[i], hit.tA);
+        pushUniqueNumber(params[j], hit.tB);
+      }
+    }
+
+    return {
+      segments: buildSegmentsFromParams(stroke, params),
+      intersections,
+    };
+  }
+  
+  function pointKey(pt) {
+    return `${Math.round(pt.x / SNAP)},${Math.round(pt.y / SNAP)}`;
+  }
+
+  function canonicalCycleKey(nodes) {
+    if (nodes.length < 3) return "";
+    const n = nodes.length;
+    const arrF = nodes.slice();
+    const arrR = nodes.slice().reverse();
+
+    function minRotation(arr) {
+      let best = 0;
+      for (let i = 1; i < n; i += 1) {
+        for (let k = 0; k < n; k += 1) {
+          const a = arr[(i + k) % n];
+          const b = arr[(best + k) % n];
+          if (a < b) { best = i; break; }
+          if (a > b) break;
+        }
+      }
+      const out = [];
+      for (let i = 0; i < n; i += 1) out.push(arr[(best + i) % n]);
+      return out.join("|");
+    }
+
+    const k1 = minRotation(arrF);
+    const k2 = minRotation(arrR);
+    return k1 < k2 ? k1 : k2;
+  }
+
+  function nodeAllSegments(segmentPolylines) {
+    const segments = [];
+    for (const polyline of segmentPolylines) {
+      if (!polyline || polyline.length < 2) continue;
+      for (let i = 0; i < polyline.length - 1; i += 1) {
+        const a = polyline[i];
+        const b = polyline[i + 1];
+        if (dist(a, b) <= 1e-8) continue;
+        segments.push([p(a.x, a.y), p(b.x, b.y)]);
+      }
+    }
+
+    const cuts = Array.from({ length: segments.length }, () => [0, 1]);
+    for (let i = 0; i < segments.length; i += 1) {
+      const [a0, a1] = segments[i];
+      for (let j = i + 1; j < segments.length; j += 1) {
+        const [b0, b1] = segments[j];
+        const hit = segmentIntersectionDetailed(a0, a1, b0, b1);
+        if (!hit) continue;
+        if (hit.kind === "point") {
+          pushUniqueNumber(cuts[i], hit.tA);
+          pushUniqueNumber(cuts[j], hit.tB);
+        } else {
+          pushUniqueNumber(cuts[i], hit.a0);
+          pushUniqueNumber(cuts[i], hit.a1);
+          pushUniqueNumber(cuts[j], hit.b0);
+          pushUniqueNumber(cuts[j], hit.b1);
+        }
+      }
+    }
+
+    const noded = [];
+    for (let i = 0; i < segments.length; i += 1) {
+      const [a, b] = segments[i];
+      const vals = cuts[i].slice().sort((x, y) => x - y);
+      const uniq = [];
+      for (const t of vals) {
+        if (uniq.length === 0 || Math.abs(t - uniq[uniq.length - 1]) > 1e-8) uniq.push(t);
+      }
+      for (let k = 0; k < uniq.length - 1; k += 1) {
+        const t0 = uniq[k];
+        const t1 = uniq[k + 1];
+        if (t1 - t0 <= 1e-8) continue;
+        const s0 = lerp(a, b, t0);
+        const s1 = lerp(a, b, t1);
+        if (dist(s0, s1) <= 1e-7) continue;
+        noded.push([s0, s1]);
+      }
+    }
+    return noded;
+  }
+
+  function polygonize(segmentPolylines) {
+    function removeDeadEnds(nodedSegs) {
+      let segs = nodedSegs.slice();
+      let changed = true;
+      while (changed) {
+        changed = false;
+        const degree = new Map();
+        for (const [a, b] of segs) {
+          const ka = pointKey(a);
+          const kb = pointKey(b);
+          degree.set(ka, (degree.get(ka) || 0) + 1);
+          degree.set(kb, (degree.get(kb) || 0) + 1);
+        }
+        const next = segs.filter(([a, b]) => (degree.get(pointKey(a)) || 0) >= 2 && (degree.get(pointKey(b)) || 0) >= 2);
+        if (next.length < segs.length) {
+          segs = next;
+          changed = true;
+        }
+      }
+      return segs;
+    }
+
+    const nodedPolylines = removeDeadEnds(nodeAllSegments(segmentPolylines));
+
+    /** @type {Map<string,{id:string,x:number,y:number,outs:number[]}>} */
+    const nodes = new Map();
+    /** @type {Array<{id:number,from:string,to:string,angle:number,rev:number,used:boolean}>} */
+    const halfEdges = [];
+
+    function ensureNode(pt) {
+      const key = pointKey(pt);
+      let node = nodes.get(key);
+      if (!node) {
+        node = { id: key, x: pt.x, y: pt.y, outs: [] };
+        nodes.set(key, node);
+      }
+      return node;
+    }
+
+    const directedSeen = new Set();
+    for (const poly of nodedPolylines) {
+      if (!poly || poly.length < 2) continue;
+      for (let i = 0; i < poly.length - 1; i += 1) {
+        const a = ensureNode(poly[i]);
+        const b = ensureNode(poly[i + 1]);
+        if (a.id === b.id) continue;
+
+        const d1 = `${a.id}>${b.id}`;
+        if (directedSeen.has(d1)) continue;
+        directedSeen.add(d1);
+        directedSeen.add(`${b.id}>${a.id}`);
+
+        const e1 = halfEdges.length;
+        const e2 = halfEdges.length + 1;
+        halfEdges.push({
+          id: e1,
+          from: a.id,
+          to: b.id,
+          angle: Math.atan2(b.y - a.y, b.x - a.x),
+          rev: e2,
+          used: false,
+        });
+        halfEdges.push({
+          id: e2,
+          from: b.id,
+          to: a.id,
+          angle: Math.atan2(a.y - b.y, a.x - b.x),
+          rev: e1,
+          used: false,
+        });
+        a.outs.push(e1);
+        b.outs.push(e2);
+      }
+    }
+
+    for (const node of nodes.values()) {
+      node.outs.sort((ia, ib) => halfEdges[ia].angle - halfEdges[ib].angle);
+    }
+
+    const rings = [];
+    const seenCycles = new Set();
+
+    for (const start of halfEdges) {
+      if (start.used) continue;
+
+      const cycleNodes = [start.from];
+      let current = start;
+      let ok = true;
+      let steps = 0;
+      const maxSteps = Math.max(8, halfEdges.length * 2);
+
+      while (steps++ < maxSteps) {
+        if (current.used) { ok = false; break; }
+        current.used = true;
+        cycleNodes.push(current.to);
+
+        const at = nodes.get(current.to);
+        if (!at || at.outs.length === 0) { ok = false; break; }
+        const revIdx = at.outs.indexOf(current.rev);
+        if (revIdx < 0) { ok = false; break; }
+        const nextIdx = (revIdx - 1 + at.outs.length) % at.outs.length;
+        current = halfEdges[at.outs[nextIdx]];
+
+        if (current.id === start.id) break;
+      }
+
+      if (!ok) continue;
+      if (current.id !== start.id) continue;
+      if (cycleNodes.length < 4) continue;
+      if (cycleNodes[0] !== cycleNodes[cycleNodes.length - 1]) continue;
+
+      const open = cycleNodes.slice(0, -1);
+      const cycKey = canonicalCycleKey(open);
+      if (!cycKey || seenCycles.has(cycKey)) continue;
+
+      const ring = open.map((id) => {
+        const node = nodes.get(id);
+        return p(node.x, node.y);
+      });
+
+      const deduped = dedupeConsecutive(ring, 1e-7);
+      if (deduped.length < 3) continue;
+      if (polygonArea(deduped) <= 1e-6) continue;
+
+      seenCycles.add(cycKey);
+      rings.push(ensureCCW(deduped));
+    }
+
+    return rings;
+  }
+
+  function pointSegDist(pt, a, b) {
+    const ab = sub(b, a);
+    const ab2 = dot(ab, ab);
+    if (ab2 <= EPS) return dist(pt, a);
+    const t = Math.max(0, Math.min(1, dot(sub(pt, a), ab) / ab2));
+    return dist(pt, lerp(a, b, t));
+  }
+
+  function simplifyRdp(points, eps) {
+    if (points.length <= 2) return points.slice();
+    let bestDist = 0;
+    let bestIndex = -1;
+    for (let i = 1; i < points.length - 1; i += 1) {
+      const d = pointSegDist(points[i], points[0], points[points.length - 1]);
+      if (d > bestDist) {
+        bestDist = d;
+        bestIndex = i;
+      }
+    }
+    if (bestDist <= eps || bestIndex < 0) return [points[0], points[points.length - 1]];
+    const left = simplifyRdp(points.slice(0, bestIndex + 1), eps);
+    const right = simplifyRdp(points.slice(bestIndex), eps);
+    return left.slice(0, -1).concat(right);
+  }
+
+  function simplifyClosedLoop(loop, eps) {
+    const ring = dedupeConsecutive(loop, 1e-6);
+    if (ring.length < 3) return [];
+    if (eps <= 0) return ensureCCW(ring);
+    const closed = ring.concat([ring[0]]);
+    const simplified = simplifyRdp(closed, eps);
+    const open = dedupeConsecutive(simplified.slice(0, -1), 1e-6);
+    if (open.length < 3 || polygonArea(open) <= 1e-3) return [];
+    return ensureCCW(open);
+  }
+
+  function strokeOverlapWithLoopOutline(loop, stroke) {
+    let overlapLength = 0;
+    const hits = [];
+    const outline = loop.concat([loop[0]]);
+
+    for (let i = 0; i < outline.length - 1; i += 1) {
+      const a0 = outline[i];
+      const a1 = outline[i + 1];
+      for (let j = 0; j < stroke.length - 1; j += 1) {
+        const b0 = stroke[j];
+        const b1 = stroke[j + 1];
+        const hit = segmentIntersectionDetailed(a0, a1, b0, b1);
+        if (!hit) continue;
+        if (hit.kind === "overlap") {
+          overlapLength += hit.length;
+        } else {
+          hits.push(hit.point);
+        }
+      }
+    }
+
+    if (overlapLength > 0) return overlapLength;
+
+    const unique = [];
+    for (const h of hits) {
+      if (!unique.some((u) => dist(u, h) <= 1e-3)) unique.push(h);
+    }
+    return unique.length;
+  }
+
+  function editLoopWithStroke(loop, stroke) {
+    const originalArea = polygonArea(loop);
+    const minAcceptedArea = originalArea * 0.1;
+    const minPartLen = Math.max(2.0, cfg.minDist);
+    const outline = loop.concat([loop[0]]);
+    const outlineParts = splitPolyline(outline, stroke).filter(
+      (seg) => seg.length >= 2 && dist(seg[0], seg[seg.length - 1]) > 1e-7 && totalStrokeLength(seg) > minPartLen,
+    );
+    const strokeParts = splitPolyline(stroke, outline).filter(
+      (seg) => seg.length >= 2 && dist(seg[0], seg[seg.length - 1]) > 1e-7 && totalStrokeLength(seg) > minPartLen,
+    );
+
+    if (outlineParts.length < 3 || strokeParts.length < 3) {
+      return null;
+    }
+
+    let best = null;
+    let bestArea = 0;
+
+    for (let replaceIdx = 0; replaceIdx < outlineParts.length; replaceIdx += 1) {
+      const keptOutline = outlineParts.filter((_, i) => i !== replaceIdx);
+      for (let strokeIdx = 0; strokeIdx < strokeParts.length; strokeIdx += 1) {
+        const strokePart = strokeParts[strokeIdx];
+        const merged = keptOutline.concat([strokePart]);
+        const candidates = polygonize(merged);
+        if (candidates.length > 0) {
+          console.log(
+            "[freehand-debug] candidates",
+            {
+              replaceIdx,
+              strokeIdx,
+              count: candidates.length,
+              areas: candidates.map((cand) => Number(polygonArea(cand).toFixed(3))),
+            },
+          );
+        }
+        for (const cand of candidates) {
+          const area = polygonArea(cand);
+          if (area < minAcceptedArea) continue;
+          if (area > bestArea) {
+            bestArea = area;
+            best = cand;
+          }
+        }
+      }
+    }
+
+    if (!best) return null;
+    const simplified = simplifyClosedLoop(best, cfg.simplifyTol);
+    if (simplified.length < 3) return null;
+    return simplified;
+  }
+
+  function totalStrokeLength(points) {
+    let total = 0;
+    for (let i = 0; i < points.length - 1; i += 1) {
+      total += dist(points[i], points[i + 1]);
+    }
+    return total;
+  }
+
+  function finalizeStroke() {
+    if (state.stroke.length < 2) {
+      state.stroke = [];
+      redraw();
+      return;
+    }
+
+    if (totalStrokeLength(state.stroke) < cfg.minDist) {
+      setStatus("Stroke rejected: below minimum sampled distance");
+      state.stroke = [];
+      redraw();
+      return;
+    }
+
+    const selfSplit = splitSelfIntersecting(state.stroke);
+    const isSimple = selfSplit.intersections === 0;
+
+    if (!isSimple) {
+      const segmentComplexity = selfSplit.intersections + 1;
+      if (segmentComplexity > cfg.maxSelfIntersectionSegments) {
+        setStatus(`Self-intersecting stroke no-op: complexity=${segmentComplexity} > max=${cfg.maxSelfIntersectionSegments}`);
+      } else {
+        const loops = polygonize(selfSplit.segments);
+        if (loops.length === 0) {
+          setStatus("Self-intersecting stroke no-op: polygonize produced no loops");
+        } else {
+          let chosen = loops[0];
+          let chosenArea = polygonArea(chosen);
+          for (let i = 1; i < loops.length; i += 1) {
+            const area = polygonArea(loops[i]);
+            if (area > chosenArea) {
+              chosen = loops[i];
+              chosenArea = area;
+            }
+          }
+          const simplified = simplifyClosedLoop(chosen, cfg.simplifyTol);
+          if (simplified.length >= 3) {
+            state.masks.push(simplified);
+            setStatus("Self-intersecting stroke finalize result=created");
+          } else {
+            setStatus("Self-intersecting stroke no-op: simplified loop invalid");
+          }
+        }
+      }
+      state.stroke = [];
+      redraw();
+      return;
+    }
+
+    // Simple branch: edit existing loop with highest overlap score.
+    let bestIdx = -1;
+    let bestCandidate = null;
+    let bestOverlap = 0;
+    let bestArea = 0;
+    const overlapEps = 1e-9;
+
+    for (let i = 0; i < state.masks.length; i += 1) {
+      const loop = state.masks[i];
+      const overlap = strokeOverlapWithLoopOutline(loop, state.stroke);
+      if (overlap <= 0) continue;
+      const candidate = editLoopWithStroke(loop, state.stroke);
+      if (!candidate) continue;
+      const area = polygonArea(loop);
+
+      if (bestIdx < 0 || overlap > bestOverlap + overlapEps) {
+        bestIdx = i;
+        bestCandidate = candidate;
+        bestOverlap = overlap;
+        bestArea = area;
+        continue;
+      }
+      if (Math.abs(overlap - bestOverlap) <= overlapEps) {
+        if (area > bestArea || (Math.abs(area - bestArea) <= overlapEps && i < bestIdx)) {
+          bestIdx = i;
+          bestCandidate = candidate;
+          bestOverlap = overlap;
+          bestArea = area;
+        }
+      }
+    }
+
+    if (bestIdx >= 0 && bestCandidate) {
+      state.masks[bestIdx] = bestCandidate;
+      setStatus("Simple stroke finalize result=updated");
+    } else {
+      setStatus("Simple stroke finalize result=no-op");
+    }
+
+    state.stroke = [];
+    redraw();
+  }
+
+  function redraw() {
+    const w = canvas.clientWidth;
+    const h = canvas.clientHeight;
+    ctx.clearRect(0, 0, w, h);
+
+    // Existing masks (blue fill/stroke) with green/red markers.
+    for (const loop of state.masks) {
+      if (loop.length < 3) continue;
+      ctx.beginPath();
+      ctx.moveTo(loop[0].x, loop[0].y);
+      for (let i = 1; i < loop.length; i += 1) {
+        ctx.lineTo(loop[i].x, loop[i].y);
+      }
+      ctx.closePath();
+      ctx.fillStyle = "rgba(40,90,220,0.22)";
+      ctx.strokeStyle = "rgba(40,90,220,0.95)";
+      ctx.lineWidth = 2;
+      ctx.fill();
+      ctx.stroke();
+
+      const start = loop[0];
+      const end = loop[loop.length - 1];
+      ctx.beginPath();
+      ctx.arc(start.x, start.y, 4.5, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(20,190,20,0.95)";
+      ctx.fill();
+
+      ctx.beginPath();
+      ctx.arc(end.x, end.y, 4.5, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(220,40,40,0.95)";
+      ctx.fill();
+    }
+
+    // Current stroke preview (red polyline)
+    if (state.stroke.length >= 2) {
+      ctx.beginPath();
+      ctx.moveTo(state.stroke[0].x, state.stroke[0].y);
+      for (let i = 1; i < state.stroke.length; i += 1) {
+        ctx.lineTo(state.stroke[i].x, state.stroke[i].y);
+      }
+      ctx.strokeStyle = "rgba(230,60,60,0.95)";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+  }
+
+  function canvasPoint(evt) {
+    const rect = canvas.getBoundingClientRect();
+    return p(evt.clientX - rect.left, evt.clientY - rect.top);
+  }
+
+  canvas.addEventListener("mousedown", (evt) => {
+    if (evt.button !== 0) return;
+    state.drawing = true;
+    state.stroke = [canvasPoint(evt)];
+    redraw();
+  });
+
+  canvas.addEventListener("mousemove", (evt) => {
+    if (!state.drawing) return;
+    const pt = canvasPoint(evt);
+    const prev = state.stroke[state.stroke.length - 1];
+    if (!prev || dist(prev, pt) >= cfg.minDist) {
+      state.stroke.push(pt);
+      redraw();
+    }
+  });
+
+  function finishStroke(evt) {
+    if (!state.drawing) return;
+    const pt = canvasPoint(evt);
+    const prev = state.stroke[state.stroke.length - 1];
+    if (!prev || dist(prev, pt) >= 0.5) {
+      state.stroke.push(pt); // always include release point
+    }
+    state.drawing = false;
+    finalizeStroke();
+  }
+
+  canvas.addEventListener("mouseup", finishStroke);
+  canvas.addEventListener("mouseleave", (evt) => {
+    if (!state.drawing) return;
+    finishStroke(evt);
+  });
+
+  window.addEventListener("keydown", (evt) => {
+    if (evt.key === "[") {
+      cfg.minDist = Math.max(1, cfg.minDist - 1);
+      updateToolbar();
+      setStatus(`min_sample_distance_px=${cfg.minDist.toFixed(1)}`);
+      return;
+    }
+    if (evt.key === "]") {
+      cfg.minDist += 1;
+      updateToolbar();
+      setStatus(`min_sample_distance_px=${cfg.minDist.toFixed(1)}`);
+      return;
+    }
+    if (evt.key === "-") {
+      cfg.simplifyTol = Math.max(0, +(cfg.simplifyTol - 0.1).toFixed(2));
+      updateToolbar();
+      setStatus(`simplify_tolerance=${cfg.simplifyTol.toFixed(2)}`);
+      return;
+    }
+    if (evt.key === "=") {
+      cfg.simplifyTol = +(cfg.simplifyTol + 0.1).toFixed(2);
+      updateToolbar();
+      setStatus(`simplify_tolerance=${cfg.simplifyTol.toFixed(2)}`);
+      return;
+    }
+    if (evt.key === "c" || evt.key === "C") {
+      state.masks = [];
+      state.stroke = [];
+      redraw();
+      setStatus("Cleared");
+    }
+  });
+
+  window.addEventListener("resize", resizeCanvas);
+  updateToolbar();
+  resizeCanvas();
+  redraw();
+})();
+</script>
+</body>
+</html>

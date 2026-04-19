@@ -231,6 +231,80 @@ func TestApplyCommentAuthorUpdate_UnchangedCommentKeepsAuthor(t *testing.T) {
 	}
 }
 
+func TestApplyMaskAuthorUpdate_NewMaskSetsAuthor(t *testing.T) {
+	existing := &annotations.AnnotationFile{
+		Images:             []annotations.CocoImage{{ID: 1}},
+		Annotations:        []annotations.CocoAnnotation{{ID: 1, ImageID: 1, Keypoints: []float64{1, 1, 2}, NumKeypoints: 1}},
+		NemolabMaskAuthors: json.RawMessage(`{"1":"alice"}`),
+	}
+	incoming := &annotations.AnnotationFile{
+		Images: []annotations.CocoImage{{ID: 1}},
+		Annotations: []annotations.CocoAnnotation{
+			{ID: 1, ImageID: 1, Keypoints: []float64{1, 1, 2}, NumKeypoints: 1},
+			{ID: 2, ImageID: 1, Keypoints: []float64{2, 2, 2}, NumKeypoints: 1},
+		},
+	}
+
+	applyMaskAuthorUpdate(existing, incoming, "bob")
+
+	authors := decodeStringMap(incoming.NemolabMaskAuthors)
+	if got := authors["1"]; got != "alice" {
+		t.Fatalf("expected unchanged mask author to stay alice, got %q", got)
+	}
+	if got := authors["2"]; got != "bob" {
+		t.Fatalf("expected new mask author to be bob, got %q", got)
+	}
+}
+
+func TestApplyMaskAuthorUpdate_ChangedMaskOverwritesAuthor(t *testing.T) {
+	existing := &annotations.AnnotationFile{
+		Images: []annotations.CocoImage{{ID: 1}},
+		Annotations: []annotations.CocoAnnotation{
+			{ID: 7, ImageID: 1, Keypoints: []float64{1, 1, 2}, NumKeypoints: 1, CategoryID: 1},
+		},
+		NemolabMaskAuthors: json.RawMessage(`{"7":"alice"}`),
+	}
+	incoming := &annotations.AnnotationFile{
+		Images: []annotations.CocoImage{{ID: 1}},
+		Annotations: []annotations.CocoAnnotation{
+			{ID: 7, ImageID: 1, Keypoints: []float64{1, 1, 2}, NumKeypoints: 1, CategoryID: 2},
+		},
+	}
+
+	applyMaskAuthorUpdate(existing, incoming, "bob")
+
+	if got := decodeStringMap(incoming.NemolabMaskAuthors)["7"]; got != "bob" {
+		t.Fatalf("expected changed mask author to be overwritten to bob, got %q", got)
+	}
+}
+
+func TestApplyMaskAuthorUpdate_RemovedMaskClearsAuthor(t *testing.T) {
+	existing := &annotations.AnnotationFile{
+		Images: []annotations.CocoImage{{ID: 1}},
+		Annotations: []annotations.CocoAnnotation{
+			{ID: 1, ImageID: 1, Keypoints: []float64{1, 1, 2}, NumKeypoints: 1},
+			{ID: 2, ImageID: 1, Keypoints: []float64{2, 2, 2}, NumKeypoints: 1},
+		},
+		NemolabMaskAuthors: json.RawMessage(`{"1":"alice","2":"alice"}`),
+	}
+	incoming := &annotations.AnnotationFile{
+		Images: []annotations.CocoImage{{ID: 1}},
+		Annotations: []annotations.CocoAnnotation{
+			{ID: 1, ImageID: 1, Keypoints: []float64{1, 1, 2}, NumKeypoints: 1},
+		},
+	}
+
+	applyMaskAuthorUpdate(existing, incoming, "bob")
+
+	authors := decodeStringMap(incoming.NemolabMaskAuthors)
+	if got := authors["1"]; got != "alice" {
+		t.Fatalf("expected retained mask author to stay alice, got %q", got)
+	}
+	if got := authors["2"]; got != "" {
+		t.Fatalf("expected removed mask author to be cleared, got %q", got)
+	}
+}
+
 func TestMigrateAnnotationFileIfNeeded_NoOpWhenTargetExists(t *testing.T) {
 	dir := t.TempDir()
 	imagePath := filepath.Join(dir, "img.png")
