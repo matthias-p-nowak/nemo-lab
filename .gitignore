@@ -10,3 +10,5 @@ images/
 logs/
 node_modules/
 package-lock.json
+.python-version
+uv.lock

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -24,6 +25,10 @@ import (
 const apiVersion = "0.1.0"
 
 func main() {
+	if err := mime.AddExtensionType(".map", "application/json"); err != nil {
+		log.Printf("register .map mime type: %v", err)
+	}
+
 	cfg, err := config.Load("nemo.toml")
 	if err != nil {
 		log.Fatalf("load config: %v", err)

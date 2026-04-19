@@ -558,19 +558,8 @@ export function editPolygonWithStroke(loop, stroke, simplifyTolerance = 0.5) {
   const strokeParts = splitPolyline(stroke, outline).filter(
     (seg) => seg.length >= 2 && dist(seg[0], seg[seg.length - 1]) > 1e-7 && polylineLength(seg) > minPartLen,
   );
-  const outlineEndpoints = [];
-  for (const seg of outlineParts) {
-    outlineEndpoints.push(seg[0]);
-    outlineEndpoints.push(seg[seg.length - 1]);
-  }
-  const matchesOutlineEndpoint = (pt) => outlineEndpoints.some((ep) => dist(ep, pt) < 2.0);
-  const strokePartsFiltered = strokeParts.filter((seg) => {
-    const start = seg[0];
-    const end = seg[seg.length - 1];
-    return matchesOutlineEndpoint(start) && matchesOutlineEndpoint(end);
-  });
 
-  if (outlineParts.length < 3 || strokePartsFiltered.length < 1) return null;
+  if (outlineParts.length < 3 || strokeParts.length < 3) return null;
 
   let best = null;
   let bestArea = 0;
@@ -578,7 +567,7 @@ export function editPolygonWithStroke(loop, stroke, simplifyTolerance = 0.5) {
   let candidatesAccepted = 0;
   for (let replaceIdx = 0; replaceIdx < outlineParts.length; replaceIdx += 1) {
     const keptOutline = outlineParts.filter((_, i) => i !== replaceIdx);
-    for (const strokePart of strokePartsFiltered) {
+    for (const strokePart of strokeParts) {
       const merged = keptOutline.concat([strokePart]);
       const candidates = polygonize(merged);
       for (const candidate of candidates) {

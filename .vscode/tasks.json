@@ -17,6 +17,21 @@
       "problemMatcher": []
     },
     {
+      "label": "compile js debug",
+      "type": "shell",
+      "command": "esbuild",
+      "args": [
+        "--bundle",
+        "frontend/src/main.ts",
+        "--outdir=${workspaceFolder}/dist/js",
+        "--sourcemap=inline"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
       "label": "compile scss",
       "type": "shell",
       "command": "sass",
@@ -68,6 +83,16 @@
       ],
       "dependsOrder": "sequence",
       "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "start-all-debug",
+      "dependsOn": [
+        "copy-resources",
+        "compile scss",
+        "compile js debug"
+      ],
+      "dependsOrder": "sequence",
       "problemMatcher": []
     }
   ]

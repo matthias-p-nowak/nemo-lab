@@ -1082,8 +1082,7 @@ function sendSaveAnnotations(): void {
   const hash = appState.currentImageHash;
   if (!hash) return;
 
-  const width = Math.max(1, Math.round(appState.annotationImageWidth));
-  const height = Math.max(1, Math.round(appState.annotationImageHeight));
+  const { width, height } = getEffectiveImageDimensions();
   const fileName = getCurrentImageEntry()?.filename ?? "";
   const currentImageID = appState.currentImageIndex + 1;
 
@@ -1302,10 +1301,25 @@ ws.addEventListener("message", (event) => {
     appState.annotationAuthors = normalizeStringMap(payload.nemolab_authors);
     appState.annotationMaskAuthors = normalizeStringMap(payload.nemolab_mask_authors);
     const image = payload.images[0];
-    const width = Math.max(1, Math.round(typeof image?.width === "number" ? image.width : appState.annotationImageWidth));
-    const height = Math.max(1, Math.round(typeof image?.height === "number" ? image.height : appState.annotationImageHeight));
-    appState.annotationImageWidth = width;
-    appState.annotationImageHeight = height;
+    const decodeWidth = Math.max(1, Math.round(typeof image?.width === "number" ? image.width : appState.annotationImageWidth));
+    const decodeHeight = Math.max(1, Math.round(typeof image?.height === "number" ? image.height : appState.annotationImageHeight));
+    const manifestDims = viewer?.getSourceImageDimensions() ?? null;
+    appState.annotationImageWidth = Math.max(
+      1,
+      Math.round(
+        manifestDims && manifestDims.width > 1
+          ? manifestDims.width
+          : decodeWidth
+      )
+    );
+    appState.annotationImageHeight = Math.max(
+      1,
+      Math.round(
+        manifestDims && manifestDims.height > 1
+          ? manifestDims.height
+          : decodeHeight
+      )
+    );
 
     const categoryNameByID = new Map<number, string>();
     payload.categories.forEach((cat) => {
@@ -1325,8 +1339,8 @@ ws.addEventListener("message", (event) => {
           const py = typeof firstPolygon[i + 1] === "number" ? firstPolygon[i + 1] : NaN;
           if (!Number.isFinite(px) || !Number.isFinite(py)) continue;
           points.push({
-            x: Math.max(0, Math.min(1, px / width)),
-            y: Math.max(0, Math.min(1, py / height)),
+            x: Math.max(0, Math.min(1, px / decodeWidth)),
+            y: Math.max(0, Math.min(1, py / decodeHeight)),
           });
         }
         const deduped = dedupeConsecutivePoints(points, 1e-6);
@@ -1357,10 +1371,10 @@ ws.addEventListener("message", (event) => {
         bw > 0 &&
         bh > 0
       ) {
-        const x = bx / width;
-        const y = by / height;
-        const w = bw / width;
-        const h = bh / height;
+        const x = bx / decodeWidth;
+        const y = by / decodeHeight;
+        const w = bw / decodeWidth;
+        const h = bh / decodeHeight;
         if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(w) || !Number.isFinite(h)) return;
         masks.push({
           id: String(ann.id),
@@ -1380,8 +1394,8 @@ ws.addEventListener("message", (event) => {
       const px = typeof keypoints[0] === "number" ? keypoints[0] : NaN;
       const py = typeof keypoints[1] === "number" ? keypoints[1] : NaN;
       if (!Number.isFinite(px) || !Number.isFinite(py)) return;
-      const x = px / width;
-      const y = py / height;
+      const x = px / decodeWidth;
+      const y = py / decodeHeight;
       if (!Number.isFinite(x) || !Number.isFinite(y)) return;
       masks.push({
         id: String(ann.id),
@@ -1742,16 +1756,9 @@ interface GeometryPoint {
   y: number;
 }
 
-interface SegmentIntersection {
-  point: GeometryPoint;
-  tA: number;
-  tB: number;
-}
-
-interface StrokeSelfIntersection extends SegmentIntersection {
-  segA: number;
-  segB: number;
-}
+type SegmentIntersectionDetailed =
+  | { kind: "point"; tA: number; tB: number; point: GeometryPoint }
+  | { kind: "overlap"; a0: number; a1: number; b0: number; b1: number; p0: GeometryPoint; p1: GeometryPoint; length: number };
 
 /** Returns Euclidean distance in pixels between two points. */
 function distancePx(a: GeometryPoint, b: GeometryPoint): number {
@@ -1760,19 +1767,52 @@ function distancePx(a: GeometryPoint, b: GeometryPoint): number {
   return Math.sqrt(dx * dx + dy * dy);
 }
 
+/** Returns image dimensions for geometry/save: viewer manifest first, then app-state fallback. */
+function getEffectiveImageDimensions(): { width: number; height: number } {
+  const viewerDims = viewer?.getSourceImageDimensions() ?? null;
+  if (viewerDims && viewerDims.width > 1 && viewerDims.height > 1) {
+    return {
+      width: Math.max(1, Math.round(viewerDims.width)),
+      height: Math.max(1, Math.round(viewerDims.height)),
+    };
+  }
+  return {
+    width: Math.max(1, Math.round(appState.annotationImageWidth)),
+    height: Math.max(1, Math.round(appState.annotationImageHeight)),
+  };
+}
+
+function subPx(a: GeometryPoint, b: GeometryPoint): GeometryPoint {
+  return { x: a.x - b.x, y: a.y - b.y };
+}
+
+function dotPx(a: GeometryPoint, b: GeometryPoint): number {
+  return a.x * b.x + a.y * b.y;
+}
+
+function crossPx(a: GeometryPoint, b: GeometryPoint): number {
+  return a.x * b.y - a.y * b.x;
+}
+
+function lerpPx(a: GeometryPoint, b: GeometryPoint, t: number): GeometryPoint {
+  return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+}
+
 /** Converts a normalized image-space point to source pixel coordinates. */
 function normalizedToImagePx(point: GeometryPoint): GeometryPoint {
+  const dims = getEffectiveImageDimensions();
   return {
-    x: point.x * Math.max(1, appState.annotationImageWidth),
-    y: point.y * Math.max(1, appState.annotationImageHeight),
+    x: point.x * dims.width,
+    y: point.y * dims.height,
   };
 }
 
 /** Converts a source pixel-space point to normalized image coordinates. */
 function imagePxToNormalized(point: GeometryPoint): GeometryPoint {
+  const dims = getEffectiveImageDimensions();
   return {
-    x: Math.max(0, Math.min(1, point.x / Math.max(1, appState.annotationImageWidth))),
-    y: Math.max(0, Math.min(1, point.y / Math.max(1, appState.annotationImageHeight))),
+    x: Math.max(0, Math.min(1, point.x / dims.width)),
+    y: Math.max(0, Math.min(1, point.y / dims.height)),
   };
 }
 
@@ -1788,9 +1828,24 @@ function polygonArea(points: GeometryPoint[]): number {
   return Math.abs(acc) * 0.5;
 }
 
-/** Returns canonical point-key string with fixed precision for map/set lookup. */
-function pointKey(point: GeometryPoint, precision = 4): string {
-  return `${point.x.toFixed(precision)},${point.y.toFixed(precision)}`;
+function signedArea(points: GeometryPoint[]): number {
+  if (points.length < 3) return 0;
+  let acc = 0;
+  for (let i = 0; i < points.length; i += 1) {
+    const a = points[i];
+    const b = points[(i + 1) % points.length];
+    acc += a.x * b.y - b.x * a.y;
+  }
+  return acc * 0.5;
+}
+
+function ensureCCW(points: GeometryPoint[]): GeometryPoint[] {
+  return signedArea(points) < 0 ? points.slice().reverse() : points.slice();
+}
+
+/** Returns canonical point-key string for graph snap lookup. */
+function pointKey(point: GeometryPoint): string {
+  return `${Math.round(point.x * 1000)},${Math.round(point.y * 1000)}`;
 }
 
 /** Removes adjacent duplicates and near-duplicates from point lists. */
@@ -1816,61 +1871,487 @@ function intersectSegments(
   b0: GeometryPoint,
   b1: GeometryPoint,
   epsilon = 1e-9
-): SegmentIntersection | null {
-  const r = { x: a1.x - a0.x, y: a1.y - a0.y };
-  const s = { x: b1.x - b0.x, y: b1.y - b0.y };
-  const denom = r.x * s.y - r.y * s.x;
-  if (Math.abs(denom) <= epsilon) return null;
-  const qmp = { x: b0.x - a0.x, y: b0.y - a0.y };
-  const t = (qmp.x * s.y - qmp.y * s.x) / denom;
-  const u = (qmp.x * r.y - qmp.y * r.x) / denom;
+): { point: GeometryPoint; tA: number; tB: number } | null {
+  const hit = segmentIntersectionDetailed(a0, a1, b0, b1, epsilon);
+  if (!hit || hit.kind !== "point") return null;
+  return { point: hit.point, tA: hit.tA, tB: hit.tB };
+}
+
+function segParam(pointOnSegment: GeometryPoint, a: GeometryPoint, b: GeometryPoint): number {
+  const ab = subPx(b, a);
+  const denom = dotPx(ab, ab);
+  if (denom <= 1e-9) return 0;
+  return dotPx(subPx(pointOnSegment, a), ab) / denom;
+}
+
+/** Segment intersection with overlap handling for robust splitting. */
+function segmentIntersectionDetailed(
+  a0: GeometryPoint,
+  a1: GeometryPoint,
+  b0: GeometryPoint,
+  b1: GeometryPoint,
+  epsilon = 1e-9
+): SegmentIntersectionDetailed | null {
+  const r = subPx(a1, a0);
+  const s = subPx(b1, b0);
+  const rxs = crossPx(r, s);
+  const qmp = subPx(b0, a0);
+  const qmpxr = crossPx(qmp, r);
+
+  if (Math.abs(rxs) <= epsilon && Math.abs(qmpxr) <= epsilon) {
+    const rr = dotPx(r, r);
+    if (rr <= epsilon) return null;
+    const t0 = dotPx(subPx(b0, a0), r) / rr;
+    const t1 = dotPx(subPx(b1, a0), r) / rr;
+    const lo = Math.max(0, Math.min(t0, t1));
+    const hi = Math.min(1, Math.max(t0, t1));
+    if (hi - lo <= epsilon) return null;
+    const p0 = lerpPx(a0, a1, lo);
+    const p1 = lerpPx(a0, a1, hi);
+    const length = distancePx(p0, p1);
+    if (length <= epsilon) return null;
+    return {
+      kind: "overlap",
+      a0: lo,
+      a1: hi,
+      b0: segParam(p0, b0, b1),
+      b1: segParam(p1, b0, b1),
+      p0,
+      p1,
+      length,
+    };
+  }
+
+  if (Math.abs(rxs) <= epsilon) return null;
+
+  const t = crossPx(qmp, s) / rxs;
+  const u = crossPx(qmp, r) / rxs;
   if (t < -epsilon || t > 1 + epsilon || u < -epsilon || u > 1 + epsilon) return null;
+  const tt = Math.max(0, Math.min(1, t));
+  const uu = Math.max(0, Math.min(1, u));
   return {
-    point: { x: a0.x + t * r.x, y: a0.y + t * r.y },
-    tA: t,
-    tB: u,
+    kind: "point",
+    tA: tt,
+    tB: uu,
+    point: lerpPx(a0, a1, tt),
   };
 }
 
-/** Finds non-adjacent self intersections in an open stroke polyline. */
-function findStrokeSelfIntersections(points: GeometryPoint[]): StrokeSelfIntersection[] {
-  const intersections: StrokeSelfIntersection[] = [];
-  if (points.length < 4) return intersections;
-  for (let i = 0; i < points.length - 1; i += 1) {
-    for (let j = i + 2; j < points.length - 1; j += 1) {
-      const hit = intersectSegments(points[i], points[i + 1], points[j], points[j + 1]);
-      if (!hit) continue;
-      if (hit.tA <= 1e-6 || hit.tA >= 1 - 1e-6) continue;
-      if (hit.tB <= 1e-6 || hit.tB >= 1 - 1e-6) continue;
-      intersections.push({ ...hit, segA: i, segB: j });
-    }
+function pushUniqueNumber(arr: number[], value: number, epsilon = 1e-8): void {
+  for (const existing of arr) {
+    if (Math.abs(existing - value) <= epsilon) return;
   }
-  return intersections;
+  arr.push(value);
 }
 
-/** Inserts self-intersection split points into the stroke path in segment order. */
-function buildAugmentedStrokePoints(
-  points: GeometryPoint[],
-  intersections: StrokeSelfIntersection[]
-): GeometryPoint[] {
-  const hitsBySegment = new Map<number, Array<{ t: number; point: GeometryPoint }>>();
-  intersections.forEach((hit) => {
-    const aHits = hitsBySegment.get(hit.segA) ?? [];
-    aHits.push({ t: hit.tA, point: hit.point });
-    hitsBySegment.set(hit.segA, aHits);
-    const bHits = hitsBySegment.get(hit.segB) ?? [];
-    bHits.push({ t: hit.tB, point: hit.point });
-    hitsBySegment.set(hit.segB, bHits);
-  });
-
-  const out: GeometryPoint[] = [];
-  for (let seg = 0; seg < points.length - 1; seg += 1) {
-    if (seg === 0) out.push(points[0]);
-    const hits = (hitsBySegment.get(seg) ?? []).sort((a, b) => a.t - b.t);
-    hits.forEach((hit) => out.push(hit.point));
-    out.push(points[seg + 1]);
+function buildSegmentsFromParams(polyline: GeometryPoint[], params: number[][]): GeometryPoint[][] {
+  const out: GeometryPoint[][] = [];
+  for (let i = 0; i < polyline.length - 1; i += 1) {
+    const a = polyline[i];
+    const b = polyline[i + 1];
+    const values = params[i].slice().sort((x, y) => x - y);
+    const uniq: number[] = [];
+    for (const t of values) {
+      if (uniq.length === 0 || Math.abs(t - uniq[uniq.length - 1]) > 1e-8) uniq.push(t);
+    }
+    for (let k = 0; k < uniq.length - 1; k += 1) {
+      const t0 = uniq[k];
+      const t1 = uniq[k + 1];
+      if (t1 - t0 <= 1e-8) continue;
+      const s0 = lerpPx(a, b, t0);
+      const s1 = lerpPx(a, b, t1);
+      if (distancePx(s0, s1) <= 1e-7) continue;
+      out.push([s0, s1]);
+    }
   }
-  return dedupeConsecutivePoints(out, 1e-4);
+  return out;
+}
+
+/** Splits subject polyline by cutter intersections with vertex-landing handling. */
+function splitPolyline(subject: GeometryPoint[], cutter: GeometryPoint[]): GeometryPoint[][] {
+  if (subject.length < 2) return [];
+  if (cutter.length < 2) return [subject.map((point) => ({ x: point.x, y: point.y }))];
+
+  const cuts: Array<{ globalT: number; point: GeometryPoint }> = [];
+  const subjectMaxT = subject.length - 1;
+  const shouldKeepGlobalT = (value: number) => value > 1e-8 && value < subjectMaxT - 1e-8;
+  for (let i = 0; i < subject.length - 1; i += 1) {
+    const a0 = subject[i];
+    const a1 = subject[i + 1];
+    for (let j = 0; j < cutter.length - 1; j += 1) {
+      const b0 = cutter[j];
+      const b1 = cutter[j + 1];
+      const hit = segmentIntersectionDetailed(a0, a1, b0, b1);
+      if (!hit) continue;
+      if (hit.kind === "point") {
+        let globalT = i + hit.tA;
+        if (hit.tA <= 1e-8) globalT = i;
+        if (hit.tA >= 1 - 1e-8) globalT = i + 1;
+        if (!shouldKeepGlobalT(globalT)) continue;
+        cuts.push({ globalT, point: globalT === i + 1 ? { x: a1.x, y: a1.y } : { x: hit.point.x, y: hit.point.y } });
+      } else {
+        let globalT0 = i + hit.a0;
+        if (hit.a0 <= 1e-8) globalT0 = i;
+        if (hit.a0 >= 1 - 1e-8) globalT0 = i + 1;
+        if (shouldKeepGlobalT(globalT0)) {
+          cuts.push({ globalT: globalT0, point: globalT0 === i + 1 ? { x: a1.x, y: a1.y } : { x: hit.p0.x, y: hit.p0.y } });
+        }
+        if (Math.abs(hit.a1 - hit.a0) > 1e-8) {
+          let globalT1 = i + hit.a1;
+          if (hit.a1 <= 1e-8) globalT1 = i;
+          if (hit.a1 >= 1 - 1e-8) globalT1 = i + 1;
+          if (shouldKeepGlobalT(globalT1)) {
+            cuts.push({ globalT: globalT1, point: globalT1 === i + 1 ? { x: a1.x, y: a1.y } : { x: hit.p1.x, y: hit.p1.y } });
+          }
+        }
+      }
+    }
+  }
+
+  cuts.sort((a, b) => a.globalT - b.globalT);
+  const deduped: Array<{ globalT: number; point: GeometryPoint }> = [];
+  for (const cut of cuts) {
+    const prev = deduped[deduped.length - 1];
+    if (!prev || Math.abs(cut.globalT - prev.globalT) > 1e-8) {
+      deduped.push(cut);
+    }
+  }
+  if (deduped.length === 0) {
+    return [subject.map((point) => ({ x: point.x, y: point.y }))];
+  }
+
+  const result: GeometryPoint[][] = [];
+  let current: GeometryPoint[] = [{ x: subject[0].x, y: subject[0].y }];
+  let cutIdx = 0;
+
+  for (let i = 0; i < subject.length - 1; i += 1) {
+    const segEndT = i + 1;
+    while (cutIdx < deduped.length && deduped[cutIdx].globalT < segEndT - 1e-8) {
+      const cut = deduped[cutIdx];
+      if (cut.globalT > i + 1e-8) {
+        const last = current[current.length - 1];
+        if (!last || distancePx(last, cut.point) > 1e-7) current.push({ x: cut.point.x, y: cut.point.y });
+        if (current.length >= 2) result.push(current);
+        current = [{ x: cut.point.x, y: cut.point.y }];
+      }
+      cutIdx += 1;
+    }
+    const segEnd = subject[i + 1];
+    const last = current[current.length - 1];
+    if (!last || distancePx(last, segEnd) > 1e-7) current.push({ x: segEnd.x, y: segEnd.y });
+    while (cutIdx < deduped.length && Math.abs(deduped[cutIdx].globalT - segEndT) <= 1e-8) {
+      if (current.length >= 2) result.push(current);
+      current = [{ x: segEnd.x, y: segEnd.y }];
+      cutIdx += 1;
+    }
+  }
+
+  if (current.length >= 2) result.push(current);
+  return result.filter((polyline) => polyline.length >= 2 && distancePx(polyline[0], polyline[polyline.length - 1]) > 1e-7);
+}
+
+function collectSelfIntersections(stroke: GeometryPoint[]): Array<{ segA: number; segB: number; point: GeometryPoint; tA: number; tB: number }> {
+  const hits: Array<{ segA: number; segB: number; point: GeometryPoint; tA: number; tB: number }> = [];
+  for (let i = 0; i < stroke.length - 1; i += 1) {
+    const a0 = stroke[i];
+    const a1 = stroke[i + 1];
+    for (let j = i + 2; j < stroke.length - 1; j += 1) {
+      const b0 = stroke[j];
+      const b1 = stroke[j + 1];
+      const hit = segmentIntersectionDetailed(a0, a1, b0, b1);
+      if (!hit || hit.kind !== "point") continue;
+      if (hit.tA <= 1e-6 || hit.tA >= 1 - 1e-6) continue;
+      if (hit.tB <= 1e-6 || hit.tB >= 1 - 1e-6) continue;
+      hits.push({ segA: i, segB: j, point: hit.point, tA: hit.tA, tB: hit.tB });
+    }
+  }
+  return hits;
+}
+
+/** Splits self-intersecting stroke into segment pieces and counts crossings. */
+function splitSelfIntersecting(stroke: GeometryPoint[]): { segments: GeometryPoint[][]; intersections: number } {
+  if (stroke.length < 2) return { segments: [], intersections: 0 };
+  const params = Array.from({ length: stroke.length - 1 }, () => [0, 1]);
+  const intersections = collectSelfIntersections(stroke);
+  for (const hit of intersections) {
+    pushUniqueNumber(params[hit.segA], hit.tA);
+    pushUniqueNumber(params[hit.segB], hit.tB);
+  }
+  return { segments: buildSegmentsFromParams(stroke, params), intersections: intersections.length };
+}
+
+function canonicalCycleKey(nodes: string[]): string {
+  if (nodes.length < 3) return "";
+  const n = nodes.length;
+  const forward = nodes.slice();
+  const reverse = nodes.slice().reverse();
+  const minRotation = (arr: string[]): string => {
+    let best = 0;
+    for (let i = 1; i < n; i += 1) {
+      for (let k = 0; k < n; k += 1) {
+        const lhs = arr[(i + k) % n];
+        const rhs = arr[(best + k) % n];
+        if (lhs < rhs) { best = i; break; }
+        if (lhs > rhs) break;
+      }
+    }
+    const out: string[] = [];
+    for (let i = 0; i < n; i += 1) out.push(arr[(best + i) % n]);
+    return out.join("|");
+  };
+  const k1 = minRotation(forward);
+  const k2 = minRotation(reverse);
+  return k1 < k2 ? k1 : k2;
+}
+
+function nodeAllSegments(segmentPolylines: GeometryPoint[][]): Array<[GeometryPoint, GeometryPoint]> {
+  const segments: Array<[GeometryPoint, GeometryPoint]> = [];
+  for (const polyline of segmentPolylines) {
+    if (!polyline || polyline.length < 2) continue;
+    for (let i = 0; i < polyline.length - 1; i += 1) {
+      const a = polyline[i];
+      const b = polyline[i + 1];
+      if (distancePx(a, b) <= 1e-8) continue;
+      segments.push([{ x: a.x, y: a.y }, { x: b.x, y: b.y }]);
+    }
+  }
+
+  const cuts: number[][] = Array.from({ length: segments.length }, () => [0, 1]);
+  for (let i = 0; i < segments.length; i += 1) {
+    const [a0, a1] = segments[i];
+    for (let j = i + 1; j < segments.length; j += 1) {
+      const [b0, b1] = segments[j];
+      const hit = segmentIntersectionDetailed(a0, a1, b0, b1);
+      if (!hit) continue;
+      if (hit.kind === "point") {
+        pushUniqueNumber(cuts[i], hit.tA);
+        pushUniqueNumber(cuts[j], hit.tB);
+      } else {
+        pushUniqueNumber(cuts[i], hit.a0);
+        pushUniqueNumber(cuts[i], hit.a1);
+        pushUniqueNumber(cuts[j], hit.b0);
+        pushUniqueNumber(cuts[j], hit.b1);
+      }
+    }
+  }
+
+  const noded: Array<[GeometryPoint, GeometryPoint]> = [];
+  for (let i = 0; i < segments.length; i += 1) {
+    const [a, b] = segments[i];
+    const values = cuts[i].slice().sort((x, y) => x - y);
+    const uniq: number[] = [];
+    for (const t of values) {
+      if (uniq.length === 0 || Math.abs(t - uniq[uniq.length - 1]) > 1e-8) uniq.push(t);
+    }
+    for (let k = 0; k < uniq.length - 1; k += 1) {
+      const t0 = uniq[k];
+      const t1 = uniq[k + 1];
+      if (t1 - t0 <= 1e-8) continue;
+      const s0 = lerpPx(a, b, t0);
+      const s1 = lerpPx(a, b, t1);
+      if (distancePx(s0, s1) <= 1e-7) continue;
+      noded.push([s0, s1]);
+    }
+  }
+  return noded;
+}
+
+/** Polygonizes segment polylines with dangling-edge pruning to avoid tail artifacts. */
+function polygonize(segmentPolylines: GeometryPoint[][]): GeometryPoint[][] {
+  const removeDeadEnds = (nodedSegments: Array<[GeometryPoint, GeometryPoint]>): Array<[GeometryPoint, GeometryPoint]> => {
+    let segs = nodedSegments.slice();
+    let changed = true;
+    while (changed) {
+      changed = false;
+      const degree = new Map<string, number>();
+      for (const [a, b] of segs) {
+        const ka = pointKey(a);
+        const kb = pointKey(b);
+        degree.set(ka, (degree.get(ka) ?? 0) + 1);
+        degree.set(kb, (degree.get(kb) ?? 0) + 1);
+      }
+      const next = segs.filter(([a, b]) => (degree.get(pointKey(a)) ?? 0) >= 2 && (degree.get(pointKey(b)) ?? 0) >= 2);
+      if (next.length < segs.length) {
+        segs = next;
+        changed = true;
+      }
+    }
+    return segs;
+  };
+
+  const noded = removeDeadEnds(nodeAllSegments(segmentPolylines));
+  const nodes = new Map<string, { id: string; x: number; y: number; outs: number[] }>();
+  const halfEdges: Array<{ id: number; from: string; to: string; angle: number; rev: number; used: boolean }> = [];
+
+  const ensureNode = (point: GeometryPoint): { id: string; x: number; y: number; outs: number[] } => {
+    const id = pointKey(point);
+    let node = nodes.get(id);
+    if (!node) {
+      node = { id, x: point.x, y: point.y, outs: [] };
+      nodes.set(id, node);
+    }
+    return node;
+  };
+
+  const directedSeen = new Set<string>();
+  for (const [aPoint, bPoint] of noded) {
+    const a = ensureNode(aPoint);
+    const b = ensureNode(bPoint);
+    if (a.id === b.id) continue;
+    const d1 = `${a.id}>${b.id}`;
+    if (directedSeen.has(d1)) continue;
+    directedSeen.add(d1);
+    directedSeen.add(`${b.id}>${a.id}`);
+    const e1 = halfEdges.length;
+    const e2 = halfEdges.length + 1;
+    halfEdges.push({ id: e1, from: a.id, to: b.id, angle: Math.atan2(b.y - a.y, b.x - a.x), rev: e2, used: false });
+    halfEdges.push({ id: e2, from: b.id, to: a.id, angle: Math.atan2(a.y - b.y, a.x - b.x), rev: e1, used: false });
+    a.outs.push(e1);
+    b.outs.push(e2);
+  }
+
+  for (const node of nodes.values()) {
+    node.outs.sort((ia, ib) => halfEdges[ia].angle - halfEdges[ib].angle);
+  }
+
+  const rings: GeometryPoint[][] = [];
+  const seenCycles = new Set<string>();
+  for (const start of halfEdges) {
+    if (start.used) continue;
+    const cycleNodes = [start.from];
+    let current = start;
+    let ok = true;
+    let steps = 0;
+    const maxSteps = Math.max(8, halfEdges.length * 2);
+
+    while (steps++ < maxSteps) {
+      if (current.used) { ok = false; break; }
+      current.used = true;
+      cycleNodes.push(current.to);
+      const at = nodes.get(current.to);
+      if (!at || at.outs.length === 0) { ok = false; break; }
+      const revIdx = at.outs.indexOf(current.rev);
+      if (revIdx < 0) { ok = false; break; }
+      const nextIdx = (revIdx - 1 + at.outs.length) % at.outs.length;
+      current = halfEdges[at.outs[nextIdx]];
+      if (current.id === start.id) break;
+    }
+
+    if (!ok) continue;
+    if (current.id !== start.id) continue;
+    if (cycleNodes.length < 4) continue;
+    if (cycleNodes[0] !== cycleNodes[cycleNodes.length - 1]) continue;
+    const open = cycleNodes.slice(0, -1);
+    const cycleKey = canonicalCycleKey(open);
+    if (!cycleKey || seenCycles.has(cycleKey)) continue;
+    const ring = open.map((id) => {
+      const node = nodes.get(id)!;
+      return { x: node.x, y: node.y };
+    });
+    const deduped = dedupeConsecutivePoints(ring, 1e-7);
+    if (deduped.length < 3) continue;
+    if (polygonArea(deduped) <= 1e-6) continue;
+    seenCycles.add(cycleKey);
+    rings.push(ensureCCW(deduped));
+  }
+  return rings;
+}
+
+/** Finds stroke/polygon-edge intersections with stroke-order metadata. */
+function findStrokePolygonIntersections(
+  strokePx: GeometryPoint[],
+  polygonPx: GeometryPoint[]
+): Array<{ point: GeometryPoint; strokeSeg: number; strokeT: number; polyEdge: number; polyT: number }> {
+  const out: Array<{ point: GeometryPoint; strokeSeg: number; strokeT: number; polyEdge: number; polyT: number }> = [];
+  const n = polygonPx.length;
+  for (let s = 0; s < strokePx.length - 1; s += 1) {
+    for (let e = 0; e < n; e += 1) {
+      const hit = segmentIntersectionDetailed(strokePx[s], strokePx[s + 1], polygonPx[e], polygonPx[(e + 1) % n]);
+      if (!hit) continue;
+      if (hit.kind === "point") {
+        out.push({ point: hit.point, strokeSeg: s, strokeT: hit.tA, polyEdge: e, polyT: hit.tB });
+      }
+    }
+  }
+  out.sort((a, b) => (a.strokeSeg - b.strokeSeg) || (a.strokeT - b.strokeT));
+  const deduped: typeof out = [];
+  out.forEach((entry) => {
+    const prev = deduped[deduped.length - 1];
+    if (prev && distancePx(prev.point, entry.point) < 1e-4) return;
+    deduped.push(entry);
+  });
+  return deduped;
+}
+
+/** Returns overlap score between stroke and polygon outline (length-first, then count). */
+function strokeOverlapScore(loop: GeometryPoint[], stroke: GeometryPoint[]): number {
+  let overlapLength = 0;
+  const points: GeometryPoint[] = [];
+  const outline = loop.concat([loop[0]]);
+  for (let i = 0; i < outline.length - 1; i += 1) {
+    for (let j = 0; j < stroke.length - 1; j += 1) {
+      const hit = segmentIntersectionDetailed(outline[i], outline[i + 1], stroke[j], stroke[j + 1]);
+      if (!hit) continue;
+      if (hit.kind === "overlap") {
+        overlapLength += hit.length;
+      } else {
+        points.push(hit.point);
+      }
+    }
+  }
+  if (overlapLength > 0) return overlapLength;
+  const unique: GeometryPoint[] = [];
+  for (const point of points) {
+    if (!unique.some((u) => distancePx(u, point) <= 1e-3)) unique.push(point);
+  }
+  return unique.length;
+}
+
+function polylineLength(points: GeometryPoint[]): number {
+  let total = 0;
+  for (let i = 0; i < points.length - 1; i += 1) total += distancePx(points[i], points[i + 1]);
+  return total;
+}
+
+/** Applies freehand split/rejoin edit to one polygon, returning updated polygon pixels or null. */
+function editPolygonWithStroke(
+  loop: GeometryPoint[],
+  stroke: GeometryPoint[],
+  simplifyTolerance = config.freehandSimplifyTolerance
+): GeometryPoint[] | null {
+  const originalArea = polygonArea(loop);
+  const minAcceptedArea = originalArea * 0.1;
+  const minPartLen = 2.0;
+  const outline = loop.concat([loop[0]]);
+  const outlineParts = splitPolyline(outline, stroke).filter(
+    (segment) => segment.length >= 2 && distancePx(segment[0], segment[segment.length - 1]) > 1e-7 && polylineLength(segment) > minPartLen
+  );
+  const strokeParts = splitPolyline(stroke, outline).filter(
+    (segment) => segment.length >= 2 && distancePx(segment[0], segment[segment.length - 1]) > 1e-7 && polylineLength(segment) > minPartLen
+  );
+  if (outlineParts.length < 3 || strokeParts.length < 3) return null;
+
+  let best: GeometryPoint[] | null = null;
+  let bestArea = 0;
+  for (let replaceIdx = 0; replaceIdx < outlineParts.length; replaceIdx += 1) {
+    const keptOutline = outlineParts.filter((_, i) => i !== replaceIdx);
+    for (const strokePart of strokeParts) {
+      const merged = keptOutline.concat([strokePart]);
+      const candidates = polygonize(merged);
+      for (const candidate of candidates) {
+        const area = polygonArea(candidate);
+        if (area < minAcceptedArea) continue;
+        if (area > bestArea) {
+          bestArea = area;
+          best = candidate;
+        }
+      }
+    }
+  }
+  if (!best) return null;
+  const simplified = simplifyClosedPolygon(best, simplifyTolerance);
+  if (simplified.length < 3) return null;
+  return simplified;
 }
 
 /** Simplifies an open polyline with Douglas-Peucker in source pixel space. */
@@ -1880,19 +2361,13 @@ function simplifyPolyline(points: GeometryPoint[], epsilon: number): GeometryPoi
   let bestIndex = -1;
   const a = points[0];
   const b = points[points.length - 1];
-  const abx = b.x - a.x;
-  const aby = b.y - a.y;
-  const ab2 = abx * abx + aby * aby;
+  const ab = subPx(b, a);
+  const ab2 = dotPx(ab, ab);
   for (let i = 1; i < points.length - 1; i += 1) {
     const p = points[i];
-    let dist = 0;
-    if (ab2 <= 1e-12) {
-      dist = distancePx(a, p);
-    } else {
-      const t = Math.max(0, Math.min(1, ((p.x - a.x) * abx + (p.y - a.y) * aby) / ab2));
-      const proj = { x: a.x + t * abx, y: a.y + t * aby };
-      dist = distancePx(p, proj);
-    }
+    const dist = ab2 <= 1e-12
+      ? distancePx(a, p)
+      : distancePx(p, lerpPx(a, b, Math.max(0, Math.min(1, dotPx(subPx(p, a), ab) / ab2))));
     if (dist > bestDist) {
       bestDist = dist;
       bestIndex = i;
@@ -1913,195 +2388,6 @@ function simplifyClosedPolygon(points: GeometryPoint[], epsilon: number): Geomet
   const open = dedupeConsecutivePoints(simplified.slice(0, -1));
   if (open.length < 3) return [];
   return open;
-}
-
-/**
- * Builds a valid closed-loop polygon candidate while avoiding aggressive
- * simplification collapse. Tries configured simplify tolerance first, then
- * no-simplify, then raw de-duplicated ring.
- */
-function normalizeLoopCandidate(points: GeometryPoint[]): GeometryPoint[] {
-  const simplified = simplifyClosedPolygon(points, config.freehandSimplifyTolerance);
-  if (simplified.length >= 3 && polygonArea(simplified) > 0) return simplified;
-
-  const unsimplified = simplifyClosedPolygon(points, 0);
-  if (unsimplified.length >= 3 && polygonArea(unsimplified) > 0) return unsimplified;
-
-  const ring = dedupeConsecutivePoints(points, 1e-4);
-  if (ring.length >= 3 && polygonArea(ring) > 0) return ring;
-  return [];
-}
-
-/** Extracts the largest enclosed loop from a self-intersecting stroke path. */
-function extractLargestLoopFromSelfIntersectingStroke(strokePx: GeometryPoint[]): GeometryPoint[] | null {
-  const intersections = findStrokeSelfIntersections(strokePx);
-  const segmentCount = intersections.length + 1;
-  if (segmentCount > config.freehandMaxSelfIntersectionSegments) return null;
-  const augmented = buildAugmentedStrokePoints(strokePx, intersections);
-  const indicesByKey = new Map<string, number[]>();
-  augmented.forEach((point, index) => {
-    const key = pointKey(point, 3);
-    const arr = indicesByKey.get(key) ?? [];
-    arr.push(index);
-    indicesByKey.set(key, arr);
-  });
-
-  let best: GeometryPoint[] | null = null;
-  let bestArea = 0;
-  indicesByKey.forEach((indices) => {
-    if (indices.length < 2) return;
-    for (let a = 0; a < indices.length - 1; a += 1) {
-      for (let b = a + 1; b < indices.length; b += 1) {
-        const i = indices[a];
-        const j = indices[b];
-        if (j - i < 2) continue;
-        const loop = dedupeConsecutivePoints(augmented.slice(i, j + 1), 1e-4);
-        if (loop.length < 3) continue;
-        const normalizedLoop = normalizeLoopCandidate(loop);
-        const area = polygonArea(normalizedLoop);
-        if (area <= 0) continue;
-        if (area > bestArea) {
-          bestArea = area;
-          best = normalizedLoop;
-        }
-      }
-    }
-  });
-  if (best) return best;
-
-  // Fallback: build loop candidates directly from each intersection pair on the
-  // original stroke path. This avoids relying on rounded augmented-point keys.
-  intersections.forEach((hit) => {
-    if (hit.segB - hit.segA < 1) return;
-    const candidate = dedupeConsecutivePoints(
-      [
-        { x: hit.point.x, y: hit.point.y },
-        ...strokePx.slice(hit.segA + 1, hit.segB + 1),
-        { x: hit.point.x, y: hit.point.y },
-      ],
-      1e-4
-    );
-    if (candidate.length < 4) return;
-    const normalizedLoop = normalizeLoopCandidate(candidate);
-    if (normalizedLoop.length < 3) return;
-    const area = polygonArea(normalizedLoop);
-    if (area <= 0) return;
-    if (area > bestArea) {
-      bestArea = area;
-      best = normalizedLoop;
-    }
-  });
-  return best;
-}
-
-/** Finds stroke/polygon-edge intersections with stroke-order metadata. */
-function findStrokePolygonIntersections(
-  strokePx: GeometryPoint[],
-  polygonPx: GeometryPoint[]
-): Array<{ point: GeometryPoint; strokeSeg: number; strokeT: number; polyEdge: number; polyT: number }> {
-  const out: Array<{ point: GeometryPoint; strokeSeg: number; strokeT: number; polyEdge: number; polyT: number }> = [];
-  const n = polygonPx.length;
-  for (let s = 0; s < strokePx.length - 1; s += 1) {
-    for (let e = 0; e < n; e += 1) {
-      const hit = intersectSegments(
-        strokePx[s],
-        strokePx[s + 1],
-        polygonPx[e],
-        polygonPx[(e + 1) % n]
-      );
-      if (!hit) continue;
-      out.push({
-        point: hit.point,
-        strokeSeg: s,
-        strokeT: hit.tA,
-        polyEdge: e,
-        polyT: hit.tB,
-      });
-    }
-  }
-  out.sort((a, b) => (a.strokeSeg - b.strokeSeg) || (a.strokeT - b.strokeT));
-  const deduped: typeof out = [];
-  out.forEach((entry) => {
-    const prev = deduped[deduped.length - 1];
-    if (prev && distancePx(prev.point, entry.point) < 1e-4) return;
-    deduped.push(entry);
-  });
-  return deduped;
-}
-
-/** Returns overlap score between a stroke and polygon outline for loop selection.
- *  Score = number of intersection points; 0 means no overlap. */
-function strokePolygonOverlapScore(strokePx: GeometryPoint[], polygonPx: GeometryPoint[]): number {
-  const hits = findStrokePolygonIntersections(strokePx, polygonPx);
-  // Require at least 2 crossings (stroke enters and exits polygon boundary)
-  return hits.length >= 2 ? hits.length : 0;
-}
-
-/** Returns stroke subpath between two intersection samples, inclusive of endpoints. */
-function strokeSliceBetween(
-  strokePx: GeometryPoint[],
-  start: { point: GeometryPoint; strokeSeg: number },
-  end: { point: GeometryPoint; strokeSeg: number }
-): GeometryPoint[] {
-  const out: GeometryPoint[] = [{ x: start.point.x, y: start.point.y }];
-  for (let seg = start.strokeSeg + 1; seg <= end.strokeSeg; seg += 1) {
-    out.push(strokePx[seg]);
-  }
-  out.push({ x: end.point.x, y: end.point.y });
-  return dedupeConsecutivePoints(out, 1e-4);
-}
-
-/** Returns polygon boundary path from start edge-point to end edge-point in chosen direction. */
-function polygonBoundaryPathBetween(
-  polygonPx: GeometryPoint[],
-  startEdge: number,
-  startPoint: GeometryPoint,
-  endEdge: number,
-  endPoint: GeometryPoint,
-  forward: boolean
-): GeometryPoint[] {
-  const n = polygonPx.length;
-  const out: GeometryPoint[] = [{ x: startPoint.x, y: startPoint.y }];
-  if (startEdge === endEdge) {
-    // Both intersections on the same edge: one direction traverses the full perimeter,
-    // the other is just the direct segment between the two points on that edge.
-    if (forward) {
-      // Traverse full perimeter (all polygon vertices)
-      for (let i = 1; i <= n; i += 1) {
-        out.push(polygonPx[(startEdge + i) % n]);
-      }
-    }
-    // backward: direct segment — nothing to add between start and end points
-  } else if (forward) {
-    let edge = startEdge;
-    while (edge !== endEdge) {
-      out.push(polygonPx[(edge + 1) % n]);
-      edge = (edge + 1) % n;
-    }
-  } else {
-    let edge = startEdge;
-    while (edge !== endEdge) {
-      out.push(polygonPx[edge]);
-      edge = (edge - 1 + n) % n;
-    }
-  }
-  out.push({ x: endPoint.x, y: endPoint.y });
-  return dedupeConsecutivePoints(out, 1e-4);
-}
-
-/** Picks the largest valid polygon candidate after split/rejoin edit. */
-function chooseLargestPolygonCandidate(candidates: GeometryPoint[][]): GeometryPoint[] | null {
-  let best: GeometryPoint[] | null = null;
-  let bestArea = 0;
-  candidates.forEach((candidate) => {
-    const simplified = simplifyClosedPolygon(candidate, config.freehandSimplifyTolerance);
-    if (simplified.length < 3) return;
-    const area = polygonArea(simplified);
-    if (area <= bestArea) return;
-    bestArea = area;
-    best = simplified;
-  });
-  return best;
 }
 
 /** Triangulates a simple polygon using ear clipping; returns triangle vertex indices. */
@@ -2162,38 +2448,6 @@ function triangulatePolygon(points: Array<{ x: number; y: number }>): number[] {
     guard += 1;
   }
   return triangles;
-}
-
-/** Applies freehand split/rejoin editing to one polygon, returning updated polygon pixels or null. */
-function editPolygonWithStroke(strokePx: GeometryPoint[], polygonPx: GeometryPoint[]): GeometryPoint[] | null {
-  const intersections = findStrokePolygonIntersections(strokePx, polygonPx);
-  if (intersections.length < 2) return null;
-  const first = intersections[0];
-  const last = intersections[intersections.length - 1];
-  const strokePart = strokeSliceBetween(strokePx, first, last);
-  if (strokePart.length < 2) return null;
-
-  const forwardBoundary = polygonBoundaryPathBetween(
-    polygonPx,
-    first.polyEdge,
-    first.point,
-    last.polyEdge,
-    last.point,
-    true
-  );
-  const backwardBoundary = polygonBoundaryPathBetween(
-    polygonPx,
-    first.polyEdge,
-    first.point,
-    last.polyEdge,
-    last.point,
-    false
-  );
-  const strokePartReversed = strokePart.slice().reverse();
-  return chooseLargestPolygonCandidate([
-    [...forwardBoundary, ...strokePartReversed],
-    [...backwardBoundary, ...strokePartReversed],
-  ]);
 }
 
 /** Adds a freehand polygon mask from normalized points and applies selected label if available. */
@@ -2268,19 +2522,45 @@ function finalizeFreehandStroke(samples: FreehandSample[]): {
   }
   const strokePx = sampled.map((point) => normalizedToImagePx(point));
   const isNearClosure =
-    distancePx(
-      { x: samples[0].canvasX, y: samples[0].canvasY },
-      { x: samples[samples.length - 1].canvasX, y: samples[samples.length - 1].canvasY }
-    ) < config.freehandClosureDistancePx;
+    distancePx(strokePx[0], strokePx[strokePx.length - 1]) < config.freehandClosureDistancePx;
 
-  const selfIntersections = findStrokeSelfIntersections(strokePx);
-  if (selfIntersections.length > 0) {
-    const loopPx = extractLargestLoopFromSelfIntersectingStroke(strokePx);
-    if (!loopPx || loopPx.length < 3) {
+  const selfSplit = splitSelfIntersecting(strokePx);
+  if (selfSplit.intersections > 0) {
+    const segmentComplexity = selfSplit.intersections + 1;
+    if (segmentComplexity > config.freehandMaxSelfIntersectionSegments) {
       return {
         outcome: "drop_self_intersecting_no_loop",
         sampled_points: sampled.length,
-        self_intersections: selfIntersections.length,
+        self_intersections: selfSplit.intersections,
+        is_near_closure: isNearClosure,
+        existing_freehand_masks: existingFreehandCount,
+      };
+    }
+    const loops = polygonize(selfSplit.segments);
+    if (loops.length === 0) {
+      return {
+        outcome: "drop_self_intersecting_no_loop",
+        sampled_points: sampled.length,
+        self_intersections: selfSplit.intersections,
+        is_near_closure: isNearClosure,
+        existing_freehand_masks: existingFreehandCount,
+      };
+    }
+    let chosen = loops[0];
+    let chosenArea = polygonArea(chosen);
+    for (let i = 1; i < loops.length; i += 1) {
+      const area = polygonArea(loops[i]);
+      if (area > chosenArea) {
+        chosen = loops[i];
+        chosenArea = area;
+      }
+    }
+    const loopPx = simplifyClosedPolygon(chosen, config.freehandSimplifyTolerance);
+    if (loopPx.length < 3) {
+      return {
+        outcome: "drop_self_intersecting_no_loop",
+        sampled_points: sampled.length,
+        self_intersections: selfSplit.intersections,
         is_near_closure: isNearClosure,
         existing_freehand_masks: existingFreehandCount,
       };
@@ -2290,7 +2570,7 @@ function finalizeFreehandStroke(samples: FreehandSample[]): {
     return {
       outcome: "new_loop_from_self_intersecting",
       sampled_points: sampled.length,
-      self_intersections: selfIntersections.length,
+      self_intersections: selfSplit.intersections,
       is_near_closure: isNearClosure,
       existing_freehand_masks: existingFreehandCount,
     };
@@ -2334,7 +2614,7 @@ function finalizeFreehandStroke(samples: FreehandSample[]): {
       return {
         mask,
         polygonPx,
-        score: strokePolygonOverlapScore(strokePx, polygonPx),
+        score: strokeOverlapScore(polygonPx, strokePx),
         area: polygonArea(polygonPx),
       };
     })
@@ -2352,7 +2632,7 @@ function finalizeFreehandStroke(samples: FreehandSample[]): {
 
   const target = ranked[0];
   const targetIntersections = findStrokePolygonIntersections(strokePx, target.polygonPx);
-  const editedPx = editPolygonWithStroke(strokePx, target.polygonPx);
+  const editedPx = editPolygonWithStroke(target.polygonPx, strokePx, config.freehandSimplifyTolerance);
   if (!editedPx || editedPx.length < 3) {
     return {
       outcome: "drop_edit_failed",
@@ -2369,7 +2649,7 @@ function finalizeFreehandStroke(samples: FreehandSample[]): {
   return {
     outcome: "existing_mask_edited",
     sampled_points: sampled.length,
-    self_intersections: selfIntersections.length,
+    self_intersections: selfSplit.intersections,
     is_near_closure: isNearClosure,
     existing_freehand_masks: existingFreehandCount,
     edited_mask_id: target.mask.id,
@@ -4380,6 +4660,12 @@ class WebGLTileViewer {
       return { width: this.manifest.width, height: this.manifest.height };
     }
     return { width: this.manifest.height, height: this.manifest.width };
+  }
+
+  /** Returns source image dimensions from current manifest, if loaded. */
+  getSourceImageDimensions(): { width: number; height: number } | null {
+    if (!this.manifest) return null;
+    return { width: this.manifest.width, height: this.manifest.height };
   }
 
   /** Applies inverse active transform to map display-normalized point to source-normalized point. */

@@ -3,6 +3,7 @@
 ## Backend runtime wiring
 
 - `backend/cmd/server/main.go` loads config from `nemo.toml`, opens SQLite, syncs `users.is_admin` from config admins, configures tile cache service, registers routes, wraps all routes with auth middleware, and starts the HTTP server.
+- Server startup registers `.map` files with MIME type `application/json` so browser debuggers can consume JavaScript sourcemaps from static assets reliably.
 - Shared JSON response writes use `writeJSON`; JSON encode failures are logged (`log.Printf`) instead of being silently ignored.
 - Routes:
   - `/api/me` handled by `backend/cmd/server/main.go` and returns `username` + `is_admin` for the authenticated user.
