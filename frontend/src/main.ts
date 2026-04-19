@@ -1915,6 +1915,23 @@ function simplifyClosedPolygon(points: GeometryPoint[], epsilon: number): Geomet
   return open;
 }
 
+/**
+ * Builds a valid closed-loop polygon candidate while avoiding aggressive
+ * simplification collapse. Tries configured simplify tolerance first, then
+ * no-simplify, then raw de-duplicated ring.
+ */
+function normalizeLoopCandidate(points: GeometryPoint[]): GeometryPoint[] {
+  const simplified = simplifyClosedPolygon(points, config.freehandSimplifyTolerance);
+  if (simplified.length >= 3 && polygonArea(simplified) > 0) return simplified;
+
+  const unsimplified = simplifyClosedPolygon(points, 0);
+  if (unsimplified.length >= 3 && polygonArea(unsimplified) > 0) return unsimplified;
+
+  const ring = dedupeConsecutivePoints(points, 1e-4);
+  if (ring.length >= 3 && polygonArea(ring) > 0) return ring;
+  return [];
+}
+
 /** Extracts the largest enclosed loop from a self-intersecting stroke path. */
 function extractLargestLoopFromSelfIntersectingStroke(strokePx: GeometryPoint[]): GeometryPoint[] | null {
   const intersections = findStrokeSelfIntersections(strokePx);
@@ -1940,12 +1957,12 @@ function extractLargestLoopFromSelfIntersectingStroke(strokePx: GeometryPoint[])
         if (j - i < 2) continue;
         const loop = dedupeConsecutivePoints(augmented.slice(i, j + 1), 1e-4);
         if (loop.length < 3) continue;
-        const simplified = simplifyClosedPolygon(loop, config.freehandSimplifyTolerance);
-        const area = polygonArea(simplified);
+        const normalizedLoop = normalizeLoopCandidate(loop);
+        const area = polygonArea(normalizedLoop);
         if (area <= 0) continue;
         if (area > bestArea) {
           bestArea = area;
-          best = simplified;
+          best = normalizedLoop;
         }
       }
     }
@@ -1965,13 +1982,13 @@ function extractLargestLoopFromSelfIntersectingStroke(strokePx: GeometryPoint[])
       1e-4
     );
     if (candidate.length < 4) return;
-    const simplified = simplifyClosedPolygon(candidate, config.freehandSimplifyTolerance);
-    if (simplified.length < 3) return;
-    const area = polygonArea(simplified);
+    const normalizedLoop = normalizeLoopCandidate(candidate);
+    if (normalizedLoop.length < 3) return;
+    const area = polygonArea(normalizedLoop);
     if (area <= 0) return;
     if (area > bestArea) {
       bestArea = area;
-      best = simplified;
+      best = normalizedLoop;
     }
   });
   return best;
@@ -2268,7 +2285,7 @@ function finalizeFreehandStroke(samples: FreehandSample[]): {
   if (freehandMasks.length === 0) {
     // No existing freehand loop to edit: close the stroke and create a new loop.
     const closedStroke = [...strokePx, strokePx[0]];
-    const loopPx = simplifyClosedPolygon(closedStroke, config.freehandSimplifyTolerance);
+    const loopPx = normalizeLoopCandidate(closedStroke);
     if (loopPx.length < 3) {
       return {
         outcome: "drop_no_existing_mask_invalid",
@@ -2303,7 +2320,7 @@ function finalizeFreehandStroke(samples: FreehandSample[]): {
   if (ranked.length === 0) {
     // No loop overlap to edit: treat as creating a new freehand loop.
     const closedStroke = [...strokePx, strokePx[0]];
-    const loopPx = simplifyClosedPolygon(closedStroke, config.freehandSimplifyTolerance);
+    const loopPx = normalizeLoopCandidate(closedStroke);
     if (loopPx.length < 3) {
       return {
         outcome: "drop_no_overlap_invalid",
@@ -2329,7 +2346,7 @@ function finalizeFreehandStroke(samples: FreehandSample[]): {
   if (!editedPx || editedPx.length < 3) {
     // Edit attempt failed: preserve the stroke as a new loop rather than dropping it.
     const closedStroke = [...strokePx, strokePx[0]];
-    const loopPx = simplifyClosedPolygon(closedStroke, config.freehandSimplifyTolerance);
+    const loopPx = normalizeLoopCandidate(closedStroke);
     if (loopPx.length < 3) {
       return {
         outcome: "drop_edit_failed_invalid",
