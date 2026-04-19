@@ -2232,20 +2232,24 @@ function finalizeFreehandStroke(samples: FreehandSample[]): {
   sampled_points: number;
   self_intersections: number;
   is_near_closure: boolean;
-  loop_extracted?: boolean;
-  existing_freehand_masks?: number;
+  existing_freehand_masks: number;
   edited_mask_id?: string;
 } {
   const sampled = dedupeConsecutivePoints(
     samples.map((sample) => ({ x: sample.imageX, y: sample.imageY })),
     1e-6
   );
+  const freehandMasks = appState.masks.filter(
+    (mask) => mask.kind === "freehand" && Array.isArray(mask.points) && (mask.points?.length ?? 0) >= 3
+  );
+  const existingFreehandCount = freehandMasks.length;
   if (sampled.length < 2) {
     return {
       outcome: "drop_too_few_points",
       sampled_points: sampled.length,
       self_intersections: 0,
       is_near_closure: false,
+      existing_freehand_masks: existingFreehandCount,
     };
   }
   const strokePx = sampled.map((point) => normalizedToImagePx(point));
@@ -2256,39 +2260,11 @@ function finalizeFreehandStroke(samples: FreehandSample[]): {
     ) < config.freehandClosureDistancePx;
 
   const selfIntersections = findStrokeSelfIntersections(strokePx);
-  const treatAsNewLoop = selfIntersections.length > 0 || isNearClosure;
-  let selfIntersectionLoopExtractionFailed = false;
-  if (treatAsNewLoop) {
-    const closedStroke = isNearClosure ? [...strokePx, strokePx[0]] : strokePx;
-    const loopPx =
-      selfIntersections.length > 0
-        ? extractLargestLoopFromSelfIntersectingStroke(closedStroke)
-        : simplifyClosedPolygon(closedStroke, config.freehandSimplifyTolerance);
-    if (loopPx && loopPx.length >= 3) {
-      const points = loopPx.map((point) => imagePxToNormalized(point));
-      addFreehandMask(points);
+  if (selfIntersections.length > 0) {
+    const loopPx = extractLargestLoopFromSelfIntersectingStroke(strokePx);
+    if (!loopPx || loopPx.length < 3) {
       return {
-        outcome: "new_loop_created",
-        sampled_points: sampled.length,
-        self_intersections: selfIntersections.length,
-        is_near_closure: isNearClosure,
-        loop_extracted: true,
-      };
-    }
-    // If self-intersection extraction fails, continue with the normal fallback
-    // path below (edit existing loop or create a closed loop) instead of drop.
-    selfIntersectionLoopExtractionFailed = selfIntersections.length > 0 && !isNearClosure;
-  }
-
-  const freehandMasks = appState.masks.filter((mask) => mask.kind === "freehand" && Array.isArray(mask.points) && (mask.points?.length ?? 0) >= 3);
-  const existingFreehandCount = freehandMasks.length;
-  if (freehandMasks.length === 0) {
-    // No existing freehand loop to edit: close the stroke and create a new loop.
-    const closedStroke = [...strokePx, strokePx[0]];
-    const loopPx = normalizeLoopCandidate(closedStroke);
-    if (loopPx.length < 3) {
-      return {
-        outcome: "drop_no_existing_mask_invalid",
+        outcome: "drop_self_intersecting_no_loop",
         sampled_points: sampled.length,
         self_intersections: selfIntersections.length,
         is_near_closure: isNearClosure,
@@ -2298,13 +2274,46 @@ function finalizeFreehandStroke(samples: FreehandSample[]): {
     const points = loopPx.map((point) => imagePxToNormalized(point));
     addFreehandMask(points);
     return {
-      outcome: selfIntersectionLoopExtractionFailed ? "new_loop_created_after_self_intersection_fallback_no_existing_mask" : "new_loop_created_no_existing_mask",
+      outcome: "new_loop_from_self_intersecting",
       sampled_points: sampled.length,
       self_intersections: selfIntersections.length,
       is_near_closure: isNearClosure,
       existing_freehand_masks: existingFreehandCount,
     };
   }
+
+  if (existingFreehandCount === 0) {
+    if (!isNearClosure) {
+      return {
+        outcome: "drop_simple_not_closed_no_existing",
+        sampled_points: sampled.length,
+        self_intersections: 0,
+        is_near_closure: isNearClosure,
+        existing_freehand_masks: existingFreehandCount,
+      };
+    }
+    const closedStroke = [...strokePx, strokePx[0]];
+    const loopPx = simplifyClosedPolygon(closedStroke, config.freehandSimplifyTolerance);
+    if (loopPx.length < 3) {
+      return {
+        outcome: "drop_simple_closed_invalid",
+        sampled_points: sampled.length,
+        self_intersections: 0,
+        is_near_closure: isNearClosure,
+        existing_freehand_masks: existingFreehandCount,
+      };
+    }
+    const points = loopPx.map((point) => imagePxToNormalized(point));
+    addFreehandMask(points);
+    return {
+      outcome: "new_loop_from_simple_closed",
+      sampled_points: sampled.length,
+      self_intersections: 0,
+      is_near_closure: isNearClosure,
+      existing_freehand_masks: existingFreehandCount,
+    };
+  }
+
   const ranked = freehandMasks
     .map((mask) => {
       const polygonPx = (mask.points ?? []).map((point) => normalizedToImagePx(point));
@@ -2318,24 +2327,10 @@ function finalizeFreehandStroke(samples: FreehandSample[]): {
     .filter((item) => item.score > 0)
     .sort((a, b) => (b.score - a.score) || (b.area - a.area) || (a.mask.index - b.mask.index));
   if (ranked.length === 0) {
-    // No loop overlap to edit: treat as creating a new freehand loop.
-    const closedStroke = [...strokePx, strokePx[0]];
-    const loopPx = normalizeLoopCandidate(closedStroke);
-    if (loopPx.length < 3) {
-      return {
-        outcome: "drop_no_overlap_invalid",
-        sampled_points: sampled.length,
-        self_intersections: selfIntersections.length,
-        is_near_closure: isNearClosure,
-        existing_freehand_masks: existingFreehandCount,
-      };
-    }
-    const points = loopPx.map((point) => imagePxToNormalized(point));
-    addFreehandMask(points);
     return {
-      outcome: selfIntersectionLoopExtractionFailed ? "new_loop_created_after_self_intersection_fallback_no_overlap" : "new_loop_created_no_overlap",
+      outcome: "drop_no_overlap",
       sampled_points: sampled.length,
-      self_intersections: selfIntersections.length,
+      self_intersections: 0,
       is_near_closure: isNearClosure,
       existing_freehand_masks: existingFreehandCount,
     };
@@ -2344,24 +2339,10 @@ function finalizeFreehandStroke(samples: FreehandSample[]): {
   const target = ranked[0];
   const editedPx = editPolygonWithStroke(strokePx, target.polygonPx);
   if (!editedPx || editedPx.length < 3) {
-    // Edit attempt failed: preserve the stroke as a new loop rather than dropping it.
-    const closedStroke = [...strokePx, strokePx[0]];
-    const loopPx = normalizeLoopCandidate(closedStroke);
-    if (loopPx.length < 3) {
-      return {
-        outcome: "drop_edit_failed_invalid",
-        sampled_points: sampled.length,
-        self_intersections: selfIntersections.length,
-        is_near_closure: isNearClosure,
-        existing_freehand_masks: existingFreehandCount,
-      };
-    }
-    const points = loopPx.map((point) => imagePxToNormalized(point));
-    addFreehandMask(points);
     return {
-      outcome: selfIntersectionLoopExtractionFailed ? "new_loop_created_after_self_intersection_fallback_edit_failed" : "new_loop_created_edit_failed",
+      outcome: "drop_edit_failed",
       sampled_points: sampled.length,
-      self_intersections: selfIntersections.length,
+      self_intersections: 0,
       is_near_closure: isNearClosure,
       existing_freehand_masks: existingFreehandCount,
     };
