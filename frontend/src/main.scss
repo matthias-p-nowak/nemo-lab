@@ -123,6 +123,42 @@ body {
   margin-top: 36px;
 }
 
+.left-sidebar__index {
+  width: 100%;
+}
+
+.left-sidebar__image-name {
+  min-height: 1.25rem;
+  word-break: break-word;
+}
+
+.left-sidebar__button-row {
+  display: grid;
+  gap: 8px;
+}
+
+.left-sidebar__button-row--nav {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.left-sidebar__button-row--download {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.left-sidebar__icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 36px;
+  padding: 6px;
+
+  svg {
+    display: block;
+    pointer-events: none;
+  }
+}
+
 .layout.left-collapsed .sidebar--left .sidebar__content,
 .layout.right-collapsed .sidebar--right .sidebar__content {
   display: none;

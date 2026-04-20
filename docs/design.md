@@ -176,6 +176,14 @@ CREATE TABLE users (
 
 ## Frontend
 
+### Tooltips
+
+Every interactive control — buttons, sliders, and checkboxes — carries a `title` attribute with a short description of what it does. The browser renders this as a native tooltip on hover.
+
+- Implemented via HTML `title="..."` attributes on the element itself (or its nearest labeled wrapper).
+- No custom tooltip library — native browser behavior only.
+- Tooltip text is concise (≤ 10 words); describes the action or effect, not the control type.
+
 ### Frontend Build Tooling
 
 - Frontend assets are built with direct CLI tools invoked by VS Code tasks, not `npm` scripts.
@@ -404,6 +412,7 @@ Certain UI preferences are persisted per user in the backend and restored on nex
 | `optics_flip_h`       | `0` \| `1`           | H transform toggle state           |
 | `optics_flip_v`       | `0` \| `1`           | V transform toggle state           |
 | `sidebar_right_width` | integer string (px)  | Right sidebar width in CSS pixels  |
+| `annotation_mode`     | `point` \| `bounding box` \| `freehand` | Active mask mode |
 
 **Storage:** `user_settings` SQLite table — one row per (user_id, key). Values stored as strings.
 
@@ -456,8 +465,12 @@ Keyboard shortcuts are scoped to UI regions. A `keydown` event only triggers a s
 |---|---|---|
 | `canvas` | `PageUp` | Cycle optics transform forward |
 | `canvas` | `PageDown` | Cycle optics transform backward |
+| `canvas` | `ArrowLeft` | Go to previous image |
+| `canvas` | `ArrowRight` | Go to next image |
+| `canvas` | `Ctrl` (hold) | Hide all masks while held |
 | `canvas` | `Escape` | Deselect selected mask; close context menu |
 | `canvas` | `Delete` | Remove selected mask |
+| `canvas` | `Backspace` | Undo last annotation change (limited history) |
 | `canvas` | `ArrowUp` | Cycle mask selection backward |
 | `canvas` | `ArrowDown` | Cycle mask selection forward |
 | `canvas` | `p` | Switch mask mode to **point** |
@@ -543,18 +556,50 @@ The menu bar is restructured so that sidebar toggle buttons are always visible a
 - The hamburger button is positioned adjacent to (next to) the left-sidebar show/hide toggle button, both fixed at the top-left corner.
 - `.sidebar__content` on the left sidebar has `overflow-y: auto` so its panels scroll vertically and are never clipped.
 
+#### Layout (top to bottom)
+
+1. **Image index field** — numeric input (1-based), Enter to jump, clamped to valid range.
+2. **Image name** — filename of the current image (basename only, no `"Image:"` prefix label).
+3. **Navigation row** — three icon buttons side by side: Previous · Next · Fast-forward.
+4. **Download row** — two icon buttons side by side: Download image · Download annotation.
+
+All buttons use inline SVG icons (no text labels). Tooltips (`title` attributes) identify each button on hover.
+
 #### Image index field
 
 - A numeric input showing the 1-based index of the current image in the image list (e.g. `3` when viewing the third image).
 - Editable: user can type a number and press Enter to jump directly to that image (clamped to valid range).
 - Updated whenever the active image changes.
 
-#### Fast-forward button
+#### Image name
 
-- Jumps to the first image (by list order, starting after the current image) whose annotation file on disk does **not** exist or contains zero masks.
-- "Annotation file on disk" follows the current mode: single-file (`nemolab.json`) or per-image sidecar.
-- If no such image exists (all remaining images are annotated), the button does nothing (no navigation).
-- The check is performed against the file system at the moment the button is clicked (not cached state).
+- Displays the basename of the currently active image file (e.g. `00001140.png`).
+- No label prefix. Empty when no image is active.
+
+#### Navigation buttons (icon row)
+
+| Button | Icon | Action |
+|--------|------|--------|
+| Previous | `previous.svg` | Go to previous image |
+| Next | `next.svg` | Go to next image |
+| Fast-forward | `fast-forward.svg` | Jump to first unannotated image after current |
+
+Fast-forward: jumps to the first image (by list order, starting after the current image) whose annotation file on disk does **not** exist or contains zero masks. Follows the current mode (single-file or per-image sidecar). Does nothing if all remaining images are annotated.
+
+#### Download buttons (icon row)
+
+| Button | Icon | Action |
+|--------|------|--------|
+| Download image | `download-image.svg` | Download active image file |
+| Download annotation | `download-annotation.svg` | Download active annotation JSON |
+
+Both buttons are disabled (grayed out) when no image is active.
+
+**Backend endpoint for image download:**
+- `GET /images/<hash>/raw` — streams the raw image file bytes with `Content-Disposition: attachment; filename="<original-filename>"`. Returns 404 if hash is unknown for the session.
+
+**Backend endpoint for annotation download:**
+- `GET /api/annotations/download?hash=<hash>` — resolves the annotation file path for the session's active task and image hash, reads the file, and returns it with `Content-Disposition: attachment; filename="<basename>"`. Returns 404 if no annotation file exists.
 
 ### Mask Mode Selector
 
@@ -568,10 +613,19 @@ A dropdown panel in the right sidebar, placed between the Labels panel and the M
 | `bounding box` | Places a rectangular mask by click-drag |
 | `freehand` | Places a freehand polygon mask by click-drag |
 
-- Default mode on task load: `point`.
+- Default mode when no persisted setting exists: `point`.
+- The selected mode is persisted in `user_settings` as `annotation_mode` (values: `point`, `bounding box`, `freehand`). It is restored on next page load and applied before first render.
 - The selected mode controls placement behavior for left-click interactions on the canvas.
 - Selecting `bounding box` (not yet implemented) displays an inline error message in the panel: "Mode not yet supported."
 - Freehand mode is fully implemented; see [Freehand mask drawing](#freehand-mask-drawing).
+
+**Per-mode description text** is displayed below the mode selector dropdown:
+
+| Mode | Description shown |
+|------|-------------------|
+| `point` | Click to annotate a location on the picture |
+| `bounding box` | Draws a rectangle to indicate both location and size |
+| `freehand` | Hand drawn mask without holes |
 
 ### Masks
 
@@ -637,9 +691,28 @@ For editing an existing loop:
 - Live stroke preview: red outline.
 - Finalized freehand masks: rendered with the standard fill/outline color and opacity rules (same as point and bbox masks).
 
+#### Undo (limited history)
+
+- Undo is available only for annotation edits on the currently active image.
+- Pressing **Backspace** (canvas scope) reverts one step to the previous in-memory annotation snapshot.
+- Undoable operations include mask create/remove, label assignment, bbox geometry edits, and freehand geometry edits.
+- History depth is limited to 20 snapshots (oldest entries are dropped first).
+- Snapshot restore re-applies masks plus annotation sidecars (`nemolab_comments`, `nemolab_authors`, `nemolab_mask_authors`) and immediately sends `save_annotations`.
+- History is cleared on image switch and when a fresh annotation payload is loaded for the image.
+- Redo is not implemented.
+
+#### Temporarily hiding masks
+
+- Holding **Ctrl** hides all masks for as long as the key is held.
+- On `keydown` of Ctrl: stop rendering masks (suppress the mask draw pass).
+- On `keyup` of Ctrl: restore normal mask rendering.
+- No state change to `appState` — purely a rendering toggle while the key is down.
+- Works in all mask modes and regardless of selection state.
+
 #### Mask selection
 
-- **Double-click** on a mask selects it. Only one mask can be selected at a time.
+- **Double-click** on a mask selects it in **all modes**, including freehand. The double-click check must run before freehand stroke capture begins, so a double-click near an existing mask never starts a freehand drag. Only one mask can be selected at a time.
+- Known broken behavior in freehand mode (to be fixed): double-clicking a freehand mask currently switches the mask mode to freehand instead of selecting the mask; non-selected masks remain filled instead of outline-only; the selected mask shows no highlight/halo; and the annotation row in the Annotations panel is not highlighted.
 - **Escape** cancels the current selection (returns to no mask selected).
 - **Arrow up / Arrow down** cycle through masks in index order; the cycle includes a "none selected" state.
 - **Delete** key (when a mask is selected) removes the selected mask.
@@ -712,6 +785,7 @@ An annotation is the assignment of a label to a mask.
 - **Right-click** within 10 CSS px of a mask opens a context menu:
   - Lists recently used labels, most recent on top.
   - Clicking a list item assigns that label to the mask.
+  - Must work immediately after any placement gesture (including after bbox drag-place), without requiring a mask to be selected first.
 - The **last assigned label** is the default for the next placed mask (auto-assigned on placement).
 
 ### Comment Panels
