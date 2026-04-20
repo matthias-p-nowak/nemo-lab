@@ -10,6 +10,75 @@ import (
 	"github.com/matthias-p-nowak/nemo-lab/annotations"
 )
 
+func TestResolveImagePath(t *testing.T) {
+	token := "tok-image"
+	hash := "hash-image"
+	imagePath := filepath.Join(t.TempDir(), "img.png")
+	restore := setConnStateForTest(token, &connState{
+		hashToPath: map[string]string{hash: imagePath},
+	})
+	defer restore()
+
+	got, ok := ResolveImagePath(token, hash)
+	if !ok {
+		t.Fatalf("expected image path to resolve")
+	}
+	if got != imagePath {
+		t.Fatalf("unexpected image path: got=%q want=%q", got, imagePath)
+	}
+}
+
+func TestResolveAnnotationPath(t *testing.T) {
+	token := "tok-ann"
+	hash := "hash-ann"
+	root := t.TempDir()
+	imagePath := filepath.Join(root, "nested", "sample.tif")
+	restore := setConnStateForTest(token, &connState{
+		hashToPath:     map[string]string{hash: imagePath},
+		annotationsDir: filepath.Join(root, "anns"),
+		singleFile:     false,
+	})
+	defer restore()
+
+	got, ok := ResolveAnnotationPath(token, hash)
+	if !ok {
+		t.Fatalf("expected annotation path to resolve")
+	}
+	want := filepath.Join(root, "anns", "sample.json")
+	if got != want {
+		t.Fatalf("unexpected annotation path: got=%q want=%q", got, want)
+	}
+}
+
+func TestResolveAnnotationPathMissingAnnotationsDir(t *testing.T) {
+	token := "tok-ann-missing"
+	hash := "hash-ann-missing"
+	restore := setConnStateForTest(token, &connState{
+		hashToPath: map[string]string{hash: "/tmp/sample.tif"},
+	})
+	defer restore()
+
+	if _, ok := ResolveAnnotationPath(token, hash); ok {
+		t.Fatalf("expected resolve to fail without annotations dir")
+	}
+}
+
+func setConnStateForTest(token string, state *connState) func() {
+	connectionsMu.Lock()
+	previous, existed := connections[token]
+	connections[token] = state
+	connectionsMu.Unlock()
+	return func() {
+		connectionsMu.Lock()
+		defer connectionsMu.Unlock()
+		if existed {
+			connections[token] = previous
+			return
+		}
+		delete(connections, token)
+	}
+}
+
 func TestMergeAnnotationFiles_AddNewMask(t *testing.T) {
 	existing := &annotations.AnnotationFile{
 		Images:      []annotations.CocoImage{{ID: 1}},

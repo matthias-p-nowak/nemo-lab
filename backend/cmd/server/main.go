@@ -23,6 +23,7 @@ import (
 )
 
 const apiVersion = "0.1.0"
+const sessionCookieName = "nemo_session"
 
 func main() {
 	if err := mime.AddExtensionType(".map", "application/json"); err != nil {
@@ -50,6 +51,8 @@ func main() {
 	mux.HandleFunc("GET /api/version", makeVersionHandler())
 	mux.HandleFunc("GET /api/settings", makeSettingsGetHandler(sqlDB))
 	mux.HandleFunc("PUT /api/settings", makeSettingsPutHandler(sqlDB))
+	mux.HandleFunc("GET /images/{hash}/raw", makeImageRawDownloadHandler())
+	mux.HandleFunc("GET /api/annotations/download", makeAnnotationDownloadHandler())
 	mux.HandleFunc("GET /api/tasks", makeTasksListHandler(sqlDB))
 	mux.HandleFunc("PUT /api/tasks/{id}", makeTaskUpsertHandler(sqlDB))
 	mux.HandleFunc("DELETE /api/tasks/{id}", makeTaskDeleteHandler(sqlDB))
@@ -368,6 +371,95 @@ func makeDirsHandler() http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, dirsResponse{Dirs: dirs})
 	}
+}
+
+func makeImageRawDownloadHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		hash := strings.TrimSpace(r.PathValue("hash"))
+		if hash == "" {
+			http.Error(w, "missing hash", http.StatusBadRequest)
+			return
+		}
+		token, ok := sessionTokenFromRequest(r)
+		if !ok {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		imagePath, ok := ws.ResolveImagePath(token, hash)
+		if !ok {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		serveDownloadFile(w, r, imagePath)
+	}
+}
+
+func makeAnnotationDownloadHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		hash := strings.TrimSpace(r.URL.Query().Get("hash"))
+		if hash == "" {
+			http.Error(w, "missing hash", http.StatusBadRequest)
+			return
+		}
+		token, ok := sessionTokenFromRequest(r)
+		if !ok {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		annotationPath, ok := ws.ResolveAnnotationPath(token, hash)
+		if !ok {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		serveDownloadFile(w, r, annotationPath)
+	}
+}
+
+func sessionTokenFromRequest(r *http.Request) (string, bool) {
+	cookie, err := r.Cookie(sessionCookieName)
+	if err != nil {
+		return "", false
+	}
+	token := strings.TrimSpace(cookie.Value)
+	if token == "" {
+		return "", false
+	}
+	return token, true
+}
+
+func serveDownloadFile(w http.ResponseWriter, r *http.Request, path string) {
+	info, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "download failed", http.StatusInternalServerError)
+		return
+	}
+	if info.IsDir() {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	filename := sanitizeAttachmentFilename(filepath.Base(path))
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+	if ctype := mime.TypeByExtension(strings.ToLower(filepath.Ext(path))); ctype != "" {
+		w.Header().Set("Content-Type", ctype)
+	}
+	http.ServeFile(w, r, path)
+}
+
+func sanitizeAttachmentFilename(name string) string {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return "download"
+	}
+	replacer := strings.NewReplacer(
+		"\"", "_",
+		"\n", "_",
+		"\r", "_",
+	)
+	return replacer.Replace(trimmed)
 }
 
 func listDirs(path string) ([]string, error) {

@@ -157,12 +157,13 @@
 ## Frontend user settings
 
 - Implemented in `frontend/src/main.ts`.
-- On startup, frontend fetches `GET /api/settings`, applies theme/sidebar/optics settings, then performs first `render()`.
+- On startup, frontend fetches `GET /api/settings`, applies theme/sidebar/optics settings plus `annotation_mode`, then performs first `render()`.
 - UI changes immediately persist via `PUT /api/settings`:
   - theme menu selection (`theme`)
   - sidebar visibility toggles (`sidebar_left`, `sidebar_right`)
   - right sidebar drag width (`sidebar_right_width`)
   - optics sliders and transform toggles (`optics_*` keys)
+  - annotation mode selector (`annotation_mode`)
 
 ## Frontend image viewer
 
@@ -190,16 +191,23 @@
 - Canvas interaction styling is in `frontend/src/main.scss` with `touch-action: none` and crosshair cursor.
 - Viewer input handlers emit telemetry with module-level `logEvent(...)` over the shared WebSocket.
 - Keyboard shortcuts use a single `document` keydown dispatcher with innermost `[data-shortcut-scope]` routing. Implemented scopes are: `canvas` (`.image-view` wrapper, focus on click), `navigation` (left sidebar index Enter), right-panel bodies (`optics`, `labels`, `annotations`, `commentImage`, `commentAnnotation`), `taskDialog` (Enter-driven task field/tag/label commit), and admin-only `taskLabelTree` (label-tree reorder/navigation arrows + Tab traversal).
+- Canvas-scope shortcuts include optics transform (`PageUp`/`PageDown`), image navigation (`ArrowLeft`/`ArrowRight`), selection control (`Escape`, `Delete`, `ArrowUp`/`ArrowDown`), and mask-mode hotkeys (`p`, `r`, `f`).
+- Canvas-scope `Backspace` performs one-step annotation undo from an in-memory snapshot stack (`undoHistory`) limited to 20 entries per image.
+- Undo snapshots capture masks plus annotation sidecars (`nemolab_comments`, `nemolab_authors`, `nemolab_mask_authors`) and are pushed before annotation mutations (create/remove/label assign/bbox edit/freehand edit). Undo restore triggers `save_annotations` so backend state matches restored frontend state.
+- Undo history is cleared on image context changes (`image_list`, image activation/switch, and fresh `annotations_data` load) and redo is not implemented.
+- A module-level `ctrlHeld` flag is toggled by document-level `keydown`/`keyup` for `Control` (reset on `window.blur`); while true, `WebGLTileViewer.drawAnnotations()` exits early so all masks (including draft previews) are temporarily hidden without mutating mask state.
 - Logged frontend events include `image_change`, document `focus` (`focusin`/`focusout`), scoped-focus telemetry (`focus_scope` with the matched `data-shortcut-scope`), and temporary mask interaction events (`mouse_click`, `mask_created`, `mask_removed`, `label_assigned`).
 - When a shortcut-scope element itself receives focus (not a descendant), frontend applies a temporary `scope-focus-flash` class for 500 ms and then removes it.
 - Left sidebar uses the same scrollable content-wrapper pattern as the right sidebar (`.sidebar__content` with vertical overflow); the left content wrapper has top margin to clear the fixed top-left controls. The hamburger button is rendered as a fixed control adjacent to the fixed left-sidebar toggle.
 - On new-image activation (`image_ready` for a new hash), frontend defers activation logging until matching `annotations_data` arrives, then emits in order: `image_activated` (full image path), optional `annotations_source` (only when loaded payload is non-empty, with count/format/type summary), and `annotations_destination` (active write-target path from task annotations mode).
 - Left sidebar includes:
-  - previous/next image buttons,
-  - a numeric image-index input (1-based, Enter to jump, clamped to valid range),
-  - and a fast-forward button that requests `find_first_annotated_image` with `current_hash` and jumps to the returned hash (first unannotated image after current in list order; no wrap).
-- Canvas left-click adds a mask point only if total pointer travel since `pointerdown` is ≤ `config.clickMaxDragPx` (default 10 CSS px); longer drags are treated as pan gestures and suppressed. `Shift+left-click` removes nearest mask within 10 CSS px. Right-click near a mask opens a floating label assignment menu.
-- Right sidebar includes a mask-mode selector panel between Labels and Masks. `appState.maskMode` is the active mode (`point`, `bounding box`, `freehand`) and defaults to `point` on task activation. Selecting `bounding box` or `freehand` shows inline `Mode not yet supported.` feedback and immediately reverts selection back to `point`.
+  - top-to-bottom order: numeric image-index input (1-based, Enter to jump, clamped), basename-only image name, navigation icon row (previous/next/fast-forward), download icon row (download image/download annotation),
+  - navigation/download buttons are icon-only controls with inline SVG and native `title` tooltips (`Previous image`, `Next image`, `Jump to first unannotated image`, `Download image file`, `Download annotation file`),
+  - fast-forward requests `find_first_annotated_image` with `current_hash` and jumps to the returned hash (first unannotated image after current in list order; no wrap),
+  - `Download image` (`GET /images/{hash}/raw`) and `Download annotation` (`GET /api/annotations/download?hash=...`) are disabled when no image is active.
+  - native `title` tooltips on interactive controls (navigation buttons/input, download buttons, toggles, sliders, checkboxes, mask mode select, annotation rows, comment textareas, and resize handle).
+- Canvas left-click adds a mask point only if total pointer travel since `pointerdown` is ≤ `config.clickMaxDragPx` (default 10 CSS px); longer drags are treated as pan gestures and suppressed. `Shift+left-click` removes nearest mask within 10 CSS px. Right-click near a mask opens a floating label assignment menu, including immediately after bbox drag placement (drag distance state is reset on pointer-up/cancel).
+- Right sidebar includes a mask-mode selector panel between Labels and Masks. `appState.maskMode` is the active mode (`point`, `bounding box`, `freehand`), restored on startup from `annotation_mode` (default `point`) and persisted on every mode change. The panel also renders per-mode helper text for point/bounding-box/freehand behavior.
 - On `image_ready` for a newly selected hash, frontend sends `load_annotations` for that hash.
 - Frontend applies `annotations_data` only when `hash === appState.currentImageHash`, updates stored image dimensions, and reconstructs masks from either COCO keypoints (`point`) or COCO `bbox` (`bounding box`) annotations with category-id label lookup.
 - Frontend handles `image_hash_mismatch` WS messages by rendering a visible dismissible warning banner that includes the affected image file path.
@@ -214,7 +222,8 @@
 - Mask rendering palettes are split: fill uses `maskFillColor` (bit-reversed hue, S=0.50 V=0.70); outline uses label-based `labelColor` (S=0.75 V=0.90) or gray for unlabeled masks.
 - Optics panel includes persisted mask-render controls (`mask_stroke_opacity`, `mask_fill_opacity`, `mask_stroke_width`, `mask_marker_size`) that drive point alpha/size in the WebGL mask draw pass.
 - Mask outline pass is rendered as an annulus (ring) via shader uniform thresholding; fill pass remains a solid circle. This avoids label-color solid dots when fill opacity is set to zero.
-- Mask selection state is stored in `appState.selectedMaskId`: `dblclick` near a mask selects it; `Escape` clears selection; `ArrowUp`/`ArrowDown` cycle through masks in index order with a `null` (none selected) state and wrap-around behavior; `Delete` removes the selected mask (canvas scope only), and clicking an annotation row selects that row's mask.
+- Mask selection state is stored in `appState.selectedMaskId`: `dblclick` near a mask selects it; `Escape` clears selection; `ArrowUp`/`ArrowDown` cycle through masks in index order with a `null` (none selected) state and wrap-around behavior; `Delete` removes the selected mask (canvas scope only), and clicking an annotation row selects that row's mask. In drag-placement modes, pointerdown now runs the dblclick mask hit-test before entering drag capture so freehand double-click selection does not start a stroke.
+- When a selected mask is a bbox and the current mode is not `bounding box`, selection handlers promote mode to `bounding box` so bbox side-edit drag remains available.
 - While a mask is selected, standard left-click placement is suppressed (temporary restriction); shift-remove and right-click label assignment remain available.
 - Mask point colors are rendered per-point in WebGL:
   - fill color = `labelColor(maskSequentialIndex0Based)` (bit-reversed hue, S=0.75, V=0.90)

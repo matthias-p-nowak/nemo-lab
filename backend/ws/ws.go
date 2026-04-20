@@ -594,6 +594,33 @@ type annotationContext struct {
 	imagePath      string
 }
 
+// ResolveImagePath resolves a session-scoped image hash to an absolute image path.
+func ResolveImagePath(token, hash string) (string, bool) {
+	connectionsMu.Lock()
+	defer connectionsMu.Unlock()
+	s := connections[token]
+	if s == nil {
+		return "", false
+	}
+	imagePath, ok := s.hashToPath[hash]
+	if !ok || strings.TrimSpace(imagePath) == "" {
+		return "", false
+	}
+	return imagePath, true
+}
+
+// ResolveAnnotationPath resolves a session-scoped hash to the current annotation file path.
+func ResolveAnnotationPath(token, hash string) (string, bool) {
+	ctx, ok := loadAnnotationContext(token, hash)
+	if !ok {
+		return "", false
+	}
+	if strings.TrimSpace(ctx.annotationsDir) == "" || strings.TrimSpace(ctx.imagePath) == "" {
+		return "", false
+	}
+	return annotationFilePath(ctx.annotationsDir, ctx.singleFile, ctx.imagePath), true
+}
+
 func loadAnnotationContext(token, hash string) (annotationContext, bool) {
 	connectionsMu.Lock()
 	defer connectionsMu.Unlock()

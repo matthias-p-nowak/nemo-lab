@@ -61,6 +61,11 @@ function persistSettingDebouncedLater(key: string, value: string, delayMs = 300)
   settingPersistDebounceTimers.set(key, timer);
 }
 
+/** Returns true when a value is one of the supported mask-mode keys. */
+function isMaskMode(value: string | undefined): value is MaskMode {
+  return value === "point" || value === "bounding box" || value === "freehand";
+}
+
 /** Schedules debounced annotation save for comment-input edits only. */
 function scheduleCommentSaveAnnotations(): void {
   if (commentSaveDebounceTimer !== null) {
@@ -142,6 +147,17 @@ function logEvent(type: string, data: Record<string, unknown> = {}): void {
 
 /** Timeout handles for shortcut-scope focus flash cleanup. */
 const scopeFocusFlashTimeouts = new WeakMap<HTMLElement, number>();
+/** True while Ctrl is held; used to suppress the mask draw pass. */
+let ctrlHeld = false;
+/** Maximum number of per-image undo snapshots retained in memory. */
+const UNDO_HISTORY_LIMIT = 20;
+
+/** Updates Ctrl-held drawing override and redraws when the value changes. */
+function setCtrlHeld(next: boolean): void {
+  if (ctrlHeld === next) return;
+  ctrlHeld = next;
+  viewer?.draw();
+}
 
 /** Tracks direct scope focus events for visual flash + telemetry. */
 function handleFocusIn(event: FocusEvent): void {
@@ -185,6 +201,20 @@ function handleCanvasScopeKeydown(e: KeyboardEvent): void {
   if (e.key === "PageUp" || e.key === "PageDown") {
     e.preventDefault();
     cycleOpticsTransform(e.key === "PageUp" ? 1 : -1);
+    return;
+  }
+  if (e.key === "Backspace") {
+    e.preventDefault();
+    undoLastAnnotationChange();
+    return;
+  }
+  if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+    e.preventDefault();
+    if (e.key === "ArrowLeft") {
+      goPreviousImage();
+    } else {
+      goNextImage();
+    }
     return;
   }
   if (e.key === "Delete") {
@@ -411,6 +441,17 @@ function handleKeydown(event: KeyboardEvent): void {
 }
 
 document.addEventListener("keydown", handleKeydown);
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Control") {
+    setCtrlHeld(true);
+  }
+});
+document.addEventListener("keyup", (event) => {
+  if (event.key === "Control") {
+    setCtrlHeld(false);
+  }
+});
+window.addEventListener("blur", () => setCtrlHeld(false));
 
 /** Mutable prototype application state. */
 const appState = {
@@ -439,6 +480,8 @@ const appState = {
   draftFreehandStroke: null as DraftFreehandStroke | null,
   /** Currently selected mask id, or null when no mask is selected. */
   selectedMaskId: null as string | null,
+  /** Per-image undo history snapshots (most recent at end). */
+  undoHistory: [] as AnnotationUndoSnapshot[],
   /** Recently assigned labels, most recent first. */
   recentLabels: [] as string[],
   /** Active mask placement mode selected in the right sidebar. */
@@ -576,6 +619,8 @@ function parseSettingInt(value: string | undefined, fallback: number): number {
 /** Fetches settings and applies them to app state before first render. */
 async function loadSettingsOnStartup(): Promise<void> {
   applyTheme("light");
+  appState.maskMode = "point";
+  appState.maskModeError = null;
   try {
     const response = await fetch("/api/settings");
     if (!response.ok) {
@@ -600,6 +645,8 @@ async function loadSettingsOnStartup(): Promise<void> {
     appState.optics.maskFillOpacity = parseSettingFloat(get("mask_fill_opacity"), appState.optics.maskFillOpacity);
     appState.optics.maskStrokeWidth = parseSettingFloat(get("mask_stroke_width"), appState.optics.maskStrokeWidth);
     appState.optics.markerSize = parseSettingFloat(get("mask_marker_size"), appState.optics.markerSize);
+    const persistedMaskMode = get("annotation_mode");
+    appState.maskMode = isMaskMode(persistedMaskMode) ? persistedMaskMode : "point";
   } catch (err) {
     console.error("settings: load failed", err);
     logEvent("settings_error", { op: "get", error: String(err) });
@@ -884,9 +931,83 @@ function getCurrentImageEntry(): { filename: string; hash: string } | null {
   return appState.imageList[appState.currentImageIndex] ?? null;
 }
 
-/** Returns the active image display label for sidebar metadata. */
+/** Returns the active image basename for the left sidebar display. */
 function getCurrentImageLabel(): string {
-  return getCurrentImageEntry()?.filename ?? "(none)";
+  const filename = getCurrentImageEntry()?.filename;
+  if (!filename) return "(none)";
+  const base = filename.replace(/\\/g, "/").split("/").pop();
+  return base && base.length > 0 ? base : filename;
+}
+
+/** Extracts a filename from Content-Disposition, supporting RFC5987 and plain filename=. */
+function filenameFromContentDisposition(value: string | null): string | null {
+  if (!value) return null;
+  const utf8Match = /filename\*=UTF-8''([^;]+)/i.exec(value);
+  if (utf8Match?.[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1].trim().replace(/^"(.*)"$/, "$1"));
+    } catch {
+      // Fall through to other parsing strategies.
+    }
+  }
+  const quotedMatch = /filename="([^"]+)"/i.exec(value);
+  if (quotedMatch?.[1]) return quotedMatch[1];
+  const plainMatch = /filename=([^;]+)/i.exec(value);
+  if (plainMatch?.[1]) return plainMatch[1].trim().replace(/^"(.*)"$/, "$1");
+  return null;
+}
+
+/** Sanitizes a suggested filename so browser downloads cannot create nested paths. */
+function sanitizeDownloadFilename(name: string | null | undefined, fallback: string): string {
+  const raw = (name ?? "").trim();
+  if (!raw) return fallback;
+  const cleaned = raw
+    .replace(/[\\/]/g, "_")
+    .replace(/[\r\n]/g, "_")
+    .trim();
+  return cleaned || fallback;
+}
+
+/** Triggers a browser download while keeping the app page loaded. */
+function triggerBrowserDownload(url: string, fallbackFilename: string): void {
+  void (async () => {
+    try {
+      const response = await fetch(url, { credentials: "same-origin" });
+      if (!response.ok) {
+        throw new Error(`download request failed: ${response.status}`);
+      }
+      const suggested = filenameFromContentDisposition(response.headers.get("Content-Disposition"));
+      const filename = sanitizeDownloadFilename(suggested, fallbackFilename);
+      const blob = await response.blob();
+      const objectURL = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = objectURL;
+      anchor.download = filename;
+      anchor.style.display = "none";
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(objectURL), 0);
+    } catch (err) {
+      console.error("download failed", err);
+      logEvent("download_error", { url, error: String(err) });
+    }
+  })();
+}
+
+/** Starts download for the currently active raw image file. */
+function downloadCurrentImage(): void {
+  const current = getCurrentImageEntry();
+  if (!current) return;
+  const base = current.filename.split("/").pop() || "image";
+  triggerBrowserDownload(`/images/${encodeURIComponent(current.hash)}/raw`, base);
+}
+
+/** Starts download for the currently active annotation JSON file. */
+function downloadCurrentAnnotation(): void {
+  const current = getCurrentImageEntry();
+  if (!current) return;
+  triggerBrowserDownload(`/api/annotations/download?hash=${encodeURIComponent(current.hash)}`, "annotation.json");
 }
 
 interface WsAnnotationImage {
@@ -923,6 +1044,13 @@ interface WsAnnotationFile {
 
 type AnnotationStringMap = Record<string, string>;
 type ImageHashWarning = { key: string; hash: string; file: string };
+interface AnnotationUndoSnapshot {
+  masks: MaskPoint[];
+  selectedMaskId: string | null;
+  annotationComments: AnnotationStringMap;
+  annotationAuthors: AnnotationStringMap;
+  annotationMaskAuthors: AnnotationStringMap;
+}
 
 /** Converts arbitrary WS payload to a typed annotation file with array defaults. */
 function normalizeWsAnnotationFile(raw: unknown): Required<WsAnnotationFile> & { hasNemolabSidecars: boolean } {
@@ -1157,6 +1285,7 @@ function activateImageAtIndex(nextIndex: number): void {
     return;
   }
   flushPendingCommentSaveAnnotations();
+  clearUndoHistory();
   const clamped = Math.max(0, Math.min(appState.imageList.length - 1, Math.round(nextIndex)));
   appState.currentImageIndex = clamped;
   // Clear active hash so remount does not briefly reload the previous image
@@ -1223,6 +1352,7 @@ ws.addEventListener("message", (event) => {
 
   if (m["type"] === "image_list") {
     flushPendingCommentSaveAnnotations();
+    clearUndoHistory();
     const images = Array.isArray(m["images"])
       ? (m["images"] as Array<Record<string, unknown>>)
         .filter((item) => typeof item["filename"] === "string" && typeof item["hash"] === "string")
@@ -1262,6 +1392,7 @@ ws.addEventListener("message", (event) => {
     // Only reset masks when the image changes.
     if (isNewImage) {
       flushPendingCommentSaveAnnotations();
+      clearUndoHistory();
       appState.annotationImageWidth = 1;
       appState.annotationImageHeight = 1;
       appState.masks = [];
@@ -1410,6 +1541,7 @@ ws.addEventListener("message", (event) => {
     appState.draftBboxMask = null;
     appState.draftFreehandStroke = null;
     appState.selectedMaskId = null;
+    clearUndoHistory();
     closeMaskContextMenu();
     updateAnnotationUI();
     return;
@@ -1532,6 +1664,14 @@ function bindGlobalNavHandlers(): void {
       requestFastForwardImage();
       return;
     }
+    if (target.closest('[data-action="download-image"]')) {
+      downloadCurrentImage();
+      return;
+    }
+    if (target.closest('[data-action="download-annotation"]')) {
+      downloadCurrentAnnotation();
+      return;
+    }
     const dismissWarningBtn = target.closest<HTMLButtonElement>('[data-action="dismiss-image-hash-warning"]');
     if (dismissWarningBtn) {
       const warningKey = dismissWarningBtn.dataset["warningKey"] ?? "";
@@ -1630,10 +1770,66 @@ function getMaskContextMenuLabels(): string[] {
   return [...appState.recentLabels, ...allLabels.filter((name) => !appState.recentLabels.includes(name))];
 }
 
+/** Returns a deep-cloned mask for undo snapshots. */
+function cloneMaskForUndo(mask: MaskPoint): MaskPoint {
+  return {
+    ...mask,
+    points: mask.points?.map((point) => ({ x: point.x, y: point.y })),
+  };
+}
+
+/** Captures the current per-image annotation state as a single undo snapshot. */
+function snapshotAnnotationStateForUndo(): AnnotationUndoSnapshot {
+  return {
+    masks: appState.masks.map((mask) => cloneMaskForUndo(mask)),
+    selectedMaskId: appState.selectedMaskId,
+    annotationComments: { ...appState.annotationComments },
+    annotationAuthors: { ...appState.annotationAuthors },
+    annotationMaskAuthors: { ...appState.annotationMaskAuthors },
+  };
+}
+
+/** Pushes one undo snapshot, trimming oldest entries to the configured limit. */
+function pushUndoSnapshot(): void {
+  appState.undoHistory.push(snapshotAnnotationStateForUndo());
+  if (appState.undoHistory.length > UNDO_HISTORY_LIMIT) {
+    appState.undoHistory.splice(0, appState.undoHistory.length - UNDO_HISTORY_LIMIT);
+  }
+}
+
+/** Drops all undo history entries for the current image context. */
+function clearUndoHistory(): void {
+  appState.undoHistory = [];
+}
+
+/** Restores the previous annotation snapshot and persists the reverted state. */
+function undoLastAnnotationChange(): void {
+  const snapshot = appState.undoHistory.pop();
+  if (!snapshot) return;
+  appState.masks = snapshot.masks.map((mask) => cloneMaskForUndo(mask));
+  const selectedMaskExists = snapshot.selectedMaskId !== null &&
+    appState.masks.some((mask) => mask.id === snapshot.selectedMaskId);
+  appState.selectedMaskId = selectedMaskExists ? snapshot.selectedMaskId : null;
+  appState.annotationComments = { ...snapshot.annotationComments };
+  appState.annotationAuthors = { ...snapshot.annotationAuthors };
+  appState.annotationMaskAuthors = { ...snapshot.annotationMaskAuthors };
+  appState.draftBboxMask = null;
+  appState.draftFreehandStroke = null;
+  closeMaskContextMenu();
+  updateMaskSelectionUI();
+  updateMaskContextMenuUI();
+  if (appState.currentImageHash) {
+    sendSaveAnnotations();
+  }
+}
+
 /** Applies a label to a mask and emits assignment logging. */
-function assignLabelToMask(maskId: string, labelName: string): void {
+function assignLabelToMask(maskId: string, labelName: string, recordUndo = true): void {
   const mask = appState.masks.find((m) => m.id === maskId);
   if (!mask) return;
+  if (recordUndo) {
+    pushUndoSnapshot();
+  }
   mask.labelName = labelName;
   touchRecentLabel(labelName);
   const assignedId = findLabelNodeIdByName(appState.activeLabels, labelName);
@@ -1653,6 +1849,7 @@ function assignLabelToMask(maskId: string, labelName: string): void {
 
 /** Adds a mask point and applies last-used label if available. */
 function addMask(x: number, y: number): void {
+  pushUndoSnapshot();
   const nextIndex = appState.masks.reduce((max, mask) => Math.max(max, mask.index), 0) + 1;
   const defaultLabel = getSelectedLabelName();
   const mask: MaskPoint = {
@@ -1674,7 +1871,7 @@ function addMask(x: number, y: number): void {
     sendSaveAnnotations();
   }
   if (mask.labelName) {
-    assignLabelToMask(mask.id, mask.labelName);
+    assignLabelToMask(mask.id, mask.labelName, false);
   }
   updateAnnotationUI();
 }
@@ -1723,6 +1920,7 @@ function addBboxMask(x0: number, y0: number, x1: number, y1: number): void {
   const { x, y, w, h } = normalizeBboxFromCorners(x0, y0, x1, y1);
   if (w <= 0 || h <= 0) return;
 
+  pushUndoSnapshot();
   const nextIndex = appState.masks.reduce((max, mask) => Math.max(max, mask.index), 0) + 1;
   const defaultLabel = getSelectedLabelName();
   const mask: MaskPoint = {
@@ -1746,7 +1944,7 @@ function addBboxMask(x0: number, y0: number, x1: number, y1: number): void {
     sendSaveAnnotations();
   }
   if (mask.labelName) {
-    assignLabelToMask(mask.id, mask.labelName);
+    assignLabelToMask(mask.id, mask.labelName, false);
   }
   updateAnnotationUI();
 }
@@ -2453,6 +2651,7 @@ function triangulatePolygon(points: Array<{ x: number; y: number }>): number[] {
 /** Adds a freehand polygon mask from normalized points and applies selected label if available. */
 function addFreehandMask(points: Array<{ x: number; y: number }>): void {
   if (points.length < 3) return;
+  pushUndoSnapshot();
   const nextIndex = appState.masks.reduce((max, mask) => Math.max(max, mask.index), 0) + 1;
   const defaultLabel = getSelectedLabelName();
   const mask: MaskPoint = {
@@ -2475,7 +2674,7 @@ function addFreehandMask(points: Array<{ x: number; y: number }>): void {
     sendSaveAnnotations();
   }
   if (mask.labelName) {
-    assignLabelToMask(mask.id, mask.labelName);
+    assignLabelToMask(mask.id, mask.labelName, false);
   }
   updateAnnotationUI();
 }
@@ -2483,6 +2682,7 @@ function addFreehandMask(points: Array<{ x: number; y: number }>): void {
 /** Applies a new polygon point-set to an existing freehand mask and persists changes. */
 function updateFreehandMask(mask: MaskPoint, points: Array<{ x: number; y: number }>): void {
   if (mask.kind !== "freehand" || points.length < 3) return;
+  pushUndoSnapshot();
   mask.points = points.map((point) => ({ x: point.x, y: point.y }));
   mask.x = points[0].x;
   mask.y = points[0].y;
@@ -2660,6 +2860,7 @@ function finalizeFreehandStroke(samples: FreehandSample[]): {
 function removeMask(maskId: string): void {
   const idx = appState.masks.findIndex((mask) => mask.id === maskId);
   if (idx === -1) return;
+  pushUndoSnapshot();
   const [removed] = appState.masks.splice(idx, 1);
   const removedCommentKey = String(maskPersistedNumericID(removed));
   delete appState.annotationComments[removedCommentKey];
@@ -2684,6 +2885,7 @@ function removeMask(maskId: string): void {
 
 /** Clears all masks for the current image. */
 function clearMasks(): void {
+  clearUndoHistory();
   appState.masks = [];
   appState.draftBboxMask = null;
   appState.draftFreehandStroke = null;
@@ -2746,17 +2948,23 @@ function updateImageHashWarningsUI(): void {
 /** Renders mask mode selector panel body. */
 function renderMaskModeBody(): string {
   const selectedMode = appState.maskMode;
+  const modeDescription: Record<MaskMode, string> = {
+    point: "Click to annotate a location on the picture",
+    "bounding box": "Draws a rectangle to indicate both location and size",
+    freehand: "Hand drawn mask without holes",
+  };
   const messageHtml = appState.maskModeError
     ? `<div class="mask-mode-panel__error" role="status">${appState.maskModeError}</div>`
-    : '<div class="mask-mode-panel__hint">Point mode places a mask on left-click.</div>';
+    : "";
   return `
     <div class="mask-mode-panel">
-      <select class="mask-mode-panel__select" data-action="set-mask-mode" aria-label="Mask mode">
+      <select class="mask-mode-panel__select" data-action="set-mask-mode" aria-label="Mask mode" title="Choose mask drawing mode">
         <option value="point"${selectedMode === "point" ? " selected" : ""}>point</option>
         <option value="bounding box"${selectedMode === "bounding box" ? " selected" : ""}>bounding box</option>
         <option value="freehand"${selectedMode === "freehand" ? " selected" : ""}>freehand</option>
       </select>
       ${messageHtml}
+      <div class="mask-mode-panel__hint">${modeDescription[selectedMode]}</div>
     </div>
   `;
 }
@@ -2774,7 +2982,7 @@ function renderAnnotationList(): string {
         const persistedID = String(maskPersistedNumericID(mask));
         const maskAuthor = appState.annotationMaskAuthors[persistedID];
         const maskAuthorHtml = maskAuthor ? ` <span class="comment-panel__author">by ${escapeHtml(maskAuthor)}</span>` : "";
-        return `<li class="annotation-list__item${selectedClass}" data-mask-id="${mask.id}">#${mask.index}${maskAuthorHtml} <span class="mask-label-chip">${mask.labelName ? mask.labelName.replace(/</g, "&lt;") : "unlabeled"}</span>` +
+        return `<li class="annotation-list__item${selectedClass}" data-mask-id="${mask.id}" title="Click to select mask; right-click canvas to relabel">#${mask.index}${maskAuthorHtml} <span class="mask-label-chip">${mask.labelName ? mask.labelName.replace(/</g, "&lt;") : "unlabeled"}</span>` +
         ` <button type="button" class="task-pin__remove" data-action="remove-mask" data-id="${mask.id}" title="Remove mask">✕</button></li>`
       }
     )
@@ -2801,7 +3009,7 @@ function renderCommentAuthorText(key: string): string {
 function renderPictureCommentBody(): string {
   const value = appState.annotationComments["image"] ?? "";
   return `
-    <textarea rows="3" placeholder="Image comment" data-action="image-comment-input">${escapeHtml(value)}</textarea>
+    <textarea rows="3" placeholder="Image comment" data-action="image-comment-input" title="Edit image comment">${escapeHtml(value)}</textarea>
     ${renderCommentAuthorText("image")}
   `;
 }
@@ -2814,7 +3022,7 @@ function renderAnnotationCommentBody(): string {
   }
   const value = appState.annotationComments[key] ?? "";
   return `
-    <textarea rows="3" placeholder="Annotation comment" data-action="annotation-comment-input">${escapeHtml(value)}</textarea>
+    <textarea rows="3" placeholder="Annotation comment" data-action="annotation-comment-input" title="Edit selected annotation comment">${escapeHtml(value)}</textarea>
     ${renderCommentAuthorText(key)}
   `;
 }
@@ -2898,6 +3106,7 @@ function setMaskMode(mode: MaskMode): void {
   }
   if (previousMode !== mode) {
     logEvent("mask_mode_changed", { from: previousMode, to: mode });
+    persistSettingLater("annotation_mode", mode);
   }
   updateMaskModePanelUI();
   showModeToast(appState.maskMode);
@@ -2964,15 +3173,24 @@ function updateImageStateUI(): void {
   viewer?.draw();
 }
 
-/** Updates left-sidebar image label and 1-based index input. */
+/** Updates left-sidebar image label, download state, and 1-based index input. */
 function updateLeftSidebarImageNavUI(): void {
   const imageMeta = appRoot.querySelector<HTMLElement>('[data-role="image-label"]');
   if (imageMeta) {
-    imageMeta.textContent = `Image: ${getCurrentImageLabel()}`;
+    imageMeta.textContent = getCurrentImageLabel();
   }
   const imageIndexInput = appRoot.querySelector<HTMLInputElement>('input[data-action="jump-image-index"]');
-  if (!imageIndexInput) return;
   const hasImages = appState.imageList.length > 0;
+  const hasActiveImage = getCurrentImageEntry() !== null;
+  const downloadImageBtn = appRoot.querySelector<HTMLButtonElement>('button[data-action="download-image"]');
+  if (downloadImageBtn) {
+    downloadImageBtn.disabled = !hasActiveImage;
+  }
+  const downloadAnnotationBtn = appRoot.querySelector<HTMLButtonElement>('button[data-action="download-annotation"]');
+  if (downloadAnnotationBtn) {
+    downloadAnnotationBtn.disabled = !hasActiveImage;
+  }
+  if (!imageIndexInput) return;
   const oneBasedIndex = hasImages ? (appState.currentImageIndex + 1) : 0;
   imageIndexInput.value = String(oneBasedIndex);
   imageIndexInput.min = hasImages ? "1" : "0";
@@ -3002,6 +3220,10 @@ function bindAnnotationPanelHandlers(): void {
     const maskId = row.getAttribute("data-mask-id");
     if (!maskId) return;
     appState.selectedMaskId = maskId;
+    const selectedMask = appState.masks.find((mask) => mask.id === maskId) ?? null;
+    if (selectedMask?.kind === "bbox" && appState.maskMode !== "bounding box") {
+      setMaskMode("bounding box");
+    }
     closeMaskContextMenu();
     updateMaskSelectionUI();
   });
@@ -3119,58 +3341,58 @@ function renderOpticsBody(): string {
     <label class="optics-row">
       <span>gamma</span>
       <input type="range" data-optics="gamma"
-        min="1.0" max="2.2" step="0.01" value="${gamma}">
+        min="1.0" max="2.2" step="0.01" value="${gamma}" title="Adjust gamma correction">
       <span class="optics-val">${gamma.toFixed(2)}</span>
     </label>
     <label class="optics-row">
       <span>multiply</span>
       <input type="range" data-optics="multiply"
-        min="0.5" max="2.5" step="0.01" value="${multiply}">
+        min="0.5" max="2.5" step="0.01" value="${multiply}" title="Adjust brightness multiplier">
       <span class="optics-val">${multiply.toFixed(2)}</span>
     </label>
     <label class="optics-row">
       <span>add</span>
       <input type="range" data-optics="add"
-        min="-100" max="100" step="1" value="${add}">
+        min="-100" max="100" step="1" value="${add}" title="Adjust additive brightness offset">
       <span class="optics-val">${add.toFixed(0)}</span>
     </label>
     <label class="optics-row">
-      <input type="checkbox" data-transform="rotate90cw" ${rotate90cw ? "checked" : ""}>
+      <input type="checkbox" data-transform="rotate90cw" ${rotate90cw ? "checked" : ""} title="Toggle 90 degree rotation">
       <span>Rotate 90 CW</span>
       <span class="optics-val"></span>
     </label>
     <label class="optics-row">
-      <input type="checkbox" data-transform="flipH" ${flipH ? "checked" : ""}>
+      <input type="checkbox" data-transform="flipH" ${flipH ? "checked" : ""} title="Toggle horizontal flip">
       <span>Horizontal flip</span>
       <span class="optics-val"></span>
     </label>
     <label class="optics-row">
-      <input type="checkbox" data-transform="flipV" ${flipV ? "checked" : ""}>
+      <input type="checkbox" data-transform="flipV" ${flipV ? "checked" : ""} title="Toggle vertical flip">
       <span>Vertical flip</span>
       <span class="optics-val"></span>
     </label>
     <label class="optics-row">
       <span>stroke opacity</span>
       <input type="range" data-mask-render="maskStrokeOpacity"
-        min="0" max="1" step="0.05" value="${maskStrokeOpacity}">
+        min="0" max="1" step="0.05" value="${maskStrokeOpacity}" title="Adjust mask stroke opacity">
       <span class="optics-val">${maskStrokeOpacity.toFixed(2)}</span>
     </label>
     <label class="optics-row">
       <span>fill opacity</span>
       <input type="range" data-mask-render="maskFillOpacity"
-        min="0" max="1" step="0.05" value="${maskFillOpacity}">
+        min="0" max="1" step="0.05" value="${maskFillOpacity}" title="Adjust mask fill opacity">
       <span class="optics-val">${maskFillOpacity.toFixed(2)}</span>
     </label>
     <label class="optics-row">
       <span>stroke width</span>
       <input type="range" data-mask-render="maskStrokeWidth"
-        min="1" max="5" step="1" value="${maskStrokeWidth}">
+        min="1" max="5" step="1" value="${maskStrokeWidth}" title="Adjust mask stroke width">
       <span class="optics-val">${maskStrokeWidth.toFixed(0)}</span>
     </label>
     <label class="optics-row">
       <span>marker size</span>
       <input type="range" data-mask-render="markerSize"
-        min="5" max="30" step="1" value="${markerSize}">
+        min="5" max="30" step="1" value="${markerSize}" title="Adjust point marker size">
       <span class="optics-val">${markerSize.toFixed(0)}</span>
     </label>
     <div class="optics-reset-row">
@@ -3448,6 +3670,8 @@ class WebGLTileViewer {
   private dragTotalDistance = 0;
   /** Current full R/H/V transform matrix in NDC (column-major mat3). */
   private transformMatrix = new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]);
+  /** Suppresses duplicate dblclick handler execution after pointerdown pre-check selection. */
+  private suppressNextNativeDoubleClick = false;
 
   constructor(
     canvas: HTMLCanvasElement,
@@ -4077,6 +4301,9 @@ class WebGLTileViewer {
 
 /** Draws normalized masks (point + bbox + freehand) over image content. */
   private drawAnnotations(): void {
+    if (ctrlHeld) {
+      return;
+    }
     const masks = this.getMasks().slice().sort((a, b) => a.index - b.index);
     const draftFreehand = this.getDraftFreehandStroke();
     if (masks.length === 0 && (!draftFreehand || draftFreehand.points.length < 2)) {
@@ -4638,6 +4865,10 @@ class WebGLTileViewer {
 
   /** Handles double-click hit-testing for mask selection. */
   private readonly handleCanvasDoubleClick = (event: MouseEvent): void => {
+    if (this.suppressNextNativeDoubleClick) {
+      this.suppressNextNativeDoubleClick = false;
+      return;
+    }
     if (event.button !== 0) return;
     if (this.dragTotalDistance > config.clickMaxDragPx) return;
     const mapped = this.mapClientToMaskEvent(event.clientX, event.clientY, {
@@ -4777,9 +5008,17 @@ class WebGLTileViewer {
     if (this.isBboxDragPlacementEnabled()) {
       const mapped = this.mapClientToMaskEvent(event.clientX, event.clientY, {
         clampToImage: false,
-        includeHitMask: false,
+        includeHitMask: true,
       });
       if (mapped) {
+        // Run dblclick mask selection before entering drag capture so freehand
+        // mode never starts a stroke on a mask-double-click interaction.
+        if (event.detail >= 2 && mapped.hitMaskId) {
+          this.suppressNextNativeDoubleClick = true;
+          this.onMaskCanvasDoubleClick(mapped.hitMaskId);
+          return;
+        }
+        this.suppressNextNativeDoubleClick = false;
         this.isBboxDragPlacing = true;
         this.bboxDragPointerId = event.pointerId;
         this.dragLastX = event.clientX;
@@ -4967,6 +5206,7 @@ class WebGLTileViewer {
       this.bboxSideEditPointerId = null;
       this.bboxSideEditMaskId = null;
       this.bboxSideEditEdge = null;
+      this.dragTotalDistance = 0;
       return;
     }
 
@@ -4990,6 +5230,7 @@ class WebGLTileViewer {
       }
       this.isBboxDragPlacing = false;
       this.bboxDragPointerId = null;
+      this.dragTotalDistance = 0;
       return;
     }
 
@@ -4997,6 +5238,7 @@ class WebGLTileViewer {
       return;
     }
     this.isDragging = false;
+    this.dragTotalDistance = 0;
     this.maybeChangeFitLevel();
     logEvent("pan", { hash: this.imageStem, offset_x: this.offsetX, offset_y: this.offsetY, zoom: this.zoom });
   };
@@ -5269,6 +5511,9 @@ function mountViewer(): void {
     (payload) => {
       const mask = appState.masks.find((m) => m.id === payload.maskId);
       if (!mask || mask.kind !== "bbox") return;
+      if (payload.phase === "start") {
+        pushUndoSnapshot();
+      }
       logEvent("bbox_edit", {
         phase: payload.phase,
         mask_id: payload.maskId,
@@ -5289,14 +5534,9 @@ function mountViewer(): void {
     },
     (maskId) => {
       appState.selectedMaskId = maskId;
-      const selectedMask = appState.masks.find((m) => m.id === maskId);
-      if (selectedMask) {
-        const modeForKind: Record<MaskPoint["kind"], MaskMode> = {
-          point: "point",
-          bbox: "bounding box",
-          freehand: "freehand",
-        };
-        setMaskMode(modeForKind[selectedMask.kind]);
+      const selectedMask = appState.masks.find((mask) => mask.id === maskId) ?? null;
+      if (selectedMask?.kind === "bbox" && appState.maskMode !== "bounding box") {
+        setMaskMode("bounding box");
       }
       closeMaskContextMenu();
       updateMaskSelectionUI();
@@ -5663,7 +5903,7 @@ function bindDirBrowserHandlers(): void {
 function renderMenuBar(): string {
   const open = appState.menuOpen;
   return `
-    <button class="hamburger" type="button" aria-label="Toggle menu" aria-expanded="${open}"
+    <button class="hamburger" type="button" aria-label="Toggle menu" aria-expanded="${open}" title="Open or close top menu"
             data-action="toggle-menu">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
         <line x1="3" y1="6"  x2="21" y2="6"/>
@@ -5674,32 +5914,32 @@ function renderMenuBar(): string {
     <div class="menu-bar ${open ? "menu-bar--open" : ""}">
       <nav class="menu-bar__items" aria-hidden="${!open}">
         <div class="menu-bar__item" data-menu="tasks">
-          <button type="button" class="menu-bar__btn" data-action="open-tasks">Tasks</button>
+          <button type="button" class="menu-bar__btn" data-action="open-tasks" title="Open tasks dialog">Tasks</button>
         </div>
         <div class="menu-bar__item" data-menu="views">
-          <button type="button" class="menu-bar__btn" data-action="toggle-menu-dropdown">Views</button>
+          <button type="button" class="menu-bar__btn" data-action="toggle-menu-dropdown" title="Open view options">Views</button>
           <div class="menu-bar__dropdown">
             <button type="button" class="menu-bar__dropdown-btn" data-action="toggle-left-sidebar"
-                    aria-checked="${!appState.leftCollapsed}">
+                    aria-checked="${!appState.leftCollapsed}" title="Show or hide left sidebar">
               <span class="menu-bar__check">✓</span><span>Left sidebar</span>
             </button>
             <button type="button" class="menu-bar__dropdown-btn" data-action="toggle-right-sidebar"
-                    aria-checked="${!appState.rightCollapsed}">
+                    aria-checked="${!appState.rightCollapsed}" title="Show or hide right sidebar">
               <span class="menu-bar__check">✓</span><span>Right sidebar</span>
             </button>
             <hr class="menu-bar__separator">
             <button type="button" class="menu-bar__dropdown-btn" data-action="set-theme" data-theme="light"
-                    aria-checked="${document.documentElement.getAttribute('data-theme') === 'light'}">
+                    aria-checked="${document.documentElement.getAttribute('data-theme') === 'light'}" title="Switch to light theme">
               <span class="menu-bar__check">✓</span><span>Light theme</span>
             </button>
             <button type="button" class="menu-bar__dropdown-btn" data-action="set-theme" data-theme="dark"
-                    aria-checked="${document.documentElement.getAttribute('data-theme') === 'dark'}">
+                    aria-checked="${document.documentElement.getAttribute('data-theme') === 'dark'}" title="Switch to dark theme">
               <span class="menu-bar__check">✓</span><span>Dark theme</span>
             </button>
           </div>
         </div>
         <div class="menu-bar__item" data-menu="help">
-          <button type="button" class="menu-bar__btn" data-action="open-help">Help</button>
+          <button type="button" class="menu-bar__btn" data-action="open-help" title="Open help dialog">Help</button>
         </div>
       </nav>
     </div>
@@ -5806,8 +6046,12 @@ function renderHelpDialogBody(): string {
         <tbody>
           <tr><td><code>canvas</code></td><td><code>PageUp</code></td><td>Cycle optics transform forward</td></tr>
           <tr><td><code>canvas</code></td><td><code>PageDown</code></td><td>Cycle optics transform backward</td></tr>
+          <tr><td><code>canvas</code></td><td><code>ArrowLeft</code></td><td>Go to previous image</td></tr>
+          <tr><td><code>canvas</code></td><td><code>ArrowRight</code></td><td>Go to next image</td></tr>
+          <tr><td><code>canvas</code></td><td><code>Ctrl</code> (hold)</td><td>Hide all masks while held</td></tr>
           <tr><td><code>canvas</code></td><td><code>Escape</code></td><td>Deselect selected mask; close context menu</td></tr>
           <tr><td><code>canvas</code></td><td><code>Delete</code></td><td>Remove selected mask</td></tr>
+          <tr><td><code>canvas</code></td><td><code>Backspace</code></td><td>Undo last annotation change</td></tr>
           <tr><td><code>canvas</code></td><td><code>ArrowUp</code></td><td>Cycle mask selection backward</td></tr>
           <tr><td><code>canvas</code></td><td><code>ArrowDown</code></td><td>Cycle mask selection forward</td></tr>
           <tr><td><code>navigation</code></td><td><code>Enter</code></td><td>Jump to typed image index</td></tr>
@@ -6410,8 +6654,6 @@ function bindTasksDialogHandlers(): void {
       appState.activeTaskAnnotationsPath = task.annotations;
       appState.activeTaskSingleFile = task.checkmark;
       appState.pendingActivationLogHash = null;
-      appState.maskMode = "point";
-      appState.maskModeError = null;
       appState.imageList = [];
       appState.currentImageIndex = 0;
       appState.currentImageHash = null;
@@ -6580,25 +6822,49 @@ function restoreFocusFromSnapshot(snapshot: FocusSnapshot | null): void {
 /** Renders the prototype UI. */
 function render(): void {
   const focusSnapshot = captureFocusSnapshot();
+  const hasActiveImage = getCurrentImageEntry() !== null;
   appRoot.innerHTML = `
     <div class="layout ${appState.leftCollapsed ? "left-collapsed" : ""} ${
       appState.rightCollapsed ? "right-collapsed" : ""
     }" style="--sidebar-right-width: ${appState.rightSidebarWidth}px;">
       <aside class="sidebar sidebar--left">
         <div class="sidebar__content" data-shortcut-scope="navigation">
-          <button type="button" data-action="previous">previous</button>
-          <button type="button" data-action="next">next</button>
           <input
             type="number"
+            class="left-sidebar__index"
             data-action="jump-image-index"
             aria-label="Image index"
+            title="Jump to image index"
             value="${appState.imageList.length > 0 ? appState.currentImageIndex + 1 : 0}"
             min="${appState.imageList.length > 0 ? 1 : 0}"
             max="${appState.imageList.length > 0 ? appState.imageList.length : 0}"
             ${appState.imageList.length > 0 ? "" : "disabled"}
           />
-          <button type="button" data-action="fast-forward">fast-forward</button>
-          <div class="meta" data-role="image-label">Image: ${getCurrentImageLabel()}</div>
+          <div class="left-sidebar__image-name meta" data-role="image-label">${getCurrentImageLabel()}</div>
+          <div class="left-sidebar__button-row left-sidebar__button-row--nav">
+            <button type="button" class="left-sidebar__icon-btn" data-action="previous"
+                    aria-label="Previous image" title="Previous image">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="5" x2="5" y2="19"/><polyline points="19,5 9,12 19,19"/></svg>
+            </button>
+            <button type="button" class="left-sidebar__icon-btn" data-action="next"
+                    aria-label="Next image" title="Next image">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="5,5 15,12 5,19"/><line x1="19" y1="5" x2="19" y2="19"/></svg>
+            </button>
+            <button type="button" class="left-sidebar__icon-btn" data-action="fast-forward"
+                    aria-label="Jump to first unannotated image" title="Jump to first unannotated image">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4,5 11,12 4,19"/><polyline points="11,5 18,12 11,19"/><line x1="21" y1="5" x2="21" y2="19"/></svg>
+            </button>
+          </div>
+          <div class="left-sidebar__button-row left-sidebar__button-row--download">
+            <button type="button" class="left-sidebar__icon-btn" data-action="download-image"
+                    aria-label="Download image file" title="Download image file" ${hasActiveImage ? "" : "disabled"}>
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2,11 C5,6 10,5 14,8 C16,9 17,10 18,11 C17,12 16,13 14,14 C10,17 5,16 2,11 Z"/><path d="M18,11 L22,7 L22,15 Z"/><circle cx="8" cy="10" r="1" fill="currentColor" stroke="none"/><line x1="11" y1="22" x2="11" y2="19"/><polyline points="8,21 11,24 14,21"/></svg>
+            </button>
+            <button type="button" class="left-sidebar__icon-btn" data-action="download-annotation"
+                    aria-label="Download annotation file" title="Download annotation file" ${hasActiveImage ? "" : "disabled"}>
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14,2 L20,8 L20,22 L4,22 L4,2 Z"/><polyline points="14,2 14,8 20,8"/><polyline points="8,12 11,10 15,13 13,17 8,16 8,12"/><line x1="12" y1="21" x2="12" y2="18"/></svg>
+            </button>
+          </div>
         </div>
       </aside>
 
@@ -6610,7 +6876,7 @@ function render(): void {
       </main>
 
       <aside class="sidebar sidebar--right">
-        <div class="sidebar__resize-handle" role="separator" aria-orientation="vertical" aria-label="Resize right sidebar"></div>
+        <div class="sidebar__resize-handle" role="separator" aria-orientation="vertical" aria-label="Resize right sidebar" title="Drag to resize right sidebar"></div>
         <div class="sidebar__content panels">
           ${renderPanel("optics", "optics", renderOpticsBody())}
           ${renderPanel("labels", "labels", renderLabelTree(appState.activeLabels, appState.activeLabelSelectedId, false))}
@@ -6633,11 +6899,11 @@ function render(): void {
         </div>
       </aside>
     </div>
-    <button type="button" class="sidebar-toggle sidebar-toggle--left" data-action="toggle-left" aria-label="Toggle left sidebar">
+    <button type="button" class="sidebar-toggle sidebar-toggle--left" data-action="toggle-left" aria-label="Toggle left sidebar" title="Show or hide left sidebar">
       ${appState.leftCollapsed ? ">" : "<"}
     </button>
     ${renderMenuBar()}
-    <button type="button" class="sidebar-toggle sidebar-toggle--right" data-action="toggle-right" aria-label="Toggle right sidebar">
+    <button type="button" class="sidebar-toggle sidebar-toggle--right" data-action="toggle-right" aria-label="Toggle right sidebar" title="Show or hide right sidebar">
       ${appState.rightCollapsed ? "<" : ">"}
     </button>
     ${renderMaskContextMenu()}
