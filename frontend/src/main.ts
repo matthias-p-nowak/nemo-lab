@@ -486,8 +486,6 @@ const appState = {
   recentLabels: [] as string[],
   /** Active mask placement mode selected in the right sidebar. */
   maskMode: "point" as MaskMode,
-  /** Inline mask-mode status/error message rendered in selector panel. */
-  maskModeError: null as string | null,
   /** Context menu state for right-click label assignment on masks. */
   maskContextMenu: {
     open: false,
@@ -620,7 +618,6 @@ function parseSettingInt(value: string | undefined, fallback: number): number {
 async function loadSettingsOnStartup(): Promise<void> {
   applyTheme("light");
   appState.maskMode = "point";
-  appState.maskModeError = null;
   try {
     const response = await fetch("/api/settings");
     if (!response.ok) {
@@ -2953,9 +2950,6 @@ function renderMaskModeBody(): string {
     "bounding box": "Draws a rectangle to indicate both location and size",
     freehand: "Hand drawn mask without holes",
   };
-  const messageHtml = appState.maskModeError
-    ? `<div class="mask-mode-panel__error" role="status">${appState.maskModeError}</div>`
-    : "";
   return `
     <div class="mask-mode-panel">
       <select class="mask-mode-panel__select" data-action="set-mask-mode" aria-label="Mask mode" title="Choose mask drawing mode">
@@ -2963,7 +2957,6 @@ function renderMaskModeBody(): string {
         <option value="bounding box"${selectedMode === "bounding box" ? " selected" : ""}>bounding box</option>
         <option value="freehand"${selectedMode === "freehand" ? " selected" : ""}>freehand</option>
       </select>
-      ${messageHtml}
       <div class="mask-mode-panel__hint">${modeDescription[selectedMode]}</div>
     </div>
   `;
@@ -3095,7 +3088,6 @@ function showModeToast(label: string): void {
 function setMaskMode(mode: MaskMode): void {
   const previousMode = appState.maskMode;
   appState.maskMode = mode;
-  appState.maskModeError = null;
   appState.draftBboxMask = null;
   appState.draftFreehandStroke = null;
   if (mode === "freehand" && appState.selectedMaskId !== null) {
@@ -6660,6 +6652,11 @@ function bindTasksDialogHandlers(): void {
       appState.masks = [];
       appState.draftBboxMask = null;
       appState.draftFreehandStroke = null;
+      appState.selectedMaskId = null;
+      appState.annotationComments = {};
+      appState.annotationAuthors = {};
+      appState.annotationMaskAuthors = {};
+      appState.undoHistory = [];
       closeMaskContextMenu();
       appState.tasksDialogOpen = false;
       render();
